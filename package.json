@@ -1,0 +1,39 @@
+{
+  "name": "super-terminal",
+  "version": "0.1.0",
+  "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:main\" \"npm run dev:renderer\"",
+    "dev:main": "tsc -p tsconfig.main.json --watch",
+    "dev:renderer": "vite",
+    "build": "tsc -p tsconfig.main.json && vite build",
+    "start": "electron dist/main/index.js",
+    "postinstall": "electron-rebuild"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "concurrently": "^8.2.0",
+    "electron": "^28.0.0",
+    "electron-rebuild": "^3.2.9",
+    "typescript": "^5.3.0",
+    "vite": "^5.0.0",
+    "vite-plugin-electron": "^0.28.0"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.0.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "zustand": "^4.5.0",
+    "allotment": "^1.0.9",
+    "nanoid": "^5.0.0"
+  }
+}
