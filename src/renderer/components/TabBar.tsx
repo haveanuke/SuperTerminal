@@ -1,8 +1,10 @@
+import { useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
 import type { LayoutMode } from '../types';
 
 export function TabBar() {
+  const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const tabs = useTerminalStore((s) => s.tabs);
   const activeTabId = useTerminalStore((s) => s.activeTabId);
   const setActiveTab = useTerminalStore((s) => s.setActiveTab);
@@ -17,6 +19,7 @@ export function TabBar() {
   const setSearchOpen = useTerminalStore((s) => s.setSearchOpen);
   const searchQuery = useTerminalStore((s) => s.searchQuery);
   const setSearchQuery = useTerminalStore((s) => s.setSearchQuery);
+  const setTabLabel = useTerminalStore((s) => s.setTabLabel);
   const theme = useThemeStore((s) => s.theme);
 
   const layoutModes: { mode: LayoutMode; label: string }[] = [
@@ -66,7 +69,41 @@ export function TabBar() {
               whiteSpace: 'nowrap',
             }}
           >
-            <span>{tab.label}</span>
+            {editingTabId === tab.id ? (
+              <input
+                type="text"
+                defaultValue={tab.label}
+                autoFocus
+                onBlur={(e) => {
+                  const val = e.target.value.trim();
+                  if (val) setTabLabel(tab.id, val);
+                  setEditingTabId(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    const val = (e.target as HTMLInputElement).value.trim();
+                    if (val) setTabLabel(tab.id, val);
+                    setEditingTabId(null);
+                  }
+                  if (e.key === 'Escape') setEditingTabId(null);
+                }}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  background: theme.uiBackground,
+                  border: `1px solid ${theme.uiAccent}`,
+                  color: theme.uiText,
+                  fontSize: 13,
+                  padding: '0 4px',
+                  width: 80,
+                  outline: 'none',
+                  borderRadius: 3,
+                }}
+              />
+            ) : (
+              <span onDoubleClick={(e) => { e.stopPropagation(); setEditingTabId(tab.id); }}>
+                {tab.label}
+              </span>
+            )}
             {tabs.length > 1 && (
               <span
                 className="tab-close"
