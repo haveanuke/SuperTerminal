@@ -1,4 +1,12 @@
 node_modules/
 dist/
+out/
+release/
 .DS_Store
 *.log
+*.dmg
+*.snap
+*.AppImage
+*.exe
+.env
+.env.*
