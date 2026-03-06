@@ -1,10 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import { SearchAddon } from '@xterm/addon-search';
-import { WebLinksAddon } from '@xterm/addon-web-links';
 import { useThemeStore } from '../stores/theme-store';
 import { useTerminalStore } from '../stores/terminal-store';
+import { xtermRegistry, getOrCreateXterm } from '../xterm-registry';
 
 interface TerminalViewProps {
   terminalId: string;
@@ -12,10 +9,6 @@ interface TerminalViewProps {
 
 export function TerminalView({ terminalId }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const xtermRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const searchAddonRef = useRef<SearchAddon | null>(null);
-  const cleanupRef = useRef<(() => void) | null>(null);
 
   const theme = useThemeStore((s) => s.theme);
   const fontSize = useThemeStore((s) => s.fontSize);
@@ -23,7 +16,6 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const broadcastTargets = useTerminalStore((s) => s.broadcastTargets);
   const setActiveTerminalId = useTerminalStore((s) => s.setActiveTerminalId);
-  const setTerminalTitle = useTerminalStore((s) => s.setTerminalTitle);
   const searchQuery = useTerminalStore((s) => s.searchQuery);
   const searchOpen = useTerminalStore((s) => s.searchOpen);
 
@@ -31,16 +23,56 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     setActiveTerminalId(terminalId);
   }, [terminalId, setActiveTerminalId]);
 
+  // Attach/detach the persistent xterm element
   useEffect(() => {
     if (!containerRef.current) return;
+    const entry = getOrCreateXterm(terminalId);
+    const container = containerRef.current;
 
-    const xterm = new Terminal({
-      fontSize,
-      fontFamily,
-      cursorBlink: true,
-      cursorStyle: 'bar',
-      allowProposedApi: true,
-      theme: {
+    // Move the xterm DOM element into this container
+    container.appendChild(entry.element);
+
+    // Fit after attaching (new container may have different size)
+    requestAnimationFrame(() => {
+      try {
+        entry.fitAddon.fit();
+        window.superTerminal.pty.resize(terminalId, entry.xterm.cols, entry.xterm.rows);
+      } catch {
+        // ignore
+      }
+    });
+
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const resizeObserver = new ResizeObserver(() => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        try {
+          if (entry.element.parentNode === container) {
+            entry.fitAddon.fit();
+            window.superTerminal.pty.resize(terminalId, entry.xterm.cols, entry.xterm.rows);
+          }
+        } catch {
+          // ignore resize errors during teardown
+        }
+      }, 100);
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeObserver.disconnect();
+      // Detach but don't destroy — the element stays in the registry
+      if (entry.element.parentNode === container) {
+        container.removeChild(entry.element);
+      }
+    };
+  }, [terminalId]);
+
+  // Update theme
+  useEffect(() => {
+    const entry = xtermRegistry.get(terminalId);
+    if (entry) {
+      entry.xterm.options.theme = {
         background: theme.background,
         foreground: theme.foreground,
         cursor: theme.cursor,
@@ -61,117 +93,75 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
         brightMagenta: theme.brightMagenta,
         brightCyan: theme.brightCyan,
         brightWhite: theme.brightWhite,
-      },
-    });
-
-    const fitAddon = new FitAddon();
-    const searchAddon = new SearchAddon();
-    const webLinksAddon = new WebLinksAddon();
-
-    xterm.loadAddon(fitAddon);
-    xterm.loadAddon(searchAddon);
-    xterm.loadAddon(webLinksAddon);
-
-    xterm.open(containerRef.current);
-    fitAddon.fit();
-
-    xtermRef.current = xterm;
-    fitAddonRef.current = fitAddon;
-    searchAddonRef.current = searchAddon;
-
-    const { cols, rows } = xterm;
-    window.superTerminal.pty.create(terminalId, cols, rows);
-
-    const removeDataListener = window.superTerminal.pty.onData(terminalId, (data) => {
-      xterm.write(data);
-    });
-
-    const removeExitListener = window.superTerminal.pty.onExit(terminalId, () => {
-      xterm.write('\r\n[Process exited]\r\n');
-    });
-
-    xterm.onData((data) => {
-      const store = useTerminalStore.getState();
-      if (store.broadcastMode && store.broadcastTargets.size > 0) {
-        store.broadcastTargets.forEach((targetId) => {
-          window.superTerminal.pty.write(targetId, data);
-        });
-      } else {
-        window.superTerminal.pty.write(terminalId, data);
-      }
-    });
-
-    xterm.onTitleChange((title) => {
-      setTerminalTitle(terminalId, title);
-    });
-
-    const resizeObserver = new ResizeObserver(() => {
-      try {
-        fitAddon.fit();
-        window.superTerminal.pty.resize(terminalId, xterm.cols, xterm.rows);
-      } catch {
-        // ignore resize errors during teardown
-      }
-    });
-    resizeObserver.observe(containerRef.current);
-
-    cleanupRef.current = () => {
-      removeDataListener();
-      removeExitListener();
-      resizeObserver.disconnect();
-      xterm.dispose();
-    };
-
-    return () => {
-      cleanupRef.current?.();
-    };
-  }, [terminalId]);
-
-  // Update theme
-  useEffect(() => {
-    xtermRef.current?.options.theme && (xtermRef.current.options.theme = {
-      background: theme.background,
-      foreground: theme.foreground,
-      cursor: theme.cursor,
-      selectionBackground: theme.selection,
-      black: theme.black,
-      red: theme.red,
-      green: theme.green,
-      yellow: theme.yellow,
-      blue: theme.blue,
-      magenta: theme.magenta,
-      cyan: theme.cyan,
-      white: theme.white,
-      brightBlack: theme.brightBlack,
-      brightRed: theme.brightRed,
-      brightGreen: theme.brightGreen,
-      brightYellow: theme.brightYellow,
-      brightBlue: theme.brightBlue,
-      brightMagenta: theme.brightMagenta,
-      brightCyan: theme.brightCyan,
-      brightWhite: theme.brightWhite,
-    });
-  }, [theme]);
+      };
+    }
+  }, [theme, terminalId]);
 
   // Update font
   useEffect(() => {
-    if (xtermRef.current) {
-      xtermRef.current.options.fontSize = fontSize;
-      xtermRef.current.options.fontFamily = fontFamily;
-      fitAddonRef.current?.fit();
+    const entry = xtermRegistry.get(terminalId);
+    if (entry) {
+      entry.xterm.options.fontSize = fontSize;
+      entry.xterm.options.fontFamily = fontFamily;
+      entry.fitAddon.fit();
     }
-  }, [fontSize, fontFamily]);
+  }, [fontSize, fontFamily, terminalId]);
 
   // Search
   useEffect(() => {
+    const entry = xtermRegistry.get(terminalId);
+    if (!entry) return;
     if (searchOpen && searchQuery) {
-      searchAddonRef.current?.findNext(searchQuery, { regex: false, caseSensitive: false });
+      entry.searchAddon.findNext(searchQuery, { regex: false, caseSensitive: false });
     } else {
-      searchAddonRef.current?.clearDecorations();
+      entry.searchAddon.clearDecorations();
     }
-  }, [searchQuery, searchOpen]);
+  }, [searchQuery, searchOpen, terminalId]);
+
+  // Auto-run
+  const autoRun = useTerminalStore((s) => s.terminals.get(terminalId)?.autoRun);
+
+  useEffect(() => {
+    if (!autoRun?.enabled || !autoRun.command) return;
+    const intervalMs = autoRun.intervalSeconds * 1000;
+    const escDelay = (autoRun.escapeDelaySecs || 2) * 1000;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const runCommand = () => {
+      window.superTerminal.pty.write(terminalId, autoRun.command);
+      const enterTimer = setTimeout(() => {
+        window.superTerminal.pty.write(terminalId, '\r');
+      }, 50);
+      timers.push(enterTimer);
+      if (autoRun.sendEscape) {
+        const escTimer = setTimeout(() => {
+          window.superTerminal.pty.write(terminalId, '\x1b');
+        }, escDelay);
+        timers.push(escTimer);
+      }
+    };
+
+    runCommand();
+    const interval = setInterval(runCommand, intervalMs);
+
+    return () => {
+      clearInterval(interval);
+      timers.forEach(clearTimeout);
+    };
+  }, [terminalId, autoRun?.enabled, autoRun?.command, autoRun?.intervalSeconds, autoRun?.sendEscape, autoRun?.escapeDelaySecs]);
 
   const isBroadcastTarget = broadcastMode && broadcastTargets.has(terminalId);
+  const swapSource = useTerminalStore((s) => s.swapSource);
+  const isSwapSource = swapSource === terminalId;
+  const isSwapTarget = swapSource !== null && swapSource !== terminalId;
+
+  const borderColor = isSwapSource
+    ? theme.yellow
+    : isSwapTarget
+    ? `${theme.yellow}88`
+    : isBroadcastTarget
+    ? theme.uiAccent
+    : 'transparent';
 
   return (
     <div
@@ -182,7 +172,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
         position: 'relative',
         width: '100%',
         height: '100%',
-        border: isBroadcastTarget ? `2px solid ${theme.uiAccent}` : '2px solid transparent',
+        border: `2px solid ${borderColor}`,
         boxSizing: 'border-box',
       }}
     >

@@ -5,11 +5,8 @@ import { useState } from 'react';
 
 export function StatusBar() {
   const terminals = useTerminalStore((s) => s.terminals);
-  const layoutMode = useTerminalStore((s) => s.layoutMode);
+  const tabs = useTerminalStore((s) => s.tabs);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
-  const gridCols = useTerminalStore((s) => s.gridCols);
-  const gridRows = useTerminalStore((s) => s.gridRows);
-  const setGridSize = useTerminalStore((s) => s.setGridSize);
   const theme = useThemeStore((s) => s.theme);
   const setTheme = useThemeStore((s) => s.setTheme);
   const fontSize = useThemeStore((s) => s.fontSize);
@@ -52,19 +49,9 @@ export function StatusBar() {
         }}
       >
         <div style={{ display: 'flex', gap: 12 }}>
+          <span>{tabs.length} tab{tabs.length !== 1 ? 's' : ''}</span>
           <span>{terminals.size} terminal{terminals.size !== 1 ? 's' : ''}</span>
-          <span>Layout: {layoutMode}</span>
           {broadcastMode && <span style={{ color: theme.uiAccent }}>Broadcast ON</span>}
-          {layoutMode === 'grid' && (
-            <span>
-              Grid:
-              <button className="toolbar-btn" onClick={() => setGridSize(Math.max(1, gridCols - 1), gridRows)} style={{ fontSize: 11 }}>-</button>
-              {gridCols}x{gridRows}
-              <button className="toolbar-btn" onClick={() => setGridSize(gridCols + 1, gridRows)} style={{ fontSize: 11 }}>+</button>
-              <button className="toolbar-btn" onClick={() => setGridSize(gridCols, Math.max(1, gridRows - 1))} style={{ fontSize: 11 }}>-R</button>
-              <button className="toolbar-btn" onClick={() => setGridSize(gridCols, gridRows + 1)} style={{ fontSize: 11 }}>+R</button>
-            </span>
-          )}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button

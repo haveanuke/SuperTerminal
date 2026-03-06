@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { nanoid } from 'nanoid';
-import type { Tab, PaneNode, LayoutMode, TerminalInstance } from '../types';
+import type { Tab, PaneNode, TerminalInstance, AutoRunConfig } from '../types';
+import { destroyXterm } from '../xterm-registry';
 
 function createTerminal(cwd?: string): TerminalInstance {
   return { id: nanoid(), title: 'Terminal', cwd };
@@ -19,14 +20,12 @@ interface TerminalStore {
   terminals: Map<string, TerminalInstance>;
   tabs: Tab[];
   activeTabId: string;
-  layoutMode: LayoutMode;
-  gridCols: number;
-  gridRows: number;
   broadcastMode: boolean;
   broadcastTargets: Set<string>;
   searchOpen: boolean;
   searchQuery: string;
   activeTerminalId: string | null;
+  swapSource: string | null;
 
   // Actions
   addTerminal: (cwd?: string) => TerminalInstance;
@@ -41,9 +40,6 @@ interface TerminalStore {
   splitPane: (tabId: string, terminalId: string, direction: 'horizontal' | 'vertical') => void;
   closePaneTerminal: (tabId: string, terminalId: string) => void;
 
-  setLayoutMode: (mode: LayoutMode) => void;
-  setGridSize: (cols: number, rows: number) => void;
-
   toggleBroadcast: () => void;
   toggleBroadcastTarget: (id: string) => void;
   setBroadcastAll: () => void;
@@ -52,6 +48,13 @@ interface TerminalStore {
   setSearchQuery: (query: string) => void;
 
   setActiveTerminalId: (id: string | null) => void;
+
+  setAutoRun: (id: string, config: AutoRunConfig) => void;
+  clearAutoRun: (id: string) => void;
+
+  startSwap: (terminalId: string) => void;
+  completeSwap: (terminalId: string) => void;
+  cancelSwap: () => void;
 
   getSerializableLayout: () => unknown;
 }
@@ -93,6 +96,21 @@ function removeFromPane(pane: PaneNode, terminalId: string): PaneNode | null {
   return { ...pane, children: [left, right] };
 }
 
+function swapTerminalIds(pane: PaneNode, idA: string, idB: string): PaneNode {
+  if (pane.type === 'terminal') {
+    if (pane.terminalId === idA) return { ...pane, terminalId: idB };
+    if (pane.terminalId === idB) return { ...pane, terminalId: idA };
+    return pane;
+  }
+  return {
+    ...pane,
+    children: [
+      swapTerminalIds(pane.children[0], idA, idB),
+      swapTerminalIds(pane.children[1], idA, idB),
+    ],
+  };
+}
+
 function collectTerminalIds(pane: PaneNode): string[] {
   if (pane.type === 'terminal') return [pane.terminalId];
   return [...collectTerminalIds(pane.children[0]), ...collectTerminalIds(pane.children[1])];
@@ -108,14 +126,12 @@ export const useTerminalStore = create<TerminalStore>((set, get) => {
     terminals: initialTerminals,
     tabs: [firstTab],
     activeTabId: firstTab.id,
-    layoutMode: 'splits',
-    gridCols: 2,
-    gridRows: 2,
     broadcastMode: false,
     broadcastTargets: new Set<string>(),
     searchOpen: false,
     searchQuery: '',
     activeTerminalId: firstTerminal.id,
+    swapSource: null,
 
     addTerminal: (cwd?: string) => {
       const term = createTerminal(cwd);
@@ -133,6 +149,7 @@ export const useTerminalStore = create<TerminalStore>((set, get) => {
         terminals.delete(id);
         return { terminals };
       });
+      destroyXterm(id);
       window.superTerminal.pty.dispose(id);
     },
 
@@ -200,9 +217,6 @@ export const useTerminalStore = create<TerminalStore>((set, get) => {
       }));
     },
 
-    setLayoutMode: (mode) => set({ layoutMode: mode }),
-    setGridSize: (gridCols, gridRows) => set({ gridCols, gridRows }),
-
     toggleBroadcast: () => set((s) => ({ broadcastMode: !s.broadcastMode })),
     toggleBroadcastTarget: (id) =>
       set((s) => {
@@ -221,14 +235,48 @@ export const useTerminalStore = create<TerminalStore>((set, get) => {
 
     setActiveTerminalId: (id) => set({ activeTerminalId: id }),
 
+    setAutoRun: (id, config) => {
+      set((s) => {
+        const terminals = new Map(s.terminals);
+        const existing = terminals.get(id);
+        if (existing) terminals.set(id, { ...existing, autoRun: config });
+        return { terminals };
+      });
+    },
+
+    clearAutoRun: (id) => {
+      set((s) => {
+        const terminals = new Map(s.terminals);
+        const existing = terminals.get(id);
+        if (existing) terminals.set(id, { ...existing, autoRun: undefined });
+        return { terminals };
+      });
+    },
+
+    startSwap: (terminalId) => set({ swapSource: terminalId }),
+
+    completeSwap: (terminalId) => {
+      const { swapSource, tabs } = get();
+      if (!swapSource || swapSource === terminalId) {
+        set({ swapSource: null });
+        return;
+      }
+      set({
+        tabs: tabs.map((t) => ({
+          ...t,
+          pane: swapTerminalIds(t.pane, swapSource, terminalId),
+        })),
+        swapSource: null,
+      });
+    },
+
+    cancelSwap: () => set({ swapSource: null }),
+
     getSerializableLayout: () => {
       const s = get();
       return {
         tabs: s.tabs,
         activeTabId: s.activeTabId,
-        layoutMode: s.layoutMode,
-        gridCols: s.gridCols,
-        gridRows: s.gridRows,
       };
     },
   };

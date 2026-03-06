@@ -4,7 +4,12 @@ import os from 'os';
 export class PtyManager {
   private processes = new Map<string, pty.IPty>();
 
+  has(id: string): boolean {
+    return this.processes.has(id);
+  }
+
   create(id: string, cols: number, rows: number, cwd?: string) {
+    if (this.processes.has(id)) return;
     const shell = process.env.SHELL || (os.platform() === 'win32' ? 'powershell.exe' : 'bash');
     const proc = pty.spawn(shell, [], {
       name: 'xterm-256color',

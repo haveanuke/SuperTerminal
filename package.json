@@ -4,9 +4,7 @@
   "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
   "main": "dist/main/index.js",
   "scripts": {
-    "dev": "concurrently \"npm run dev:main\" \"npm run dev:renderer\"",
-    "dev:main": "tsc -p tsconfig.main.json --watch",
-    "dev:renderer": "vite",
+    "dev": "tsc -p tsconfig.main.json && concurrently \"tsc -p tsconfig.main.json --watch\" \"vite\" \"electron dist/main/index.js --dev\"",
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "electron dist/main/index.js",
     "postinstall": "electron-rebuild"

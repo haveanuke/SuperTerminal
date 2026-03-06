@@ -24,7 +24,6 @@ function createWindow() {
 
   if (process.env.NODE_ENV === 'development' || process.argv.includes('--dev')) {
     mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools();
   } else {
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
@@ -52,13 +51,16 @@ app.on('activate', () => {
 
 // PTY IPC handlers
 ipcMain.handle('pty:create', (_event, { id, cols, rows, cwd }) => {
+  const existed = ptyManager.has(id);
   ptyManager.create(id, cols, rows, cwd);
-  ptyManager.onData(id, (data) => {
-    mainWindow?.webContents.send(`pty:data:${id}`, data);
-  });
-  ptyManager.onExit(id, (exitCode) => {
-    mainWindow?.webContents.send(`pty:exit:${id}`, exitCode);
-  });
+  if (!existed) {
+    ptyManager.onData(id, (data) => {
+      mainWindow?.webContents.send(`pty:data:${id}`, data);
+    });
+    ptyManager.onExit(id, (exitCode) => {
+      mainWindow?.webContents.send(`pty:exit:${id}`, exitCode);
+    });
+  }
   return true;
 });
 

@@ -1,7 +1,16 @@
+export interface AutoRunConfig {
+  command: string;
+  intervalSeconds: number;
+  enabled: boolean;
+  sendEscape?: boolean;
+  escapeDelaySecs?: number;
+}
+
 export interface TerminalInstance {
   id: string;
   title: string;
   cwd?: string;
+  autoRun?: AutoRunConfig;
 }
 
 export type SplitDirection = 'horizontal' | 'vertical';
@@ -10,7 +19,6 @@ export type PaneNode =
   | { type: 'terminal'; terminalId: string }
   | { type: 'split'; direction: SplitDirection; children: [PaneNode, PaneNode]; sizes?: [number, number] };
 
-export type LayoutMode = 'tabs' | 'splits' | 'grid';
 
 export interface Tab {
   id: string;

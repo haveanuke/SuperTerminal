@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
-import type { LayoutMode } from '../types';
 
 export function TabBar() {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -10,8 +9,6 @@ export function TabBar() {
   const setActiveTab = useTerminalStore((s) => s.setActiveTab);
   const addTab = useTerminalStore((s) => s.addTab);
   const removeTab = useTerminalStore((s) => s.removeTab);
-  const layoutMode = useTerminalStore((s) => s.layoutMode);
-  const setLayoutMode = useTerminalStore((s) => s.setLayoutMode);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const toggleBroadcast = useTerminalStore((s) => s.toggleBroadcast);
   const setBroadcastAll = useTerminalStore((s) => s.setBroadcastAll);
@@ -21,12 +18,6 @@ export function TabBar() {
   const setSearchQuery = useTerminalStore((s) => s.setSearchQuery);
   const setTabLabel = useTerminalStore((s) => s.setTabLabel);
   const theme = useThemeStore((s) => s.theme);
-
-  const layoutModes: { mode: LayoutMode; label: string }[] = [
-    { mode: 'tabs', label: 'Tabs' },
-    { mode: 'splits', label: 'Splits' },
-    { mode: 'grid', label: 'Grid' },
-  ];
 
   return (
     <div
@@ -46,8 +37,8 @@ export function TabBar() {
       <div
         style={{
           display: 'flex',
-          flex: 1,
           overflow: 'auto',
+          flexShrink: 1,
           WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
@@ -132,6 +123,9 @@ export function TabBar() {
         </button>
       </div>
 
+      {/* Draggable spacer */}
+      <div style={{ flex: 1, minWidth: 40 }} />
+
       {/* Controls */}
       <div
         style={{
@@ -192,22 +186,6 @@ export function TabBar() {
         >
           BC
         </button>
-
-        {/* Layout mode */}
-        {layoutModes.map(({ mode, label }) => (
-          <button
-            key={mode}
-            className="toolbar-btn"
-            onClick={() => setLayoutMode(mode)}
-            style={{
-              color: layoutMode === mode ? theme.uiAccent : theme.uiTextMuted,
-              fontWeight: layoutMode === mode ? 'bold' : 'normal',
-              fontSize: 11,
-            }}
-          >
-            {label}
-          </button>
-        ))}
       </div>
     </div>
   );

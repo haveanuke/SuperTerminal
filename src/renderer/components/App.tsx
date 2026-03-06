@@ -2,24 +2,12 @@ import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
 import { TabBar } from './TabBar';
 import { SplitPane } from './SplitPane';
-import { GridLayout } from './GridLayout';
 import { StatusBar } from './StatusBar';
-import { TerminalView } from './TerminalView';
-import { PaneToolbar } from './PaneToolbar';
-
-function collectTerminalIds(pane: import('../types').PaneNode): string[] {
-  if (pane.type === 'terminal') return [pane.terminalId];
-  return [...collectTerminalIds(pane.children[0]), ...collectTerminalIds(pane.children[1])];
-}
 
 export function App() {
   const tabs = useTerminalStore((s) => s.tabs);
   const activeTabId = useTerminalStore((s) => s.activeTabId);
-  const layoutMode = useTerminalStore((s) => s.layoutMode);
   const theme = useThemeStore((s) => s.theme);
-  const closePaneTerminal = useTerminalStore((s) => s.closePaneTerminal);
-
-  const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
 
   return (
     <div
@@ -36,31 +24,19 @@ export function App() {
     >
       <TabBar />
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
-        {layoutMode === 'grid' ? (
-          <GridLayout />
-        ) : layoutMode === 'tabs' ? (
-          // Tabs mode: show only the active tab's first terminal
-          activeTab && (() => {
-            const termIds = collectTerminalIds(activeTab.pane);
-            const termId = termIds[0];
-            return termId ? (
-              <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-                <PaneToolbar
-                  terminalId={termId}
-                  onSplitH={() => {}}
-                  onSplitV={() => {}}
-                  onClose={() => closePaneTerminal(activeTab.id, termId)}
-                />
-                <div style={{ flex: 1, overflow: 'hidden' }}>
-                  <TerminalView terminalId={termId} />
-                </div>
-              </div>
-            ) : null;
-          })()
-        ) : (
-          // Splits mode
-          activeTab && <SplitPane pane={activeTab.pane} tabId={activeTab.id} />
-        )}
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              visibility: tab.id === activeTabId ? 'visible' : 'hidden',
+              pointerEvents: tab.id === activeTabId ? 'auto' : 'none',
+            }}
+          >
+            <SplitPane pane={tab.pane} tabId={tab.id} />
+          </div>
+        ))}
       </div>
       <StatusBar />
     </div>
