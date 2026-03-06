@@ -24,14 +24,15 @@ export function TabBar() {
       className="tab-bar"
       style={{
         display: 'flex',
-        alignItems: 'center',
+        alignItems: 'stretch',
+        minHeight: 40,
         backgroundColor: theme.uiSurface,
         borderBottom: `1px solid ${theme.uiBorder}`,
         WebkitAppRegion: 'drag' as unknown as string,
       }}
     >
       {/* Drag region / window controls spacer */}
-      <div style={{ width: 78, flexShrink: 0 }} />
+      <div style={{ width: 78, flexShrink: 0, display: 'flex', alignItems: 'center' }} />
 
       {/* Tabs */}
       <div
@@ -48,10 +49,11 @@ export function TabBar() {
             className={`tab ${tab.id === activeTabId ? 'tab-active' : ''}`}
             onClick={() => setActiveTab(tab.id)}
             style={{
-              padding: '6px 12px',
+              padding: '0 12px',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
+              alignSelf: 'stretch',
               gap: 6,
               fontSize: 13,
               color: tab.id === activeTabId ? theme.uiText : theme.uiTextMuted,
@@ -124,7 +126,7 @@ export function TabBar() {
       </div>
 
       {/* Draggable spacer */}
-      <div style={{ flex: 1, minWidth: 40 }} />
+      <div style={{ flex: 1, minWidth: 40, display: 'flex', alignItems: 'center' }} />
 
       {/* Controls */}
       <div

@@ -1,5 +1,29 @@
 import * as pty from 'node-pty';
 import os from 'os';
+import { execSync } from 'child_process';
+
+function getShellEnv(): Record<string, string> {
+  if (os.platform() === 'win32') return process.env as Record<string, string>;
+  const shell = process.env.SHELL || 'bash';
+  try {
+    const output = execSync(`${shell} -ilc 'env'`, {
+      encoding: 'utf-8',
+      timeout: 5000,
+    });
+    const env: Record<string, string> = {};
+    for (const line of output.split('\n')) {
+      const idx = line.indexOf('=');
+      if (idx > 0) {
+        env[line.substring(0, idx)] = line.substring(idx + 1);
+      }
+    }
+    return env;
+  } catch {
+    return process.env as Record<string, string>;
+  }
+}
+
+const shellEnv = getShellEnv();
 
 export class PtyManager {
   private processes = new Map<string, pty.IPty>();
@@ -16,7 +40,7 @@ export class PtyManager {
       cols,
       rows,
       cwd: cwd || os.homedir(),
-      env: process.env as Record<string, string>,
+      env: shellEnv,
     });
     this.processes.set(id, proc);
   }
