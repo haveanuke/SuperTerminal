@@ -1,7 +1,6 @@
 import { useTerminalStore } from '../stores/terminal-store';
-import { useThemeStore } from '../stores/theme-store';
-import { themes } from '../stores/theme-store';
-import { useState } from 'react';
+import { useThemeStore, builtinThemes, validateTheme, exportThemeJSON } from '../stores/theme-store';
+import { useState, useRef } from 'react';
 
 export function StatusBar() {
   const terminals = useTerminalStore((s) => s.terminals);
@@ -11,8 +10,14 @@ export function StatusBar() {
   const setTheme = useThemeStore((s) => s.setTheme);
   const fontSize = useThemeStore((s) => s.fontSize);
   const setFontSize = useThemeStore((s) => s.setFontSize);
+  const customThemes = useThemeStore((s) => s.customThemes);
+  const addCustomTheme = useThemeStore((s) => s.addCustomTheme);
+  const removeCustomTheme = useThemeStore((s) => s.removeCustomTheme);
+  const getAllThemes = useThemeStore((s) => s.getAllThemes);
 
   const [showSettings, setShowSettings] = useState(false);
+  const [importError, setImportError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Session management
   const getSerializableLayout = useTerminalStore((s) => s.getSerializableLayout);
@@ -31,6 +36,44 @@ export function StatusBar() {
     setSessionName('');
     loadSessions();
   };
+
+  const handleImportTheme = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setImportError('');
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result as string);
+        if (!validateTheme(parsed)) {
+          setImportError('Invalid theme: missing required fields');
+          return;
+        }
+        addCustomTheme(parsed);
+        setTheme(parsed);
+        setImportError('');
+      } catch {
+        setImportError('Invalid JSON file');
+      }
+    };
+    reader.readAsText(file);
+    // Reset so same file can be re-imported
+    e.target.value = '';
+  };
+
+  const handleExportTheme = () => {
+    const json = exportThemeJSON(theme);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${theme.name.toLowerCase().replace(/\s+/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const allThemes = getAllThemes();
+  const isCustom = (name: string) => customThemes.some((t) => t.name === name);
 
   return (
     <>
@@ -74,7 +117,9 @@ export function StatusBar() {
             position: 'absolute',
             bottom: 24,
             right: 8,
-            width: 300,
+            width: 340,
+            maxHeight: 'calc(100vh - 80px)',
+            overflowY: 'auto',
             backgroundColor: theme.uiSurface,
             border: `1px solid ${theme.uiBorder}`,
             borderRadius: 8,
@@ -87,21 +132,36 @@ export function StatusBar() {
             gap: 12,
           }}
         >
+          {/* Theme Selection */}
           <div>
-            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted }}>Theme</label>
-            <div style={{ display: 'flex', gap: 4 }}>
-              {themes.map((t) => (
+            <label style={{ display: 'block', marginBottom: 6, color: theme.uiTextMuted }}>Theme</label>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, 1fr)',
+                gap: 4,
+                maxHeight: 180,
+                overflowY: 'auto',
+                paddingRight: 4,
+              }}
+            >
+              {allThemes.map((t) => (
                 <button
                   key={t.name}
                   className="toolbar-btn"
                   onClick={() => setTheme(t)}
+                  title={t.name}
                   style={{
-                    padding: '4px 8px',
-                    fontSize: 11,
+                    padding: '5px 6px',
+                    fontSize: 10,
                     backgroundColor: t.background,
                     color: t.foreground,
                     border: theme.name === t.name ? `2px solid ${theme.uiAccent}` : `1px solid ${theme.uiBorder}`,
                     borderRadius: 4,
+                    textOverflow: 'ellipsis',
+                    overflow: 'hidden',
+                    whiteSpace: 'nowrap',
+                    position: 'relative',
                   }}
                 >
                   {t.name}
@@ -110,6 +170,44 @@ export function StatusBar() {
             </div>
           </div>
 
+          {/* Custom Theme Actions */}
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            <button
+              className="toolbar-btn"
+              onClick={() => fileInputRef.current?.click()}
+              style={{ fontSize: 11, padding: '3px 8px' }}
+            >
+              Import Theme
+            </button>
+            <button
+              className="toolbar-btn"
+              onClick={handleExportTheme}
+              style={{ fontSize: 11, padding: '3px 8px' }}
+            >
+              Export Current
+            </button>
+            {isCustom(theme.name) && (
+              <button
+                className="toolbar-btn"
+                onClick={() => removeCustomTheme(theme.name)}
+                style={{ fontSize: 11, padding: '3px 8px', color: theme.red }}
+              >
+                Delete Theme
+              </button>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleImportTheme}
+              style={{ display: 'none' }}
+            />
+          </div>
+          {importError && (
+            <span style={{ color: theme.red, fontSize: 11 }}>{importError}</span>
+          )}
+
+          {/* Font Size */}
           <div>
             <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted }}>
               Font Size: {fontSize}px
@@ -124,6 +222,7 @@ export function StatusBar() {
             />
           </div>
 
+          {/* Sessions */}
           <div>
             <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted }}>Sessions</label>
             <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
