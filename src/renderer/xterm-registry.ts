@@ -100,15 +100,15 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
 export function safeFit(entry: XtermEntry) {
   const buf = entry.xterm.buffer.active;
   const wasAtBottom = buf.viewportY >= buf.baseY;
-  const savedY = buf.viewportY;
 
   entry.fitAddon.fit();
 
-  // Restore scroll: if user was at the bottom, stay there; otherwise restore exact line
+  // If user was at the bottom, ensure they stay there after reflow.
+  // Otherwise let xterm's built-in reflow handle scroll preservation —
+  // manually restoring a saved viewportY breaks when line count changes
+  // due to reflow (e.g. full scrollback buffer with wrapping lines).
   if (wasAtBottom) {
     entry.xterm.scrollToBottom();
-  } else {
-    entry.xterm.scrollToLine(savedY);
   }
 }
 
