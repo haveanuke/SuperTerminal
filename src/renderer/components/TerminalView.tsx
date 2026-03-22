@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useThemeStore } from '../stores/theme-store';
 import { useTerminalStore } from '../stores/terminal-store';
-import { xtermRegistry, getOrCreateXterm } from '../xterm-registry';
+import { xtermRegistry, getOrCreateXterm, safeFit } from '../xterm-registry';
 
 interface TerminalViewProps {
   terminalId: string;
@@ -35,7 +35,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     // Fit after attaching (new container may have different size)
     requestAnimationFrame(() => {
       try {
-        entry.fitAddon.fit();
+        safeFit(entry);
         window.superTerminal.pty.resize(terminalId, entry.xterm.cols, entry.xterm.rows);
       } catch {
         // ignore
@@ -48,7 +48,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
       resizeTimer = setTimeout(() => {
         try {
           if (entry.element.parentNode === container) {
-            entry.fitAddon.fit();
+            safeFit(entry);
             window.superTerminal.pty.resize(terminalId, entry.xterm.cols, entry.xterm.rows);
           }
         } catch {
@@ -103,7 +103,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     if (entry) {
       entry.xterm.options.fontSize = fontSize;
       entry.xterm.options.fontFamily = fontFamily;
-      entry.fitAddon.fit();
+      safeFit(entry);
     }
   }, [fontSize, fontFamily, terminalId]);
 

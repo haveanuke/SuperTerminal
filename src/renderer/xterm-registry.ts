@@ -96,6 +96,22 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   return entry;
 }
 
+/** Call fit() while preserving the terminal's scroll position */
+export function safeFit(entry: XtermEntry) {
+  const buf = entry.xterm.buffer.active;
+  const wasAtBottom = buf.viewportY >= buf.baseY;
+  const savedY = buf.viewportY;
+
+  entry.fitAddon.fit();
+
+  // Restore scroll: if user was at the bottom, stay there; otherwise restore exact line
+  if (wasAtBottom) {
+    entry.xterm.scrollToBottom();
+  } else {
+    entry.xterm.scrollToLine(savedY);
+  }
+}
+
 export function destroyXterm(terminalId: string) {
   const entry = xtermRegistry.get(terminalId);
   if (entry) {
