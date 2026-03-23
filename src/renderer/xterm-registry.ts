@@ -25,6 +25,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   const xterm = new Terminal({
     fontSize: themeState.fontSize,
     fontFamily: themeState.fontFamily,
+    scrollback: 10000,
     cursorBlink: true,
     cursorStyle: 'bar',
     allowProposedApi: true,
@@ -84,7 +85,13 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   window.superTerminal.pty.create(terminalId, cols, rows);
 
   const removeDataListener = window.superTerminal.pty.onData(terminalId, (data) => {
-    xterm.write(data);
+    const buf = xterm.buffer.active;
+    const wasAtBottom = buf.viewportY >= buf.baseY;
+    xterm.write(data, () => {
+      if (wasAtBottom) {
+        xterm.scrollToBottom();
+      }
+    });
   });
 
   const removeExitListener = window.superTerminal.pty.onExit(terminalId, () => {
