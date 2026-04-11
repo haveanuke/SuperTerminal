@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+import { createStore } from '../lib/create-store';
 import type { ThemeConfig } from '../types';
 
 const tokyoNight: ThemeConfig = {
@@ -417,7 +417,7 @@ interface ThemeStore {
   getAllThemes: () => ThemeConfig[];
 }
 
-export const useThemeStore = create<ThemeStore>((set, get) => ({
+export const useThemeStore = createStore<ThemeStore>((set, get) => ({
   theme: tokyoNight,
   customThemes: loadCustomThemes(),
   fontSize: 14,

@@ -1,17 +1,15 @@
 import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import { SearchAddon } from '@xterm/addon-search';
-import { WebLinksAddon } from '@xterm/addon-web-links';
+import { fitTerminal, invalidateCharCache } from './lib/xterm-fit';
+import { registerWebLinks } from './lib/xterm-web-links';
 import { useThemeStore } from './stores/theme-store';
 import { useTerminalStore } from './stores/terminal-store';
 
 export interface XtermEntry {
   xterm: Terminal;
-  fitAddon: FitAddon;
-  searchAddon: SearchAddon;
   element: HTMLDivElement;
   removeDataListener: () => void;
   removeExitListener: () => void;
+  removeLinkProvider: () => void;
 }
 
 export const xtermRegistry = new Map<string, XtermEntry>();
@@ -53,13 +51,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     },
   });
 
-  const fitAddon = new FitAddon();
-  const searchAddon = new SearchAddon();
-  const webLinksAddon = new WebLinksAddon();
-
-  xterm.loadAddon(fitAddon);
-  xterm.loadAddon(searchAddon);
-  xterm.loadAddon(webLinksAddon);
+  const linkDisposable = registerWebLinks(xterm);
 
   const element = document.createElement('div');
   element.style.width = '100%';
@@ -98,7 +90,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     xterm.write('\r\n[Process exited]\r\n');
   });
 
-  const entry: XtermEntry = { xterm, fitAddon, searchAddon, element, removeDataListener, removeExitListener };
+  const entry: XtermEntry = { xterm, element, removeDataListener, removeExitListener, removeLinkProvider: () => linkDisposable.dispose() };
   xtermRegistry.set(terminalId, entry);
   return entry;
 }
@@ -108,12 +100,10 @@ export function safeFit(entry: XtermEntry) {
   const buf = entry.xterm.buffer.active;
   const wasAtBottom = buf.viewportY >= buf.baseY;
 
-  entry.fitAddon.fit();
+  const container = entry.element;
+  if (container.clientWidth === 0 || container.clientHeight === 0) return;
+  fitTerminal(entry.xterm, container);
 
-  // If user was at the bottom, ensure they stay there after reflow.
-  // Otherwise let xterm's built-in reflow handle scroll preservation —
-  // manually restoring a saved viewportY breaks when line count changes
-  // due to reflow (e.g. full scrollback buffer with wrapping lines).
   if (wasAtBottom) {
     entry.xterm.scrollToBottom();
   }
@@ -124,8 +114,11 @@ export function destroyXterm(terminalId: string) {
   if (entry) {
     entry.removeDataListener();
     entry.removeExitListener();
+    entry.removeLinkProvider();
     entry.xterm.dispose();
     entry.element.remove();
     xtermRegistry.delete(terminalId);
   }
 }
+
+export { invalidateCharCache } from './lib/xterm-fit';

@@ -1,16 +1,15 @@
-import { create } from 'zustand';
-import { nanoid } from 'nanoid';
+import { createStore } from '../lib/create-store';
 import type { Tab, PaneNode, TerminalInstance, AutoRunConfig } from '../types';
 import { destroyXterm } from '../xterm-registry';
 
 function createTerminal(cwd?: string): TerminalInstance {
-  return { id: nanoid(), title: 'Terminal', cwd };
+  return { id: crypto.randomUUID(), title: 'Terminal', cwd };
 }
 
 function createTab(terminal?: TerminalInstance): Tab {
   const term = terminal || createTerminal();
   return {
-    id: nanoid(),
+    id: crypto.randomUUID(),
     label: 'Terminal',
     pane: { type: 'terminal', terminalId: term.id },
   };
@@ -116,7 +115,7 @@ function collectTerminalIds(pane: PaneNode): string[] {
   return [...collectTerminalIds(pane.children[0]), ...collectTerminalIds(pane.children[1])];
 }
 
-export const useTerminalStore = create<TerminalStore>((set, get) => {
+export const useTerminalStore = createStore<TerminalStore>((set, get) => {
   const firstTerminal = createTerminal();
   const firstTab = createTab(firstTerminal);
   const initialTerminals = new Map<string, TerminalInstance>();

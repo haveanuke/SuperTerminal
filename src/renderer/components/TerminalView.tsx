@@ -1,7 +1,8 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useThemeStore } from '../stores/theme-store';
 import { useTerminalStore } from '../stores/terminal-store';
-import { xtermRegistry, getOrCreateXterm, safeFit } from '../xterm-registry';
+import { findNext, clearDecorations } from '../lib/xterm-search';
+import { xtermRegistry, getOrCreateXterm, safeFit, invalidateCharCache } from '../xterm-registry';
 
 interface TerminalViewProps {
   terminalId: string;
@@ -103,6 +104,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     if (entry) {
       entry.xterm.options.fontSize = fontSize;
       entry.xterm.options.fontFamily = fontFamily;
+      invalidateCharCache();
       safeFit(entry);
     }
   }, [fontSize, fontFamily, terminalId]);
@@ -112,9 +114,9 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     const entry = xtermRegistry.get(terminalId);
     if (!entry) return;
     if (searchOpen && searchQuery) {
-      entry.searchAddon.findNext(searchQuery, { regex: false, caseSensitive: false });
+      findNext(entry.xterm, searchQuery, { caseSensitive: false });
     } else {
-      entry.searchAddon.clearDecorations();
+      clearDecorations(entry.xterm);
     }
   }, [searchQuery, searchOpen, terminalId]);
 
