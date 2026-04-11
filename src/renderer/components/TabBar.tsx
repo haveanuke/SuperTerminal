@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
+import { Plus, X, Search, Radio } from './icons';
 
 export function TabBar() {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -43,85 +44,88 @@ export function TabBar() {
           WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
-        {tabs.map((tab) => (
-          <div
-            key={tab.id}
-            className={`tab ${tab.id === activeTabId ? 'tab-active' : ''}`}
-            onClick={() => setActiveTab(tab.id)}
-            style={{
-              padding: '0 12px',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              alignSelf: 'stretch',
-              gap: 6,
-              fontSize: 13,
-              color: tab.id === activeTabId ? theme.uiText : theme.uiTextMuted,
-              backgroundColor: tab.id === activeTabId ? theme.uiBackground : 'transparent',
-              borderRight: `1px solid ${theme.uiBorder}`,
-              whiteSpace: 'nowrap',
-            }}
-          >
-            {editingTabId === tab.id ? (
-              <input
-                type="text"
-                defaultValue={tab.label}
-                autoFocus
-                onBlur={(e) => {
-                  const val = e.target.value.trim();
-                  if (val) setTabLabel(tab.id, val);
-                  setEditingTabId(null);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    const val = (e.target as HTMLInputElement).value.trim();
+        {tabs.map((tab) => {
+          const isActive = tab.id === activeTabId;
+          return (
+            <div
+              key={tab.id}
+              className="tab"
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                padding: '0 12px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                alignSelf: 'stretch',
+                gap: 6,
+                fontSize: 13,
+                color: isActive ? theme.uiText : theme.uiTextMuted,
+                backgroundColor: isActive ? theme.uiBackground : 'transparent',
+                borderRight: `1px solid ${theme.uiBorder}`,
+                borderBottom: isActive ? `2px solid ${theme.uiAccent}` : '2px solid transparent',
+                whiteSpace: 'nowrap',
+                position: 'relative',
+              }}
+            >
+              {editingTabId === tab.id ? (
+                <input
+                  type="text"
+                  defaultValue={tab.label}
+                  autoFocus
+                  onBlur={(e) => {
+                    const val = e.target.value.trim();
                     if (val) setTabLabel(tab.id, val);
                     setEditingTabId(null);
-                  }
-                  if (e.key === 'Escape') setEditingTabId(null);
-                }}
-                onClick={(e) => e.stopPropagation()}
-                style={{
-                  background: theme.uiBackground,
-                  border: `1px solid ${theme.uiAccent}`,
-                  color: theme.uiText,
-                  fontSize: 13,
-                  padding: '0 4px',
-                  width: 80,
-                  outline: 'none',
-                  borderRadius: 3,
-                }}
-              />
-            ) : (
-              <span onDoubleClick={(e) => { e.stopPropagation(); setEditingTabId(tab.id); }}>
-                {tab.label}
-              </span>
-            )}
-            {tabs.length > 1 && (
-              <span
-                className="tab-close"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  removeTab(tab.id);
-                }}
-                style={{ opacity: 0.5, fontSize: 14 }}
-              >
-                &times;
-              </span>
-            )}
-          </div>
-        ))}
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const val = (e.target as HTMLInputElement).value.trim();
+                      if (val) setTabLabel(tab.id, val);
+                      setEditingTabId(null);
+                    }
+                    if (e.key === 'Escape') setEditingTabId(null);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    background: theme.uiBackground,
+                    border: `1px solid ${theme.uiAccent}`,
+                    color: theme.uiText,
+                    fontSize: 13,
+                    padding: '0 4px',
+                    width: 80,
+                    outline: 'none',
+                    borderRadius: 3,
+                  }}
+                />
+              ) : (
+                <span onDoubleClick={(e) => { e.stopPropagation(); setEditingTabId(tab.id); }}>
+                  {tab.label}
+                </span>
+              )}
+              {tabs.length > 1 && (
+                <span
+                  className="tab-close"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeTab(tab.id);
+                  }}
+                >
+                  <X size={12} />
+                </span>
+              )}
+            </div>
+          );
+        })}
         <button
           className="toolbar-btn"
           onClick={addTab}
           title="New tab"
           style={{
             padding: '6px 10px',
-            fontSize: 16,
             WebkitAppRegion: 'no-drag' as unknown as string,
           }}
         >
-          +
+          <Plus size={14} />
         </button>
       </div>
 
@@ -133,7 +137,7 @@ export function TabBar() {
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 4,
+          gap: 2,
           padding: '0 8px',
           WebkitAppRegion: 'no-drag' as unknown as string,
         }}
@@ -170,7 +174,7 @@ export function TabBar() {
           title="Search"
           style={{ color: searchOpen ? theme.uiAccent : undefined }}
         >
-          &#x1F50D;
+          <Search />
         </button>
 
         {/* Broadcast */}
@@ -183,10 +187,9 @@ export function TabBar() {
           title={broadcastMode ? 'Disable broadcast' : 'Enable broadcast'}
           style={{
             color: broadcastMode ? theme.uiAccent : undefined,
-            fontWeight: broadcastMode ? 'bold' : 'normal',
           }}
         >
-          BC
+          <Radio />
         </button>
       </div>
     </div>

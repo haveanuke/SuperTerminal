@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
+import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical } from './icons';
 
 interface PaneToolbarProps {
   terminalId: string;
@@ -43,13 +44,20 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
     clearAutoRun(terminalId);
   };
 
+  const separatorStyle: React.CSSProperties = {
+    width: 1,
+    alignSelf: 'stretch',
+    margin: '4px 2px',
+    backgroundColor: theme.uiBorder,
+  };
+
   return (
     <div
       className="pane-toolbar"
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 4,
+        gap: 2,
         padding: '2px 8px',
         backgroundColor: theme.uiSurface,
         borderBottom: `1px solid ${theme.uiBorder}`,
@@ -68,19 +76,26 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
           </span>
         )}
       </span>
+
+      {/* Broadcast toggle (only when broadcast mode is on) */}
       {broadcastMode && (
-        <button
-          className="toolbar-btn"
-          onClick={() => toggleBroadcastTarget(terminalId)}
-          title={isBroadcastTarget ? 'Remove from broadcast' : 'Add to broadcast'}
-          style={{
-            background: isBroadcastTarget ? theme.uiAccent : 'transparent',
-            color: isBroadcastTarget ? theme.uiBackground : theme.uiTextMuted,
-          }}
-        >
-          BC
-        </button>
+        <>
+          <button
+            className="toolbar-btn"
+            onClick={() => toggleBroadcastTarget(terminalId)}
+            title={isBroadcastTarget ? 'Remove from broadcast' : 'Add to broadcast'}
+            style={{
+              background: isBroadcastTarget ? theme.uiAccent : 'transparent',
+              color: isBroadcastTarget ? theme.uiBackground : theme.uiTextMuted,
+            }}
+          >
+            <Radio size={13} />
+          </button>
+          <div style={separatorStyle} />
+        </>
       )}
+
+      {/* Swap */}
       {isSwapTarget ? (
         <button
           className="toolbar-btn"
@@ -97,20 +112,36 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
           title={isSwapSource ? 'Cancel swap' : 'Swap this pane'}
           style={{ color: isSwapSource ? theme.yellow : theme.uiTextMuted }}
         >
-          &#x21C4;
+          <ArrowRightLeft size={13} />
         </button>
       )}
+
+      {/* Auto-run */}
       <button
         className="toolbar-btn"
         onClick={() => setShowAutoRun(!showAutoRun)}
         title="Auto-run command on timer"
         style={{ color: autoRunActive ? theme.green : theme.uiTextMuted }}
       >
-        &#x23F1;
+        <Timer size={13} />
       </button>
-      <button className="toolbar-btn" onClick={onSplitH} title="Split horizontal">&#x2502;</button>
-      <button className="toolbar-btn" onClick={onSplitV} title="Split vertical">&#x2500;</button>
-      <button className="toolbar-btn" onClick={onClose} title="Close">&times;</button>
+
+      <div style={separatorStyle} />
+
+      {/* Split controls */}
+      <button className="toolbar-btn" onClick={onSplitH} title="Split horizontal">
+        <SplitHorizontal size={13} />
+      </button>
+      <button className="toolbar-btn" onClick={onSplitV} title="Split vertical">
+        <SplitVertical size={13} />
+      </button>
+
+      <div style={separatorStyle} />
+
+      {/* Close */}
+      <button className="toolbar-btn toolbar-btn-danger" onClick={onClose} title="Close">
+        <X size={13} />
+      </button>
 
       {showAutoRun && (
         <div

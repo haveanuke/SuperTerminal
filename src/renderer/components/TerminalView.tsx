@@ -14,6 +14,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
   const theme = useThemeStore((s) => s.theme);
   const fontSize = useThemeStore((s) => s.fontSize);
   const fontFamily = useThemeStore((s) => s.fontFamily);
+  const backgroundImage = useThemeStore((s) => s.backgroundImage);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const broadcastTargets = useTerminalStore((s) => s.broadcastTargets);
   const setActiveTerminalId = useTerminalStore((s) => s.setActiveTerminalId);
@@ -73,8 +74,9 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
   useEffect(() => {
     const entry = xtermRegistry.get(terminalId);
     if (entry) {
+      entry.xterm.options.allowTransparency = !!backgroundImage;
       entry.xterm.options.theme = {
-        background: theme.background,
+        background: backgroundImage ? 'transparent' : theme.background,
         foreground: theme.foreground,
         cursor: theme.cursor,
         selectionBackground: theme.selection,
@@ -96,7 +98,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
         brightWhite: theme.brightWhite,
       };
     }
-  }, [theme, terminalId]);
+  }, [theme, terminalId, backgroundImage]);
 
   // Update font
   useEffect(() => {
@@ -167,7 +169,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
 
   return (
     <div
-      className="terminal-view"
+      className={`terminal-view${backgroundImage ? ' terminal-transparent' : ''}`}
       onFocus={handleFocus}
       onClick={handleFocus}
       style={{

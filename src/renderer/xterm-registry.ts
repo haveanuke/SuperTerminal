@@ -27,8 +27,9 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     cursorBlink: true,
     cursorStyle: 'bar',
     allowProposedApi: true,
+    allowTransparency: !!themeState.backgroundImage,
     theme: {
-      background: themeState.theme.background,
+      background: themeState.backgroundImage ? 'transparent' : themeState.theme.background,
       foreground: themeState.theme.foreground,
       cursor: themeState.theme.cursor,
       selectionBackground: themeState.theme.selection,

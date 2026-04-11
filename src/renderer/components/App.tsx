@@ -8,6 +8,8 @@ export function App() {
   const tabs = useTerminalStore((s) => s.tabs);
   const activeTabId = useTerminalStore((s) => s.activeTabId);
   const theme = useThemeStore((s) => s.theme);
+  const backgroundImage = useThemeStore((s) => s.backgroundImage);
+  const backgroundOpacity = useThemeStore((s) => s.backgroundOpacity);
 
   return (
     <div
@@ -20,10 +22,36 @@ export function App() {
         backgroundColor: theme.uiBackground,
         color: theme.uiText,
         overflow: 'hidden',
+        position: 'relative',
       }}
     >
-      <TabBar />
-      <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+      {/* Background image layer */}
+      {backgroundImage && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            zIndex: 0,
+            pointerEvents: 'none',
+          }}
+        >
+          <img
+            src={`file://${backgroundImage}`}
+            alt=""
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              opacity: backgroundOpacity,
+            }}
+          />
+        </div>
+      )}
+
+      <div style={{ position: 'relative', zIndex: 1 }}>
+        <TabBar />
+      </div>
+      <div style={{ flex: 1, overflow: 'hidden', position: 'relative', zIndex: 1 }}>
         {tabs.map((tab) => (
           <div
             key={tab.id}
@@ -38,7 +66,9 @@ export function App() {
           </div>
         ))}
       </div>
-      <StatusBar />
+      <div style={{ position: 'relative', zIndex: 1 }}>
+        <StatusBar />
+      </div>
     </div>
   );
 }

@@ -30,4 +30,7 @@ contextBridge.exposeInMainWorld('superTerminal', {
     delete: (name: string) =>
       ipcRenderer.invoke('session:delete', { name }),
   },
+  dialog: {
+    openImage: () => ipcRenderer.invoke('dialog:openImage'),
+  },
 });

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
 import path from 'path';
 import { PtyManager } from './pty-manager';
 import { SessionManager } from './session-manager';
@@ -92,4 +92,14 @@ ipcMain.handle('session:list', () => {
 
 ipcMain.handle('session:delete', (_event, { name }) => {
   return sessionManager.delete(name);
+});
+
+// Dialog IPC handlers
+ipcMain.handle('dialog:openImage', async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ['openFile'],
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
 });

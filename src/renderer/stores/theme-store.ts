@@ -402,16 +402,33 @@ export function exportThemeJSON(theme: ThemeConfig): string {
   return JSON.stringify(theme, null, 2);
 }
 
+// Background image persistence via localStorage
+const BG_IMAGE_KEY = 'superTerminal:backgroundImage';
+const BG_OPACITY_KEY = 'superTerminal:backgroundOpacity';
+
+function loadBackgroundImage(): string | null {
+  return localStorage.getItem(BG_IMAGE_KEY);
+}
+
+function loadBackgroundOpacity(): number {
+  const stored = localStorage.getItem(BG_OPACITY_KEY);
+  return stored ? Number(stored) : 0.3;
+}
+
 interface ThemeStore {
   theme: ThemeConfig;
   customThemes: ThemeConfig[];
   fontSize: number;
   fontFamily: string;
   opacity: number;
+  backgroundImage: string | null;
+  backgroundOpacity: number;
   setTheme: (theme: ThemeConfig) => void;
   setFontSize: (size: number) => void;
   setFontFamily: (family: string) => void;
   setOpacity: (opacity: number) => void;
+  setBackgroundImage: (path: string | null) => void;
+  setBackgroundOpacity: (opacity: number) => void;
   addCustomTheme: (theme: ThemeConfig) => void;
   removeCustomTheme: (name: string) => void;
   getAllThemes: () => ThemeConfig[];
@@ -423,10 +440,21 @@ export const useThemeStore = createStore<ThemeStore>((set, get) => ({
   fontSize: 14,
   fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
   opacity: 1,
+  backgroundImage: loadBackgroundImage(),
+  backgroundOpacity: loadBackgroundOpacity(),
   setTheme: (theme) => set({ theme }),
   setFontSize: (fontSize) => set({ fontSize }),
   setFontFamily: (fontFamily) => set({ fontFamily }),
   setOpacity: (opacity) => set({ opacity }),
+  setBackgroundImage: (path) => {
+    if (path) localStorage.setItem(BG_IMAGE_KEY, path);
+    else localStorage.removeItem(BG_IMAGE_KEY);
+    set({ backgroundImage: path });
+  },
+  setBackgroundOpacity: (opacity) => {
+    localStorage.setItem(BG_OPACITY_KEY, String(opacity));
+    set({ backgroundOpacity: opacity });
+  },
   addCustomTheme: (theme) => {
     const existing = get().customThemes;
     const filtered = existing.filter((t) => t.name !== theme.name);

@@ -35,34 +35,57 @@ html, body, #root {
   border: none;
   cursor: pointer;
   color: inherit;
-  padding: 2px 4px;
-  border-radius: 3px;
+  padding: 3px 5px;
+  border-radius: 4px;
   font-family: inherit;
   line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  transition: background-color 0.1s;
 }
 
 .toolbar-btn:hover {
   background: rgba(255, 255, 255, 0.1);
 }
 
+.toolbar-btn-danger:hover {
+  background: rgba(255, 80, 80, 0.2);
+}
+
+.tab {
+  transition: background-color 0.1s;
+}
+
 .tab:hover {
   background: rgba(255, 255, 255, 0.05) !important;
+}
+
+.tab-close {
+  opacity: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px;
+  border-radius: 3px;
+  transition: opacity 0.1s;
+}
+
+.tab:hover .tab-close {
+  opacity: 0.5;
 }
 
 .tab-close:hover {
   opacity: 1 !important;
   color: #f7768e;
+  background: rgba(255, 80, 80, 0.15);
 }
 
 .terminal-view .xterm {
   padding: 4px;
 }
 
-/* Allotment sash styling */
-.split-view-view .sash-container .sash {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.split-view-view .sash-container .sash:hover {
-  background: rgba(255, 255, 255, 0.2);
+.terminal-transparent .xterm,
+.terminal-transparent .xterm-viewport {
+  background-color: transparent !important;
 }

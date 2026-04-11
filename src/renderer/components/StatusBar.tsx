@@ -1,6 +1,7 @@
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore, builtinThemes, validateTheme, exportThemeJSON } from '../stores/theme-store';
 import { useState, useRef } from 'react';
+import { Settings, Import, Export, Trash, ImageIcon, Save, X } from './icons';
 
 export function StatusBar() {
   const terminals = useTerminalStore((s) => s.terminals);
@@ -14,6 +15,10 @@ export function StatusBar() {
   const addCustomTheme = useThemeStore((s) => s.addCustomTheme);
   const removeCustomTheme = useThemeStore((s) => s.removeCustomTheme);
   const getAllThemes = useThemeStore((s) => s.getAllThemes);
+  const backgroundImage = useThemeStore((s) => s.backgroundImage);
+  const backgroundOpacity = useThemeStore((s) => s.backgroundOpacity);
+  const setBackgroundImage = useThemeStore((s) => s.setBackgroundImage);
+  const setBackgroundOpacity = useThemeStore((s) => s.setBackgroundOpacity);
 
   const [showSettings, setShowSettings] = useState(false);
   const [importError, setImportError] = useState('');
@@ -57,7 +62,6 @@ export function StatusBar() {
       }
     };
     reader.readAsText(file);
-    // Reset so same file can be re-imported
     e.target.value = '';
   };
 
@@ -70,6 +74,11 @@ export function StatusBar() {
     a.download = `${theme.name.toLowerCase().replace(/\s+/g, '-')}.json`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handlePickImage = async () => {
+    const path = await window.superTerminal.dialog.openImage();
+    if (path) setBackgroundImage(path);
   };
 
   const allThemes = getAllThemes();
@@ -103,9 +112,9 @@ export function StatusBar() {
               setShowSettings(!showSettings);
               if (!showSettings) loadSessions();
             }}
-            style={{ fontSize: 11 }}
+            title="Settings"
           >
-            Settings
+            <Settings size={13} />
           </button>
         </div>
       </div>
@@ -134,7 +143,7 @@ export function StatusBar() {
         >
           {/* Theme Selection */}
           <div>
-            <label style={{ display: 'block', marginBottom: 6, color: theme.uiTextMuted }}>Theme</label>
+            <label style={{ display: 'block', marginBottom: 6, color: theme.uiTextMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Theme</label>
             <div
               style={{
                 display: 'grid',
@@ -161,7 +170,6 @@ export function StatusBar() {
                     textOverflow: 'ellipsis',
                     overflow: 'hidden',
                     whiteSpace: 'nowrap',
-                    position: 'relative',
                   }}
                 >
                   {t.name}
@@ -177,22 +185,22 @@ export function StatusBar() {
               onClick={() => fileInputRef.current?.click()}
               style={{ fontSize: 11, padding: '3px 8px' }}
             >
-              Import Theme
+              <Import size={12} /> Import
             </button>
             <button
               className="toolbar-btn"
               onClick={handleExportTheme}
               style={{ fontSize: 11, padding: '3px 8px' }}
             >
-              Export Current
+              <Export size={12} /> Export
             </button>
             {isCustom(theme.name) && (
               <button
-                className="toolbar-btn"
+                className="toolbar-btn toolbar-btn-danger"
                 onClick={() => removeCustomTheme(theme.name)}
                 style={{ fontSize: 11, padding: '3px 8px', color: theme.red }}
               >
-                Delete Theme
+                <Trash size={12} /> Delete
               </button>
             )}
             <input
@@ -209,7 +217,7 @@ export function StatusBar() {
 
           {/* Font Size */}
           <div>
-            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted }}>
+            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
               Font Size: {fontSize}px
             </label>
             <input
@@ -222,9 +230,49 @@ export function StatusBar() {
             />
           </div>
 
+          {/* Background Image */}
+          <div>
+            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Background
+            </label>
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <button
+                className="toolbar-btn"
+                onClick={handlePickImage}
+                style={{ fontSize: 11, padding: '3px 8px' }}
+              >
+                <ImageIcon size={12} /> {backgroundImage ? 'Change' : 'Set Image'}
+              </button>
+              {backgroundImage && (
+                <button
+                  className="toolbar-btn toolbar-btn-danger"
+                  onClick={() => setBackgroundImage(null)}
+                  style={{ fontSize: 11, padding: '3px 8px', color: theme.red }}
+                >
+                  <X size={12} /> Clear
+                </button>
+              )}
+            </div>
+            {backgroundImage && (
+              <div style={{ marginTop: 6 }}>
+                <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted, fontSize: 11 }}>
+                  Opacity: {Math.round(backgroundOpacity * 100)}%
+                </label>
+                <input
+                  type="range"
+                  min="5"
+                  max="100"
+                  value={Math.round(backgroundOpacity * 100)}
+                  onChange={(e) => setBackgroundOpacity(Number(e.target.value) / 100)}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            )}
+          </div>
+
           {/* Sessions */}
           <div>
-            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted }}>Sessions</label>
+            <label style={{ display: 'block', marginBottom: 4, color: theme.uiTextMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Sessions</label>
             <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
               <input
                 type="text"
@@ -243,7 +291,7 @@ export function StatusBar() {
                 }}
               />
               <button className="toolbar-btn" onClick={saveSession} style={{ fontSize: 11, padding: '3px 8px' }}>
-                Save
+                <Save size={12} /> Save
               </button>
             </div>
             {savedSessions.length > 0 && (
@@ -252,11 +300,11 @@ export function StatusBar() {
                   <div key={name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <span style={{ fontSize: 12 }}>{name}</span>
                     <button
-                      className="toolbar-btn"
+                      className="toolbar-btn toolbar-btn-danger"
                       onClick={() => window.superTerminal.session.delete(name).then(loadSessions)}
                       style={{ fontSize: 10, color: theme.red }}
                     >
-                      Delete
+                      <Trash size={11} />
                     </button>
                   </div>
                 ))}

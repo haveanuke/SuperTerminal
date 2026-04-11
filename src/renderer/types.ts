@@ -73,6 +73,9 @@ declare global {
         list: () => Promise<string[]>;
         delete: (name: string) => Promise<boolean>;
       };
+      dialog: {
+        openImage: () => Promise<string | null>;
+      };
     };
   }
 }
