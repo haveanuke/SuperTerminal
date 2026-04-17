@@ -76,6 +76,10 @@ declare global {
       dialog: {
         openImage: () => Promise<string | null>;
       };
+      buddy: {
+        react: (req: { command: string; args: string[]; prompt: string; timeoutMs?: number }) =>
+          Promise<{ ok: boolean; text: string; error?: string }>;
+      };
     };
   }
 }

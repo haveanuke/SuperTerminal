@@ -33,4 +33,8 @@ contextBridge.exposeInMainWorld('superTerminal', {
   dialog: {
     openImage: () => ipcRenderer.invoke('dialog:openImage'),
   },
+  buddy: {
+    react: (req: { command: string; args: string[]; prompt: string; timeoutMs?: number }) =>
+      ipcRenderer.invoke('buddy:react', req),
+  },
 });

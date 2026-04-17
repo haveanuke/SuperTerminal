@@ -3,8 +3,12 @@ import { useThemeStore } from '../stores/theme-store';
 import { TabBar } from './TabBar';
 import { SplitPane } from './SplitPane';
 import { StatusBar } from './StatusBar';
+import { ClaudeBuddy } from './ClaudeBuddy';
+import { useBuddyEventWatcher } from '../buddy/use-event-watcher';
 
 export function App() {
+  useBuddyEventWatcher();
+
   const tabs = useTerminalStore((s) => s.tabs);
   const activeTabId = useTerminalStore((s) => s.activeTabId);
   const theme = useThemeStore((s) => s.theme);
@@ -69,6 +73,7 @@ export function App() {
       <div style={{ position: 'relative', zIndex: 1 }}>
         <StatusBar />
       </div>
+      <ClaudeBuddy />
     </div>
   );
 }

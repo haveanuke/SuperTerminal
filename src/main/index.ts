@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
 import path from 'path';
 import { PtyManager } from './pty-manager';
 import { SessionManager } from './session-manager';
+import { runBuddyAgent } from './buddy-agent';
 
 let mainWindow: BrowserWindow | null = null;
 const ptyManager = new PtyManager();
@@ -92,6 +93,11 @@ ipcMain.handle('session:list', () => {
 
 ipcMain.handle('session:delete', (_event, { name }) => {
   return sessionManager.delete(name);
+});
+
+// Buddy agent IPC handler
+ipcMain.handle('buddy:react', async (_event, req) => {
+  return runBuddyAgent(req);
 });
 
 // Dialog IPC handlers

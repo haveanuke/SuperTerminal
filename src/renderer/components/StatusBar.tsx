@@ -1,5 +1,7 @@
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore, builtinThemes, validateTheme, exportThemeJSON } from '../stores/theme-store';
+import { useBuddyStore, AGENT_PRESETS } from '../buddy/buddy-store';
+import type { AgentConfig } from '../buddy/buddy-store';
 import { useState, useRef } from 'react';
 import { Settings, Import, Export, Trash, ImageIcon, Save, X } from './icons';
 
@@ -19,6 +21,14 @@ export function StatusBar() {
   const backgroundOpacity = useThemeStore((s) => s.backgroundOpacity);
   const setBackgroundImage = useThemeStore((s) => s.setBackgroundImage);
   const setBackgroundOpacity = useThemeStore((s) => s.setBackgroundOpacity);
+
+  const buddyVisible = useBuddyStore((s) => s.visible);
+  const setBuddyVisible = useBuddyStore((s) => s.setVisible);
+  const buddyHatched = useBuddyStore((s) => s.hasHatched);
+  const buddyCompanion = useBuddyStore((s) => s.companion);
+  const setBuddyCardOpen = useBuddyStore((s) => s.setCardOpen);
+  const buddyAgent = useBuddyStore((s) => s.agent);
+  const setBuddyAgent = useBuddyStore((s) => s.setAgent);
 
   const [showSettings, setShowSettings] = useState(false);
   const [importError, setImportError] = useState('');
@@ -105,7 +115,20 @@ export function StatusBar() {
           <span>{terminals.size} terminal{terminals.size !== 1 ? 's' : ''}</span>
           {broadcastMode && <span style={{ color: theme.uiAccent }}>Broadcast ON</span>}
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {buddyHatched && buddyCompanion && (
+            <button
+              className="toolbar-btn"
+              onClick={() => {
+                if (buddyVisible) setBuddyCardOpen(true);
+                else setBuddyVisible(true);
+              }}
+              title={buddyVisible ? `${buddyCompanion.name} — click for details` : `Show ${buddyCompanion.name}`}
+              style={{ fontSize: 11, padding: '1px 6px', opacity: buddyVisible ? 1 : 0.55 }}
+            >
+              {buddyVisible ? '\u25c9' : '\u25cb'} {buddyCompanion.name}
+            </button>
+          )}
           <button
             className="toolbar-btn"
             onClick={() => {
@@ -266,6 +289,87 @@ export function StatusBar() {
                   onChange={(e) => setBackgroundOpacity(Number(e.target.value) / 100)}
                   style={{ width: '100%' }}
                 />
+              </div>
+            )}
+          </div>
+
+          {/* Claude Buddy */}
+          <div>
+            <label style={{ display: 'block', marginBottom: 6, color: theme.uiTextMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+              Buddy
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 6 }}>
+              <input
+                type="checkbox"
+                checked={buddyAgent.enabled}
+                onChange={(e) => setBuddyAgent({ enabled: e.target.checked })}
+              />
+              Smart reactions (run a CLI agent)
+            </label>
+            {buddyAgent.enabled && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <select
+                  value={buddyAgent.preset}
+                  onChange={(e) => {
+                    const preset = e.target.value as AgentConfig['preset'];
+                    if (preset === 'custom') {
+                      setBuddyAgent({ preset });
+                    } else {
+                      setBuddyAgent({ preset, ...AGENT_PRESETS[preset] });
+                    }
+                  }}
+                  style={{
+                    background: theme.uiBackground,
+                    border: `1px solid ${theme.uiBorder}`,
+                    color: theme.uiText,
+                    padding: '3px 6px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                  }}
+                >
+                  <option value="claude">Claude Code (claude -p)</option>
+                  <option value="codex">Codex (codex exec)</option>
+                  <option value="ollama">Ollama (llama3)</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <input
+                  type="text"
+                  value={buddyAgent.command}
+                  onChange={(e) => setBuddyAgent({ command: e.target.value, preset: 'custom' })}
+                  placeholder="command (e.g. claude)"
+                  style={{
+                    background: theme.uiBackground,
+                    border: `1px solid ${theme.uiBorder}`,
+                    color: theme.uiText,
+                    padding: '3px 8px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                    outline: 'none',
+                    fontFamily: 'monospace',
+                  }}
+                />
+                <input
+                  type="text"
+                  value={buddyAgent.args.join(' ')}
+                  onChange={(e) => {
+                    const args = e.target.value.match(/(?:"[^"]*"|\S)+/g)?.map((a) => a.replace(/^"|"$/g, '')) ?? [];
+                    setBuddyAgent({ args, preset: 'custom' });
+                  }}
+                  placeholder={'args (use {prompt} placeholder)'}
+                  style={{
+                    background: theme.uiBackground,
+                    border: `1px solid ${theme.uiBorder}`,
+                    color: theme.uiText,
+                    padding: '3px 8px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                    outline: 'none',
+                    fontFamily: 'monospace',
+                  }}
+                />
+                <div style={{ fontSize: 10, color: theme.uiTextMuted }}>
+                  Runs on error / test-fail / large output, max once per 30s. Falls back to canned reactions.
+                </div>
               </div>
             )}
           </div>
