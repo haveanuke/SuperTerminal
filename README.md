@@ -23,6 +23,38 @@ npm run build
 npm start
 ```
 
+## Packaging
+
+Build a distributable `.dmg` for macOS:
+
+```bash
+npm run package
+```
+
+Output lands in `release/` (gitignored). The default config builds for Apple Silicon (`arm64`); Intel Macs can build locally by editing the `mac.target` arch in `package.json`.
+
+> **Note on unsigned builds:** Without an Apple Developer signing identity, macOS Gatekeeper will block the app on first launch ("Apple cannot check this app for malicious software"). Users can either right-click → **Open** to bypass once, or run `xattr -cr /Applications/SuperTerminal.app` after installing. Proper signing + notarization requires a paid Apple Developer account.
+
+## Releases
+
+A GitHub Actions workflow (`.github/workflows/release.yml`) builds and uploads DMGs to a GitHub release whenever a `v*` tag is pushed:
+
+```bash
+# Bump the version field in package.json first, then:
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow runs on `macos-latest` (Apple Silicon), and attaches the DMG to a release with auto-generated release notes. Builds are unsigned — see the note above.
+
+## Tests & Lint
+
+```bash
+npm test          # vitest run
+npm run lint      # eslint
+npm run format    # prettier --write
+```
+
 ## Usage
 
 - **Add tabs** - Click `+` in the tab bar (each tab is an independent workspace)

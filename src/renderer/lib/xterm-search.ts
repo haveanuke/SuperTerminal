@@ -27,7 +27,7 @@ function findAllMatches(terminal: Terminal, query: string, caseSensitive: boolea
   for (let i = 0; i < buf.length; i++) {
     const line = buf.getLine(i);
     if (!line) continue;
-    let text = line.translateToString(false);
+    const text = line.translateToString(false);
     const compareText = caseSensitive ? text : text.toLowerCase();
     let offset = 0;
     while (offset <= compareText.length - searchStr.length) {

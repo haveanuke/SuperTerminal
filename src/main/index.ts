@@ -70,6 +70,13 @@ ipcMain.handle('pty:write', (_event, { id, data }) => {
   ptyManager.write(id, data);
 });
 
+ipcMain.handle('pty:writeBroadcast', (_event, { ids, data }) => {
+  if (!Array.isArray(ids) || typeof data !== 'string') return;
+  for (const id of ids) {
+    if (typeof id === 'string') ptyManager.write(id, data);
+  }
+});
+
 ipcMain.handle('pty:resize', (_event, { id, cols, rows }) => {
   ptyManager.resize(id, cols, rows);
 });

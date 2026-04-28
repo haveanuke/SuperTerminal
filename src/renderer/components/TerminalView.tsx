@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useThemeStore } from '../stores/theme-store';
+import { useUIStore } from '../stores/ui-store';
 import { useTerminalStore } from '../stores/terminal-store';
 import { findNext, clearDecorations } from '../lib/xterm-search';
 import { xtermRegistry, getOrCreateXterm, safeFit, invalidateCharCache } from '../xterm-registry';
@@ -12,9 +13,9 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const theme = useThemeStore((s) => s.theme);
-  const fontSize = useThemeStore((s) => s.fontSize);
-  const fontFamily = useThemeStore((s) => s.fontFamily);
-  const backgroundImage = useThemeStore((s) => s.backgroundImage);
+  const fontSize = useUIStore((s) => s.fontSize);
+  const fontFamily = useUIStore((s) => s.fontFamily);
+  const backgroundImage = useUIStore((s) => s.backgroundImage);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const broadcastTargets = useTerminalStore((s) => s.broadcastTargets);
   const setActiveTerminalId = useTerminalStore((s) => s.setActiveTerminalId);
@@ -124,22 +125,28 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
 
   // Auto-run
   const autoRun = useTerminalStore((s) => s.terminals.get(terminalId)?.autoRun);
+  const autoRunInFlightRef = useRef(false);
 
   useEffect(() => {
     if (!autoRun?.enabled || !autoRun.command) return;
     const intervalMs = autoRun.intervalSeconds * 1000;
     const escDelay = (autoRun.escapeDelaySecs || 2) * 1000;
     const timers: ReturnType<typeof setTimeout>[] = [];
+    autoRunInFlightRef.current = false;
 
     const runCommand = () => {
+      if (autoRunInFlightRef.current) return;
+      autoRunInFlightRef.current = true;
       window.superTerminal.pty.write(terminalId, autoRun.command);
       const enterTimer = setTimeout(() => {
         window.superTerminal.pty.write(terminalId, '\r');
+        if (!autoRun.sendEscape) autoRunInFlightRef.current = false;
       }, 50);
       timers.push(enterTimer);
       if (autoRun.sendEscape) {
         const escTimer = setTimeout(() => {
           window.superTerminal.pty.write(terminalId, '\x1b');
+          autoRunInFlightRef.current = false;
         }, escDelay);
         timers.push(escTimer);
       }
@@ -151,6 +158,7 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     return () => {
       clearInterval(interval);
       timers.forEach(clearTimeout);
+      autoRunInFlightRef.current = false;
     };
   }, [terminalId, autoRun?.enabled, autoRun?.command, autoRun?.intervalSeconds, autoRun?.sendEscape, autoRun?.escapeDelaySecs]);
 

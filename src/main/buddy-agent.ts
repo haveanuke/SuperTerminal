@@ -19,6 +19,13 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '');
 }
 
+// Sanity bounds against malformed IPC payloads — not a security boundary.
+// The renderer already has arbitrary local exec via pty:write, so locking down
+// the binary here would be theater. Args are spawned with shell:false so
+// metacharacters in args can't escape into the shell.
+const MAX_ARGS = 16;
+const MAX_ARG_LEN = 4096;
+
 /**
  * Electron on macOS/Linux doesn't inherit the user's shell PATH, so CLIs installed
  * via homebrew/pyenv/fnm/etc. aren't findable. Ask the login shell for its $PATH once
@@ -66,8 +73,20 @@ export function runBuddyAgent(req: BuddyAgentRequest): Promise<BuddyAgentResult>
   const timeoutMs = req.timeoutMs ?? 25_000;
 
   return new Promise((resolve) => {
-    if (!req.command.trim()) {
+    if (typeof req.command !== 'string' || !req.command.trim()) {
       resolve({ ok: false, text: '', error: 'empty command' });
+      return;
+    }
+    if (
+      !Array.isArray(req.args)
+      || req.args.length > MAX_ARGS
+      || req.args.some((a) => typeof a !== 'string' || a.length > MAX_ARG_LEN)
+    ) {
+      resolve({ ok: false, text: '', error: 'invalid args' });
+      return;
+    }
+    if (typeof req.prompt !== 'string') {
+      resolve({ ok: false, text: '', error: 'invalid prompt' });
       return;
     }
 

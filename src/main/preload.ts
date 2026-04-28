@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('superTerminal', {
       ipcRenderer.invoke('pty:create', { id, cols, rows, cwd }),
     write: (id: string, data: string) =>
       ipcRenderer.invoke('pty:write', { id, data }),
+    writeBroadcast: (ids: string[], data: string) =>
+      ipcRenderer.invoke('pty:writeBroadcast', { ids, data }),
     resize: (id: string, cols: number, rows: number) =>
       ipcRenderer.invoke('pty:resize', { id, cols, rows }),
     dispose: (id: string) =>

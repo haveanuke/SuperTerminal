@@ -3,7 +3,7 @@ import { useBuddyStore } from '../buddy/buddy-store';
 import { useThemeStore } from '../stores/theme-store';
 import { getArtFrame, applyHat } from '../buddy/species-art';
 import { RARITY_COLOR, RARITY_STARS, STAT_NAMES } from '../buddy/engine';
-import { talkToBuddy } from '../buddy/talk';
+import { BuddyChatPanel } from './BuddyChatPanel';
 import { X } from './icons';
 
 const FRAME_INTERVAL = 900;
@@ -17,49 +17,23 @@ export function ClaudeBuddy() {
   const bubble = useBuddyStore((s) => s.bubble);
   const cardOpen = useBuddyStore((s) => s.cardOpen);
   const chatOpen = useBuddyStore((s) => s.chatOpen);
-  const chatBusy = useBuddyStore((s) => s.chatBusy);
   const logOpen = useBuddyStore((s) => s.logOpen);
   const chatLog = useBuddyStore((s) => s.chatLog);
-  const agent = useBuddyStore((s) => s.agent);
   const hatch = useBuddyStore((s) => s.hatch);
   const pet = useBuddyStore((s) => s.pet);
   const setPosition = useBuddyStore((s) => s.setPosition);
   const dismissBubble = useBuddyStore((s) => s.dismissBubble);
   const setCardOpen = useBuddyStore((s) => s.setCardOpen);
   const setChatOpen = useBuddyStore((s) => s.setChatOpen);
-  const setChatBusy = useBuddyStore((s) => s.setChatBusy);
   const setLogOpen = useBuddyStore((s) => s.setLogOpen);
-  const addChatEntry = useBuddyStore((s) => s.addChatEntry);
   const clearChatLog = useBuddyStore((s) => s.clearChatLog);
-  const setBubbleText = useBuddyStore((s) => s.setBubbleText);
-  const speak = useBuddyStore((s) => s.speak);
 
   const theme = useThemeStore((s) => s.theme);
 
   const [frame, setFrame] = useState(0);
   const [blink, setBlink] = useState(false);
-  const [chatDraft, setChatDraft] = useState('');
   const [bubbleCopied, setBubbleCopied] = useState(false);
   const dragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
-
-  const sendChat = async () => {
-    const msg = chatDraft.trim();
-    if (!msg || !companion || chatBusy) return;
-    addChatEntry({ role: 'user', text: msg });
-    setChatBusy(true);
-    setBubbleText('...', 60_000);
-    const res = await talkToBuddy(companion, agent, msg);
-    setChatBusy(false);
-    if (res.ok && res.text) {
-      setBubbleText(res.text, 30_000);
-      addChatEntry({ role: 'buddy', text: res.text });
-      speak(res.text);
-    } else {
-      setBubbleText(res.error || '*silence*', 6_000);
-    }
-    setChatDraft('');
-    setChatOpen(false);
-  };
 
   const copyBubbleText = async () => {
     if (!bubble?.text) return;
@@ -193,85 +167,7 @@ export function ClaudeBuddy() {
           </div>
         )}
 
-        {chatOpen && (() => {
-          // Chat panel is rendered at a fixed viewport position so it can't
-          // get clipped by the buddy's own offsetParent, and flips sides
-          // depending on which half of the screen the buddy sits in.
-          const panelW = 280;
-          const panelH = 40;
-          const margin = 8;
-          const buddyW = 160;
-          const buddyH = 100;
-          const anchorBelow = position.y + buddyH + panelH + margin < window.innerHeight;
-          const left = Math.max(margin, Math.min(window.innerWidth - panelW - margin, position.x + buddyW / 2 - panelW / 2));
-          const top = anchorBelow ? position.y + buddyH + margin : Math.max(margin, position.y - panelH - margin);
-          return (
-            <div
-              onMouseDown={(e) => e.stopPropagation()}
-              style={{
-                position: 'fixed',
-                top,
-                left,
-                width: panelW,
-                display: 'flex',
-                gap: 4,
-                background: theme.uiSurface,
-                border: `1px solid ${theme.uiBorder}`,
-                borderRadius: 8,
-                padding: 6,
-                boxShadow: '0 4px 16px rgba(0,0,0,0.35)',
-                zIndex: 201,
-                boxSizing: 'border-box',
-              }}
-            >
-              <input
-                autoFocus
-                value={chatDraft}
-                onChange={(e) => setChatDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') sendChat();
-                  else if (e.key === 'Escape') {
-                    setChatOpen(false);
-                    setChatDraft('');
-                  }
-                }}
-                placeholder={agent.enabled ? `talk to ${companion.name}...` : 'enable smart mode in settings'}
-                disabled={!agent.enabled || chatBusy}
-                style={{
-                  flex: '1 1 auto',
-                  minWidth: 0,
-                  background: theme.uiBackground,
-                  color: theme.uiText,
-                  border: `1px solid ${theme.uiBorder}`,
-                  padding: '3px 8px',
-                  fontSize: 12,
-                  borderRadius: 4,
-                  outline: 'none',
-                }}
-              />
-              <button
-                className="toolbar-btn"
-                onClick={sendChat}
-                disabled={!agent.enabled || chatBusy || !chatDraft.trim()}
-                style={{ fontSize: 11, flex: '0 0 auto', whiteSpace: 'nowrap' }}
-              >
-                {chatBusy ? '...' : 'send'}
-              </button>
-              <button
-                className="toolbar-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setLogOpen(true);
-                }}
-                disabled={chatLog.length === 0}
-                title={chatLog.length === 0 ? 'no chat history yet' : `view ${chatLog.length} message${chatLog.length === 1 ? '' : 's'}`}
-                style={{ fontSize: 11, flex: '0 0 auto', whiteSpace: 'nowrap' }}
-              >
-                log
-              </button>
-            </div>
-          );
-        })()}
+        {chatOpen && <BuddyChatPanel position={position} />}
 
         <div
           onClick={(e) => {
