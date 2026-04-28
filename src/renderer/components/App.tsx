@@ -1,9 +1,11 @@
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
+import { useUIStore } from '../stores/ui-store';
 import { TabBar } from './TabBar';
 import { SplitPane } from './SplitPane';
 import { StatusBar } from './StatusBar';
 import { ClaudeBuddy } from './ClaudeBuddy';
+import { Toasts } from './Toasts';
 import { useBuddyEventWatcher } from '../buddy/use-event-watcher';
 
 export function App() {
@@ -12,8 +14,8 @@ export function App() {
   const tabs = useTerminalStore((s) => s.tabs);
   const activeTabId = useTerminalStore((s) => s.activeTabId);
   const theme = useThemeStore((s) => s.theme);
-  const backgroundImage = useThemeStore((s) => s.backgroundImage);
-  const backgroundOpacity = useThemeStore((s) => s.backgroundOpacity);
+  const backgroundImage = useUIStore((s) => s.backgroundImage);
+  const backgroundOpacity = useUIStore((s) => s.backgroundOpacity);
 
   return (
     <div
@@ -74,6 +76,7 @@ export function App() {
         <StatusBar />
       </div>
       <ClaudeBuddy />
+      <Toasts />
     </div>
   );
 }

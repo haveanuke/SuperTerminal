@@ -25,15 +25,20 @@ function getShellEnv(): Record<string, string> {
 
 const shellEnv = getShellEnv();
 
+interface PtyRecord {
+  proc: pty.IPty;
+  listenerDisposables: pty.IDisposable[];
+}
+
 export class PtyManager {
-  private processes = new Map<string, pty.IPty>();
+  private records = new Map<string, PtyRecord>();
 
   has(id: string): boolean {
-    return this.processes.has(id);
+    return this.records.has(id);
   }
 
   create(id: string, cols: number, rows: number, cwd?: string) {
-    if (this.processes.has(id)) return;
+    if (this.records.has(id)) return;
     const shell = process.env.SHELL || (os.platform() === 'win32' ? 'powershell.exe' : 'bash');
     const proc = pty.spawn(shell, [], {
       name: 'xterm-256color',
@@ -42,35 +47,42 @@ export class PtyManager {
       cwd: cwd || os.homedir(),
       env: shellEnv,
     });
-    this.processes.set(id, proc);
+    this.records.set(id, { proc, listenerDisposables: [] });
   }
 
   write(id: string, data: string) {
-    this.processes.get(id)?.write(data);
+    this.records.get(id)?.proc.write(data);
   }
 
   resize(id: string, cols: number, rows: number) {
-    this.processes.get(id)?.resize(cols, rows);
+    this.records.get(id)?.proc.resize(cols, rows);
   }
 
   onData(id: string, callback: (data: string) => void) {
-    this.processes.get(id)?.onData(callback);
+    const rec = this.records.get(id);
+    if (!rec) return;
+    rec.listenerDisposables.push(rec.proc.onData(callback));
   }
 
   onExit(id: string, callback: (exitCode: number) => void) {
-    this.processes.get(id)?.onExit(({ exitCode }) => callback(exitCode));
+    const rec = this.records.get(id);
+    if (!rec) return;
+    rec.listenerDisposables.push(rec.proc.onExit(({ exitCode }) => callback(exitCode)));
   }
 
   dispose(id: string) {
-    const proc = this.processes.get(id);
-    if (proc) {
-      proc.kill();
-      this.processes.delete(id);
+    const rec = this.records.get(id);
+    if (!rec) return;
+    for (const d of rec.listenerDisposables) {
+      try { d.dispose(); } catch { /* ignore */ }
     }
+    rec.listenerDisposables.length = 0;
+    rec.proc.kill();
+    this.records.delete(id);
   }
 
   disposeAll() {
-    for (const [id] of this.processes) {
+    for (const id of [...this.records.keys()]) {
       this.dispose(id);
     }
   }

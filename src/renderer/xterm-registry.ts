@@ -1,8 +1,10 @@
 import { Terminal } from '@xterm/xterm';
-import { fitTerminal, invalidateCharCache } from './lib/xterm-fit';
+import { fitTerminal } from './lib/xterm-fit';
 import { registerWebLinks } from './lib/xterm-web-links';
 import { useThemeStore } from './stores/theme-store';
+import { useUIStore } from './stores/ui-store';
 import { useTerminalStore } from './stores/terminal-store';
+import { toastError } from './stores/toast-store';
 
 export interface XtermEntry {
   xterm: Terminal;
@@ -19,17 +21,18 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   if (existing) return existing;
 
   const themeState = useThemeStore.getState();
+  const uiState = useUIStore.getState();
 
   const xterm = new Terminal({
-    fontSize: themeState.fontSize,
-    fontFamily: themeState.fontFamily,
+    fontSize: uiState.fontSize,
+    fontFamily: uiState.fontFamily,
     scrollback: 10000,
     cursorBlink: true,
     cursorStyle: 'bar',
     allowProposedApi: true,
-    allowTransparency: !!themeState.backgroundImage,
+    allowTransparency: !!uiState.backgroundImage,
     theme: {
-      background: themeState.backgroundImage ? 'transparent' : themeState.theme.background,
+      background: uiState.backgroundImage ? 'transparent' : themeState.theme.background,
       foreground: themeState.theme.foreground,
       cursor: themeState.theme.cursor,
       selectionBackground: themeState.theme.selection,
@@ -62,9 +65,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   xterm.onData((data) => {
     const store = useTerminalStore.getState();
     if (store.broadcastMode && store.broadcastTargets.size > 0) {
-      store.broadcastTargets.forEach((targetId) => {
-        window.superTerminal.pty.write(targetId, data);
-      });
+      window.superTerminal.pty.writeBroadcast([...store.broadcastTargets], data);
     } else {
       window.superTerminal.pty.write(terminalId, data);
     }
@@ -75,7 +76,11 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   });
 
   const { cols, rows } = xterm;
-  window.superTerminal.pty.create(terminalId, cols, rows);
+  window.superTerminal.pty.create(terminalId, cols, rows).catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    xterm.write(`\r\n[Failed to start terminal: ${msg}]\r\n`);
+    toastError(`Failed to start terminal: ${msg}`);
+  });
 
   const removeDataListener = window.superTerminal.pty.onData(terminalId, (data) => {
     const buf = xterm.buffer.active;

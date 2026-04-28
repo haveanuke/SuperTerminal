@@ -62,6 +62,7 @@ declare global {
       pty: {
         create: (id: string, cols: number, rows: number, cwd?: string) => Promise<boolean>;
         write: (id: string, data: string) => Promise<void>;
+        writeBroadcast: (ids: string[], data: string) => Promise<void>;
         resize: (id: string, cols: number, rows: number) => Promise<void>;
         dispose: (id: string) => Promise<void>;
         onData: (id: string, callback: (data: string) => void) => () => void;
