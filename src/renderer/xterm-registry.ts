@@ -59,7 +59,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   element.style.height = '100%';
   xterm.open(element);
 
-  xterm.onData((data) => {
+  const writeToPty = (data: string) => {
     const store = useTerminalStore.getState();
     if (store.broadcastMode && store.broadcastTargets.size > 0) {
       store.broadcastTargets.forEach((targetId) => {
@@ -68,6 +68,61 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     } else {
       window.superTerminal.pty.write(terminalId, data);
     }
+  };
+
+  xterm.onData(writeToPty);
+
+  xterm.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    const { metaKey, altKey, ctrlKey, key } = e;
+
+    if (metaKey && !ctrlKey && !altKey) {
+      switch (key) {
+        case 'Backspace':
+          writeToPty('\x15');
+          e.preventDefault();
+          return false;
+        case 'ArrowLeft':
+          writeToPty('\x01');
+          e.preventDefault();
+          return false;
+        case 'ArrowRight':
+          writeToPty('\x05');
+          e.preventDefault();
+          return false;
+        case 'Delete':
+          writeToPty('\x0b');
+          e.preventDefault();
+          return false;
+        case 'Enter':
+          writeToPty('\x1b\r');
+          e.preventDefault();
+          return false;
+      }
+    }
+
+    if (altKey && !metaKey && !ctrlKey) {
+      switch (key) {
+        case 'Backspace':
+          writeToPty('\x17');
+          e.preventDefault();
+          return false;
+        case 'Delete':
+          writeToPty('\x1bd');
+          e.preventDefault();
+          return false;
+        case 'ArrowLeft':
+          writeToPty('\x1bb');
+          e.preventDefault();
+          return false;
+        case 'ArrowRight':
+          writeToPty('\x1bf');
+          e.preventDefault();
+          return false;
+      }
+    }
+
+    return true;
   });
 
   xterm.onTitleChange((title) => {
