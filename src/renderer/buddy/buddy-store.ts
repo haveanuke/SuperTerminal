@@ -280,7 +280,6 @@ export const useBuddyStore = createStore<BuddyStoreState>((set, get) => ({
     const text = getReaction(reason, companion.bones.species, companion.bones.rarity, context);
     const ttl = reason === 'hatch' ? 12_000 : reason === 'pet' ? 7_000 : 10_000;
     set({ bubble: { text, at: now, ttl }, lastReactionAt: now });
-    get().addChatEntry({ role: 'buddy', text });
     get().speak(text);
   },
 
