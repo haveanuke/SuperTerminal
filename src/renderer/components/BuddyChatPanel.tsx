@@ -12,9 +12,13 @@ export function BuddyChatPanel({ position }: Props) {
   const companion = useBuddyStore((s) => s.companion);
   const chatBusy = useBuddyStore((s) => s.chatBusy);
   const agent = useBuddyStore((s) => s.agent);
+  const chatLog = useBuddyStore((s) => s.chatLog);
   const setChatOpen = useBuddyStore((s) => s.setChatOpen);
   const setChatBusy = useBuddyStore((s) => s.setChatBusy);
   const setBubbleText = useBuddyStore((s) => s.setBubbleText);
+  const setLogOpen = useBuddyStore((s) => s.setLogOpen);
+  const addChatEntry = useBuddyStore((s) => s.addChatEntry);
+  const speak = useBuddyStore((s) => s.speak);
   const theme = useThemeStore((s) => s.theme);
 
   const [draft, setDraft] = useState('');
@@ -22,14 +26,17 @@ export function BuddyChatPanel({ position }: Props) {
   const send = async () => {
     const msg = draft.trim();
     if (!msg || !companion || chatBusy) return;
+    addChatEntry({ role: 'user', text: msg });
     setChatBusy(true);
     setBubbleText('...', 60_000);
     const res = await talkToBuddy(companion, agent, msg);
     setChatBusy(false);
     if (res.ok && res.text) {
-      setBubbleText(res.text, 9_000);
+      setBubbleText(res.text, 30_000);
+      addChatEntry({ role: 'buddy', text: res.text });
+      speak(res.text);
     } else {
-      setBubbleText(res.error || '*silence*', 4_000);
+      setBubbleText(res.error || '*silence*', 6_000);
     }
     setDraft('');
     setChatOpen(false);
@@ -89,6 +96,18 @@ export function BuddyChatPanel({ position }: Props) {
         style={{ fontSize: 11, flex: '0 0 auto', whiteSpace: 'nowrap' }}
       >
         {chatBusy ? '...' : 'send'}
+      </button>
+      <button
+        className="toolbar-btn"
+        onClick={(e) => {
+          e.stopPropagation();
+          setLogOpen(true);
+        }}
+        disabled={chatLog.length === 0}
+        title={chatLog.length === 0 ? 'no chat history yet' : `view ${chatLog.length} message${chatLog.length === 1 ? '' : 's'}`}
+        style={{ fontSize: 11, flex: '0 0 auto', whiteSpace: 'nowrap' }}
+      >
+        log
       </button>
     </div>
   );

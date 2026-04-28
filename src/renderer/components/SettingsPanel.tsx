@@ -4,6 +4,7 @@ import { useThemeStore, validateTheme, exportThemeJSON } from '../stores/theme-s
 import { useUIStore } from '../stores/ui-store';
 import { useBuddyStore, AGENT_PRESETS } from '../buddy/buddy-store';
 import type { AgentConfig } from '../buddy/buddy-store';
+import { isTtsAvailable, getVoicesAsync, speak as ttsPreview } from '../buddy/tts';
 import { toastError } from '../stores/toast-store';
 import { Import, Export, Trash, ImageIcon, Save, X } from './icons';
 
@@ -24,11 +25,26 @@ export function SettingsPanel() {
 
   const buddyAgent = useBuddyStore((s) => s.agent);
   const setBuddyAgent = useBuddyStore((s) => s.setAgent);
+  const buddyCompanion = useBuddyStore((s) => s.companion);
+  const buddyTts = useBuddyStore((s) => s.tts);
+  const setBuddyTts = useBuddyStore((s) => s.setTts);
 
   const getSerializableLayout = useTerminalStore((s) => s.getSerializableLayout);
 
   const [importError, setImportError] = useState('');
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!isTtsAvailable()) return;
+    let cancelled = false;
+    getVoicesAsync().then((vs) => {
+      if (!cancelled) setVoices(vs);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [sessionName, setSessionName] = useState('');
   const [savedSessions, setSavedSessions] = useState<string[]>([]);
@@ -332,6 +348,95 @@ export function SettingsPanel() {
             </div>
           </div>
         )}
+
+        {/* TTS */}
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${theme.uiBorder}` }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 6 }}>
+            <input
+              type="checkbox"
+              checked={buddyTts.enabled}
+              disabled={!isTtsAvailable()}
+              onChange={(e) => setBuddyTts({ enabled: e.target.checked })}
+            />
+            Speak messages (text-to-speech)
+          </label>
+          {!isTtsAvailable() && (
+            <div style={{ fontSize: 10, color: theme.uiTextMuted, marginBottom: 4 }}>
+              Web Speech API not available in this environment.
+            </div>
+          )}
+          {buddyTts.enabled && isTtsAvailable() && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <select
+                value={buddyTts.voice ?? ''}
+                onChange={(e) => setBuddyTts({ voice: e.target.value || null })}
+                style={{
+                  background: theme.uiBackground,
+                  border: `1px solid ${theme.uiBorder}`,
+                  color: theme.uiText,
+                  padding: '3px 6px',
+                  fontSize: 12,
+                  borderRadius: 4,
+                }}
+              >
+                <option value="">System default</option>
+                {voices
+                  .filter((v) => v.lang.toLowerCase().startsWith('en'))
+                  .map((v) => (
+                    <option key={`${v.name}-${v.lang}`} value={v.name}>
+                      {v.name} ({v.lang}){v.default ? ' — default' : ''}
+                    </option>
+                  ))}
+              </select>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: theme.uiTextMuted }}>
+                <span style={{ width: 40 }}>Rate</span>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={2}
+                  step={0.1}
+                  value={buddyTts.rate}
+                  onChange={(e) => setBuddyTts({ rate: Number(e.target.value) })}
+                  style={{ flex: 1 }}
+                />
+                <span style={{ width: 30, textAlign: 'right' }}>{buddyTts.rate.toFixed(1)}</span>
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: theme.uiTextMuted }}>
+                <span style={{ width: 40 }}>Pitch</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={buddyTts.pitch}
+                  onChange={(e) => setBuddyTts({ pitch: Number(e.target.value) })}
+                  style={{ flex: 1 }}
+                />
+                <span style={{ width: 30, textAlign: 'right' }}>{buddyTts.pitch.toFixed(1)}</span>
+              </label>
+
+              <button
+                className="toolbar-btn"
+                onClick={() =>
+                  ttsPreview(`Hi, I'm ${buddyCompanion?.name ?? 'your buddy'}.`, {
+                    voice: buddyTts.voice,
+                    rate: buddyTts.rate,
+                    pitch: buddyTts.pitch,
+                  })
+                }
+                style={{ fontSize: 11, alignSelf: 'flex-start' }}
+              >
+                preview
+              </button>
+
+              <div style={{ fontSize: 10, color: theme.uiTextMuted }}>
+                Uses your OS voices. Messages over 180 chars are trimmed at sentence boundary.
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Sessions */}

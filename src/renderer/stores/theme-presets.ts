@@ -270,6 +270,36 @@ const monokai: ThemeConfig = {
   uiTextMuted: '#75715e',
 };
 
+const monokaiProSpectrum: ThemeConfig = {
+  name: 'Monokai Pro Spectrum',
+  background: '#222222',
+  foreground: '#f7f1ff',
+  cursor: '#f7f1ff',
+  selection: '#403e41',
+  black: '#363537',
+  red: '#fc618d',
+  green: '#7bd88f',
+  yellow: '#fce566',
+  blue: '#5ad4e6',
+  magenta: '#948ae3',
+  cyan: '#5ad4e6',
+  white: '#bab6c0',
+  brightBlack: '#69676c',
+  brightRed: '#fc618d',
+  brightGreen: '#7bd88f',
+  brightYellow: '#fce566',
+  brightBlue: '#5ad4e6',
+  brightMagenta: '#948ae3',
+  brightCyan: '#5ad4e6',
+  brightWhite: '#f7f1ff',
+  uiBackground: '#222222',
+  uiSurface: '#2d2a2e',
+  uiBorder: '#403e41',
+  uiAccent: '#948ae3',
+  uiText: '#f7f1ff',
+  uiTextMuted: '#8b888f',
+};
+
 const rosePine: ThemeConfig = {
   name: 'Rose Pine',
   background: '#191724',
@@ -363,5 +393,5 @@ const everforest: ThemeConfig = {
 export const builtinThemes: ThemeConfig[] = [
   tokyoNight, dracula, catppuccin, nord,
   solarizedDark, solarizedLight, gruvboxDark, oneDark,
-  monokai, rosePine, kanagawa, everforest,
+  monokai, monokaiProSpectrum, rosePine, kanagawa, everforest,
 ];
