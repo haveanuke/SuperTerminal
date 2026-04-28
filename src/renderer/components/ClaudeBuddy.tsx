@@ -18,6 +18,8 @@ export function ClaudeBuddy() {
   const cardOpen = useBuddyStore((s) => s.cardOpen);
   const chatOpen = useBuddyStore((s) => s.chatOpen);
   const chatBusy = useBuddyStore((s) => s.chatBusy);
+  const logOpen = useBuddyStore((s) => s.logOpen);
+  const chatLog = useBuddyStore((s) => s.chatLog);
   const agent = useBuddyStore((s) => s.agent);
   const hatch = useBuddyStore((s) => s.hatch);
   const pet = useBuddyStore((s) => s.pet);
@@ -26,29 +28,48 @@ export function ClaudeBuddy() {
   const setCardOpen = useBuddyStore((s) => s.setCardOpen);
   const setChatOpen = useBuddyStore((s) => s.setChatOpen);
   const setChatBusy = useBuddyStore((s) => s.setChatBusy);
+  const setLogOpen = useBuddyStore((s) => s.setLogOpen);
+  const addChatEntry = useBuddyStore((s) => s.addChatEntry);
+  const clearChatLog = useBuddyStore((s) => s.clearChatLog);
   const setBubbleText = useBuddyStore((s) => s.setBubbleText);
+  const speak = useBuddyStore((s) => s.speak);
 
   const theme = useThemeStore((s) => s.theme);
 
   const [frame, setFrame] = useState(0);
   const [blink, setBlink] = useState(false);
   const [chatDraft, setChatDraft] = useState('');
+  const [bubbleCopied, setBubbleCopied] = useState(false);
   const dragRef = useRef<{ offsetX: number; offsetY: number } | null>(null);
 
   const sendChat = async () => {
     const msg = chatDraft.trim();
     if (!msg || !companion || chatBusy) return;
+    addChatEntry({ role: 'user', text: msg });
     setChatBusy(true);
     setBubbleText('...', 60_000);
     const res = await talkToBuddy(companion, agent, msg);
     setChatBusy(false);
     if (res.ok && res.text) {
-      setBubbleText(res.text, 9_000);
+      setBubbleText(res.text, 30_000);
+      addChatEntry({ role: 'buddy', text: res.text });
+      speak(res.text);
     } else {
-      setBubbleText(res.error || '*silence*', 4_000);
+      setBubbleText(res.error || '*silence*', 6_000);
     }
     setChatDraft('');
     setChatOpen(false);
+  };
+
+  const copyBubbleText = async () => {
+    if (!bubble?.text) return;
+    try {
+      await navigator.clipboard.writeText(bubble.text);
+      setBubbleCopied(true);
+      setTimeout(() => setBubbleCopied(false), 1200);
+    } catch {
+      // ignore clipboard failures
+    }
   };
 
   // Hatch on first run
@@ -129,6 +150,12 @@ export function ClaudeBuddy() {
         {/* Speech bubble */}
         {bubble && (
           <div
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              copyBubbleText();
+            }}
+            title="Click to copy"
             style={{
               position: 'absolute',
               bottom: 'calc(100% + 6px)',
@@ -139,16 +166,17 @@ export function ClaudeBuddy() {
               padding: '6px 10px',
               background: theme.uiSurface,
               color: theme.uiText,
-              border: `1px solid ${theme.uiBorder}`,
+              border: `1px solid ${bubbleCopied ? theme.uiAccent : theme.uiBorder}`,
               borderRadius: 8,
               fontSize: 12,
               fontStyle: 'italic',
               whiteSpace: 'normal',
               textAlign: 'center',
               boxShadow: '0 4px 16px rgba(0,0,0,0.35)',
+              cursor: 'pointer',
             }}
           >
-            {bubble.text}
+            {bubbleCopied ? '✓ copied' : bubble.text}
             <div
               style={{
                 position: 'absolute',
@@ -229,6 +257,18 @@ export function ClaudeBuddy() {
               >
                 {chatBusy ? '...' : 'send'}
               </button>
+              <button
+                className="toolbar-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setLogOpen(true);
+                }}
+                disabled={chatLog.length === 0}
+                title={chatLog.length === 0 ? 'no chat history yet' : `view ${chatLog.length} message${chatLog.length === 1 ? '' : 's'}`}
+                style={{ fontSize: 11, flex: '0 0 auto', whiteSpace: 'nowrap' }}
+              >
+                log
+              </button>
             </div>
           );
         })()}
@@ -273,7 +313,158 @@ export function ClaudeBuddy() {
       </div>
 
       {cardOpen && <BuddyCard onClose={() => setCardOpen(false)} />}
+      {logOpen && (
+        <ChatLogModal
+          entries={chatLog}
+          buddyName={companion.name}
+          onClose={() => setLogOpen(false)}
+          onClear={clearChatLog}
+        />
+      )}
     </>
+  );
+}
+
+function ChatLogModal({
+  entries,
+  buddyName,
+  onClose,
+  onClear,
+}: {
+  entries: { role: 'user' | 'buddy'; text: string; at: number }[];
+  buddyName: string;
+  onClose: () => void;
+  onClear: () => void;
+}) {
+  const theme = useThemeStore((s) => s.theme);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+
+  const copy = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedIndex(index);
+      setTimeout(() => setCopiedIndex((i) => (i === index ? null : i)), 1000);
+    } catch {
+      // ignore
+    }
+  };
+
+  const fmtTime = (ms: number) => {
+    const d = new Date(ms);
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.5)',
+        zIndex: 300,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: theme.uiSurface,
+          border: `1px solid ${theme.uiBorder}`,
+          borderRadius: 10,
+          padding: 16,
+          width: 460,
+          maxHeight: '70vh',
+          display: 'flex',
+          flexDirection: 'column',
+          color: theme.uiText,
+          fontSize: 13,
+          boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ fontSize: 11, color: theme.uiTextMuted, textTransform: 'uppercase', letterSpacing: 1 }}>
+            Chat Log — {buddyName}
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              className="toolbar-btn"
+              onClick={onClear}
+              disabled={entries.length === 0}
+              style={{ fontSize: 11 }}
+            >
+              clear
+            </button>
+            <button className="toolbar-btn" onClick={onClose} style={{ padding: 2 }}>
+              <X size={12} />
+            </button>
+          </div>
+        </div>
+
+        <div
+          style={{
+            flex: 1,
+            overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            paddingRight: 4,
+          }}
+        >
+          {entries.length === 0 ? (
+            <div style={{ color: theme.uiTextMuted, fontStyle: 'italic', textAlign: 'center', padding: 20 }}>
+              no messages this session
+            </div>
+          ) : (
+            entries.map((entry, i) => {
+              const isUser = entry.role === 'user';
+              const isCopied = copiedIndex === i;
+              return (
+                <div
+                  key={`${entry.at}-${i}`}
+                  onClick={() => copy(entry.text, i)}
+                  title="Click to copy"
+                  style={{
+                    cursor: 'pointer',
+                    padding: '6px 10px',
+                    borderRadius: 6,
+                    background: isUser ? theme.uiBackground : theme.uiSurface,
+                    border: `1px solid ${isCopied ? theme.uiAccent : theme.uiBorder}`,
+                    alignSelf: isUser ? 'flex-end' : 'flex-start',
+                    maxWidth: '85%',
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 9,
+                      color: theme.uiTextMuted,
+                      textTransform: 'uppercase',
+                      letterSpacing: 0.5,
+                      marginBottom: 2,
+                      display: 'flex',
+                      gap: 6,
+                    }}
+                  >
+                    <span>{isUser ? 'you' : buddyName}</span>
+                    <span>·</span>
+                    <span>{fmtTime(entry.at)}</span>
+                    {isCopied && <span style={{ color: theme.uiAccent }}>· copied</span>}
+                  </div>
+                  <div style={{ fontSize: 12, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                    {entry.text}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+
+        <div style={{ marginTop: 8, fontSize: 10, color: theme.uiTextMuted, textAlign: 'center' }}>
+          click any message to copy · session only, cleared on restart
+        </div>
+      </div>
+    </div>
   );
 }
 

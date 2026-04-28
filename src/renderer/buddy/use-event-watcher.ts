@@ -101,7 +101,10 @@ export function useBuddyEventWatcher() {
             prompt,
           });
           if (res.ok && res.text) {
-            useBuddyStore.getState().setBubbleText(res.text, 7000);
+            const store = useBuddyStore.getState();
+            store.setBubbleText(res.text, 12_000);
+            store.addChatEntry({ role: 'buddy', text: res.text });
+            store.speak(res.text);
           } else {
             console.warn('[buddy] smart agent failed:', res.error || '(no text)');
           }

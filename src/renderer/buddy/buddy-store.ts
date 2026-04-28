@@ -7,6 +7,7 @@ import {
   getReaction, generateFallbackName, generatePersonality,
   type ReactionReason,
 } from './reactions';
+import { speak as ttsSpeak, stopSpeaking } from './tts';
 
 export interface AgentConfig {
   enabled: boolean;
@@ -14,6 +15,15 @@ export interface AgentConfig {
   command: string;
   args: string[]; // {prompt} placeholder is substituted at runtime
 }
+
+export interface TtsConfig {
+  enabled: boolean;
+  voice: string | null;
+  rate: number;
+  pitch: number;
+}
+
+const DEFAULT_TTS: TtsConfig = { enabled: false, voice: null, rate: 1, pitch: 1 };
 
 export const AGENT_PRESETS: Record<AgentConfig['preset'], Omit<AgentConfig, 'enabled' | 'preset'>> = {
   claude: { command: 'claude', args: ['-p', '{prompt}'] },
@@ -37,6 +47,14 @@ interface SpeechBubble {
   ttl: number;
 }
 
+export interface ChatEntry {
+  role: 'user' | 'buddy';
+  text: string;
+  at: number;
+}
+
+const CHAT_LOG_LIMIT = 50;
+
 interface BuddyStoreState {
   companion: Companion | null;
   visible: boolean;
@@ -48,8 +66,11 @@ interface BuddyStoreState {
   cardOpen: boolean;
   chatOpen: boolean;
   chatBusy: boolean;
+  logOpen: boolean;
+  chatLog: ChatEntry[];
   lastReactionAt: number;
   agent: AgentConfig;
+  tts: TtsConfig;
 
   hatch: () => void;
   reroll: () => void;
@@ -66,13 +87,43 @@ interface BuddyStoreState {
   setCardOpen: (open: boolean) => void;
   setChatOpen: (open: boolean) => void;
   setChatBusy: (busy: boolean) => void;
+  setLogOpen: (open: boolean) => void;
+  addChatEntry: (entry: Omit<ChatEntry, 'at'>) => void;
+  clearChatLog: () => void;
   setAgent: (patch: Partial<AgentConfig>) => void;
+  setTts: (patch: Partial<TtsConfig>) => void;
+  speak: (text: string) => void;
 }
 
 const STORAGE_KEY = 'superTerminal:buddy';
 const POSITION_KEY = 'superTerminal:buddyPosition';
 const VISIBLE_KEY = 'superTerminal:buddyVisible';
 const AGENT_KEY = 'superTerminal:buddyAgent';
+const TTS_KEY = 'superTerminal:buddyTts';
+
+function loadTts(): TtsConfig {
+  try {
+    const raw = localStorage.getItem(TTS_KEY);
+    if (!raw) return { ...DEFAULT_TTS };
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: !!parsed.enabled,
+      voice: typeof parsed.voice === 'string' ? parsed.voice : null,
+      rate: typeof parsed.rate === 'number' ? parsed.rate : 1,
+      pitch: typeof parsed.pitch === 'number' ? parsed.pitch : 1,
+    };
+  } catch {
+    return { ...DEFAULT_TTS };
+  }
+}
+
+function saveTts(tts: TtsConfig) {
+  try {
+    localStorage.setItem(TTS_KEY, JSON.stringify(tts));
+  } catch {
+    // ignore
+  }
+}
 
 function loadAgent(): AgentConfig {
   try {
@@ -174,8 +225,11 @@ export const useBuddyStore = createStore<BuddyStoreState>((set, get) => ({
   cardOpen: false,
   chatOpen: false,
   chatBusy: false,
+  logOpen: false,
+  chatLog: [],
   lastReactionAt: 0,
   agent: loadAgent(),
+  tts: loadTts(),
 
   hatch: () => {
     const companion = makeCompanion();
@@ -224,8 +278,10 @@ export const useBuddyStore = createStore<BuddyStoreState>((set, get) => ({
     // Rate limit: min 2 seconds between reactions (except pet, which is user-driven)
     if (reason !== 'pet' && reason !== 'hatch' && now - lastReactionAt < 2000) return;
     const text = getReaction(reason, companion.bones.species, companion.bones.rarity, context);
-    const ttl = reason === 'hatch' ? 5000 : reason === 'pet' ? 2500 : 4000;
+    const ttl = reason === 'hatch' ? 12_000 : reason === 'pet' ? 7_000 : 10_000;
     set({ bubble: { text, at: now, ttl }, lastReactionAt: now });
+    get().addChatEntry({ role: 'buddy', text });
+    get().speak(text);
   },
 
   setBubbleText: (text, ttl = 6000) => {
@@ -242,6 +298,7 @@ export const useBuddyStore = createStore<BuddyStoreState>((set, get) => ({
 
   setVisible: (visible) => {
     localStorage.setItem(VISIBLE_KEY, String(visible));
+    if (!visible) stopSpeaking();
     set({ visible });
   },
 
@@ -255,6 +312,31 @@ export const useBuddyStore = createStore<BuddyStoreState>((set, get) => ({
   setCardOpen: (cardOpen) => set({ cardOpen }),
   setChatOpen: (chatOpen) => set({ chatOpen }),
   setChatBusy: (chatBusy) => set({ chatBusy }),
+  setLogOpen: (logOpen) => set({ logOpen }),
+
+  addChatEntry: ({ role, text }) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const entry: ChatEntry = { role, text: trimmed, at: Date.now() };
+    const next = [...get().chatLog, entry];
+    if (next.length > CHAT_LOG_LIMIT) next.splice(0, next.length - CHAT_LOG_LIMIT);
+    set({ chatLog: next });
+  },
+
+  clearChatLog: () => set({ chatLog: [] }),
+
+  setTts: (patch) => {
+    const next = { ...get().tts, ...patch };
+    saveTts(next);
+    if (!next.enabled) stopSpeaking();
+    set({ tts: next });
+  },
+
+  speak: (text) => {
+    const { tts, visible } = get();
+    if (!tts.enabled || !visible) return;
+    ttsSpeak(text, { voice: tts.voice, rate: tts.rate, pitch: tts.pitch });
+  },
 }));
 
 export type { ReactionReason, StatName };
