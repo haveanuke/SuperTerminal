@@ -1,6 +1,6 @@
 {
   "name": "super-terminal",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
   "author": "Tomas Pinal",
   "main": "dist/main/index.js",
@@ -24,7 +24,7 @@
   "scripts": {
     "dev": "tsc -p tsconfig.main.json && node scripts/dev.mjs",
     "build": "tsc -p tsconfig.main.json && vite build",
-    "package": "npm run build && electron-builder --mac",
+    "package": "npm run build && electron-builder --mac --publish never",
     "start": "electron dist/main/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
