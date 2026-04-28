@@ -12,6 +12,7 @@
     },
     "mac": {
       "category": "public.app-category.developer-tools",
+      "icon": "build/logo.png",
       "target": [
         { "target": "dmg", "arch": ["arm64"] }
       ]
