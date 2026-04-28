@@ -1,0 +1,41 @@
+name: Release
+
+# Triggered by pushing a tag like v0.2.0. Produces unsigned DMGs for both
+# Intel and Apple Silicon Macs and attaches them to a GitHub release.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Build DMGs
+        run: npm run package
+        env:
+          # electron-builder will refuse to publish without explicit credentials —
+          # we only want it to build artifacts; the upload step below handles release.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.dmg
+            release/*.dmg.blockmap
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

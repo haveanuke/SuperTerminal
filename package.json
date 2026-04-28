@@ -7,9 +7,14 @@
   "build": {
     "appId": "com.tomaspinal.superterminal",
     "productName": "SuperTerminal",
+    "directories": {
+      "output": "release"
+    },
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": "dmg"
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] }
+      ]
     },
     "files": [
       "dist/**/*",
