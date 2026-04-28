@@ -31,9 +31,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/*.dmg
-            release/*.dmg.blockmap
+          files: release/*.dmg
           generate_release_notes: true
           draft: false
           prerelease: false

@@ -1,6 +1,6 @@
 {
   "name": "super-terminal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
   "author": "Tomas Pinal",
   "main": "dist/main/index.js",
@@ -13,7 +13,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] }
+        { "target": "dmg", "arch": ["arm64"] }
       ]
     },
     "files": [
