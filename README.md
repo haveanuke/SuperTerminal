@@ -1,8 +1,14 @@
 # SuperTerminal
 
-A modern multi-terminal manager built with Electron, React, and xterm.js.
+A modern multi-terminal manager built with Tauri 2, Rust, React, and xterm.js.
+
+> **Migrating from the Electron build?** Saved terminal sessions carry over
+> automatically on first launch. Theme/font/buddy settings do not (the webview
+> storage is different) — re-pick them once in Settings.
 
 ## Setup
+
+Requires Node 20+ and a Rust toolchain (`brew install rust` or [rustup](https://rustup.rs)).
 
 ```bash
 npm install
@@ -10,28 +16,22 @@ npm install
 
 ## Development
 
-One command to compile, start Vite, and launch Electron:
+One command to start Vite and launch the Tauri app (during the Electron→Tauri
+transition this is `dev:tauri`; the Electron app remains on `npm run dev`):
 
 ```bash
-npm run dev
-```
-
-## Production Build
-
-```bash
-npm run build
-npm start
+npm run dev:tauri
 ```
 
 ## Packaging
 
-Build a distributable `.dmg` for macOS:
+Build a distributable `.app`/`.dmg` for macOS (Apple Silicon):
 
 ```bash
-npm run package
+npm run package:tauri
 ```
 
-Output lands in `release/` (gitignored). The default config builds for Apple Silicon (`arm64`); Intel Macs can build locally by editing the `mac.target` arch in `package.json`.
+Output lands in `src-tauri/target/release/bundle/` (gitignored).
 
 > **Note on unsigned builds:** Without an Apple Developer signing identity, macOS Gatekeeper will block the app on first launch ("Apple cannot check this app for malicious software"). Users can either right-click → **Open** to bypass once, or run `xattr -cr /Applications/SuperTerminal.app` after installing. Proper signing + notarization requires a paid Apple Developer account.
 
@@ -40,9 +40,10 @@ Output lands in `release/` (gitignored). The default config builds for Apple Sil
 A GitHub Actions workflow (`.github/workflows/release.yml`) builds and uploads DMGs to a GitHub release whenever a `v*` tag is pushed:
 
 ```bash
-# Bump the version field in package.json first, then:
-git tag v0.2.0
-git push origin v0.2.0
+# Bump the version fields (package.json, src-tauri/tauri.conf.json,
+# src-tauri/Cargo.toml) first, then:
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The workflow runs on `macos-latest` (Apple Silicon), and attaches the DMG to a release with auto-generated release notes. Builds are unsigned — see the note above.
