@@ -42,7 +42,7 @@ export function App() {
           }}
         >
           <img
-            src={backgroundImage.startsWith('/') ? `file://${backgroundImage}` : backgroundImage}
+            src={backgroundImage}
             alt=""
             style={{
               width: '100%',

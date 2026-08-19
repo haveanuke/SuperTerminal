@@ -30,7 +30,6 @@ export function TabBar() {
         minHeight: 40,
         backgroundColor: theme.uiSurface,
         borderBottom: `1px solid ${theme.uiBorder}`,
-        WebkitAppRegion: 'drag' as unknown as string,
       }}
     >
       {/* Drag region / window controls spacer */}
@@ -42,7 +41,6 @@ export function TabBar() {
           display: 'flex',
           overflow: 'auto',
           flexShrink: 1,
-          WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
         {tabs.map((tab) => {
@@ -123,7 +121,6 @@ export function TabBar() {
           title="New tab"
           style={{
             padding: '6px 10px',
-            WebkitAppRegion: 'no-drag' as unknown as string,
           }}
         >
           <Plus size={14} />
@@ -140,7 +137,6 @@ export function TabBar() {
           alignItems: 'center',
           gap: 2,
           padding: '0 8px',
-          WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
         {/* Search */}

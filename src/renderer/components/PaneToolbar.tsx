@@ -65,7 +65,6 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
         color: theme.uiTextMuted,
         userSelect: 'none',
         position: 'relative',
-        WebkitAppRegion: 'no-drag' as unknown as string,
       }}
     >
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>

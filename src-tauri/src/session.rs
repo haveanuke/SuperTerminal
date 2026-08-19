@@ -169,22 +169,26 @@ impl SessionManager {
         }
     }
 
-    /// One-time copy of sessions from the old Electron app-data dir. Idempotent
-    /// (marker file), never clobbers a session that already exists here.
-    pub fn migrate_from(&self, old_dir: &Path) {
+    /// One-time copy of sessions from the old Electron app-data dirs. Idempotent
+    /// (marker file), never clobbers a session that already exists here. Multiple
+    /// candidates because Electron's userData derived from package.json `name`
+    /// (`super-terminal`); earlier candidates win for duplicate filenames.
+    pub fn migrate_from(&self, old_dirs: &[&Path]) {
         let marker = self.dir.join(".migrated");
         if marker.exists() {
             return;
         }
-        if let Ok(entries) = std::fs::read_dir(old_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".json") {
-                    continue;
-                }
-                let dest = self.dir.join(&name);
-                if !dest.exists() {
-                    let _ = std::fs::copy(entry.path(), dest);
+        for old_dir in old_dirs {
+            if let Ok(entries) = std::fs::read_dir(old_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(".json") {
+                        continue;
+                    }
+                    let dest = self.dir.join(&name);
+                    if !dest.exists() {
+                        let _ = std::fs::copy(entry.path(), dest);
+                    }
                 }
             }
         }
@@ -322,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_nested_split_layout_round_trip() {
+        let split = json!({
+            "tabs": [{
+                "id": "tab-1", "label": "Split",
+                "pane": { "type": "split", "direction": "horizontal",
+                          "sizes": [50, 50],
+                          "children": [
+                            { "type": "terminal", "terminalId": "t1" },
+                            { "type": "terminal", "terminalId": "t2" } ] } }],
+            "activeTabId": "tab-1"
+        });
+        let mgr = SessionManager::new(tmp_dir("split"));
+        mgr.save("split", &split).unwrap();
+        let loaded = mgr.load("split").unwrap().unwrap();
+        assert_eq!(loaded["layout"], split);
+    }
+
+    #[test]
     fn list_and_delete() {
         let mgr = SessionManager::new(tmp_dir("ld"));
         mgr.save("a", &valid_layout()).unwrap();
@@ -337,13 +359,18 @@ mod tests {
     #[test]
     fn migration_copies_once_and_never_clobbers() {
         let old = tmp_dir("mig-old");
+        let old2 = tmp_dir("mig-old2");
         let new = tmp_dir("mig-new");
         std::fs::write(old.join("legacy.json"), "{}").unwrap();
         std::fs::write(old.join("both.json"), "\"old\"").unwrap();
+        std::fs::write(old2.join("second.json"), "{}").unwrap();
+        std::fs::write(old2.join("both.json"), "\"old2\"").unwrap();
         std::fs::write(new.join("both.json"), "\"new\"").unwrap();
         let mgr = SessionManager::new(new.clone());
-        mgr.migrate_from(&old);
+        mgr.migrate_from(&[old.as_path(), old2.as_path()]);
+        // copied from both candidate dirs; existing files never clobbered
         assert!(new.join("legacy.json").exists());
+        assert!(new.join("second.json").exists());
         assert_eq!(
             std::fs::read_to_string(new.join("both.json")).unwrap(),
             "\"new\""
@@ -351,7 +378,7 @@ mod tests {
         assert!(new.join(".migrated").exists());
         // second run is a no-op even with new files in old dir
         std::fs::write(old.join("later.json"), "{}").unwrap();
-        mgr.migrate_from(&old);
+        mgr.migrate_from(&[old.as_path()]);
         assert!(!new.join("later.json").exists());
     }
 }

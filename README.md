@@ -16,11 +16,10 @@ npm install
 
 ## Development
 
-One command to start Vite and launch the Tauri app (during the Electron→Tauri
-transition this is `dev:tauri`; the Electron app remains on `npm run dev`):
+One command to start Vite and launch the app:
 
 ```bash
-npm run dev:tauri
+npm run dev
 ```
 
 ## Packaging
@@ -28,7 +27,7 @@ npm run dev:tauri
 Build a distributable `.app`/`.dmg` for macOS (Apple Silicon):
 
 ```bash
-npm run package:tauri
+npm run package
 ```
 
 Output lands in `src-tauri/target/release/bundle/` (gitignored).

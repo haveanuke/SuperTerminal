@@ -47,9 +47,13 @@ pub fn run() {
             let sessions = session::SessionManager::new(data_dir.join("sessions"));
             #[cfg(target_os = "macos")]
             if let Ok(home) = app.path().home_dir() {
-                sessions.migrate_from(
-                    &home.join("Library/Application Support/SuperTerminal/sessions"),
-                );
+                // Electron's userData was `super-terminal` (package.json name);
+                // `SuperTerminal` covers any productName-based variant.
+                let support = home.join("Library/Application Support");
+                sessions.migrate_from(&[
+                    support.join("super-terminal/sessions").as_path(),
+                    support.join("SuperTerminal/sessions").as_path(),
+                ]);
             }
             app.manage(sessions);
             create_main_window(app.handle())?;

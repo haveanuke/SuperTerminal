@@ -28,7 +28,7 @@ jobs:
 
       - run: npm run lint
 
-      - run: npx vite build
+      - run: npm run build
 
       - run: npx vitest run
 
