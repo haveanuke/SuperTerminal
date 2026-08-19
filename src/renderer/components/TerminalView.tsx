@@ -3,7 +3,7 @@ import { useThemeStore } from '../stores/theme-store';
 import { useUIStore } from '../stores/ui-store';
 import { useTerminalStore } from '../stores/terminal-store';
 import { findNext, clearDecorations } from '../lib/xterm-search';
-import { xtermRegistry, getOrCreateXterm, safeFit, invalidateCharCache } from '../xterm-registry';
+import { xtermRegistry, getOrCreateXterm, safeFit, invalidateCharCache, setWebglEnabled } from '../xterm-registry';
 
 interface TerminalViewProps {
   terminalId: string;
@@ -81,6 +81,8 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     const entry = xtermRegistry.get(terminalId);
     if (entry) {
       entry.xterm.options.allowTransparency = !!backgroundImage;
+      // Transparency needs the DOM renderer; otherwise use the GPU renderer.
+      setWebglEnabled(entry, !backgroundImage);
       entry.xterm.options.theme = {
         background: backgroundImage ? 'transparent' : theme.background,
         foreground: theme.foreground,

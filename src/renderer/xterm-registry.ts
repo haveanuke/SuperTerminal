@@ -1,4 +1,5 @@
 import { Terminal } from '@xterm/xterm';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { fitTerminal } from './lib/xterm-fit';
 import { registerWebLinks } from './lib/xterm-web-links';
 import { useThemeStore } from './stores/theme-store';
@@ -9,9 +10,35 @@ import { toastError } from './stores/toast-store';
 export interface XtermEntry {
   xterm: Terminal;
   element: HTMLDivElement;
+  webglAddon: WebglAddon | null;
   removeDataListener: () => void;
   removeExitListener: () => void;
   removeLinkProvider: () => void;
+}
+
+/**
+ * GPU renderer toggle. WebGL draws glyphs (and the cursor) into a canvas —
+ * fast, and immune to the WebKit CSS-painting quirks of the DOM renderer.
+ * Disabled while a background image needs terminal transparency; falls back
+ * to the DOM renderer automatically if a GL context is unavailable or lost.
+ */
+export function setWebglEnabled(entry: XtermEntry, enabled: boolean) {
+  if (enabled && !entry.webglAddon) {
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        addon.dispose();
+        entry.webglAddon = null;
+      });
+      entry.xterm.loadAddon(addon);
+      entry.webglAddon = addon;
+    } catch {
+      entry.webglAddon = null; // no GL context -> stay on DOM renderer
+    }
+  } else if (!enabled && entry.webglAddon) {
+    entry.webglAddon.dispose();
+    entry.webglAddon = null;
+  }
 }
 
 export const xtermRegistry = new Map<string, XtermEntry>();
@@ -155,7 +182,8 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     xterm.write('\r\n[Process exited]\r\n');
   });
 
-  const entry: XtermEntry = { xterm, element, removeDataListener, removeExitListener, removeLinkProvider: () => linkDisposable.dispose() };
+  const entry: XtermEntry = { xterm, element, webglAddon: null, removeDataListener, removeExitListener, removeLinkProvider: () => linkDisposable.dispose() };
+  setWebglEnabled(entry, !uiState.backgroundImage);
   xtermRegistry.set(terminalId, entry);
 
   return entry;

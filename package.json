@@ -1,6 +1,6 @@
 {
   "name": "super-terminal",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
   "author": "Tomas Pinal",
   "scripts": {
@@ -34,6 +34,7 @@
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2.5.4",
+    "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^5.5.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
