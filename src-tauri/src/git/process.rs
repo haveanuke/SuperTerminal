@@ -140,7 +140,7 @@ pub(crate) fn run_command_with_timeout_and_cap(
     }
 
     // Bounded reap: a process can close its pipes and keep running — never
-    // block on wait() without a deadline.
+    // block on wait() without a deadline, on ANY path.
     let reap_deadline = if failure.is_some() {
         Instant::now() + Duration::from_secs(5)
     } else {
@@ -156,7 +156,13 @@ pub(crate) fn run_command_with_timeout_and_cap(
                     }
                     kill_group(pid);
                     let _ = child.kill();
-                    let _ = child.wait(); // safe post-SIGKILL
+                    // Post-SIGKILL bounded poll — still no unbounded wait().
+                    let grace = Instant::now() + Duration::from_secs(2);
+                    while child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+                        && Instant::now() < grace
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -165,25 +171,31 @@ pub(crate) fn run_command_with_timeout_and_cap(
                 if failure.is_none() {
                     failure = Some(e.to_string());
                 }
+                kill_group(pid);
+                let _ = child.kill();
                 break None;
             }
         }
     };
 
-    let _ = so.join();
-    let _ = se.join();
-
     if let Some(f) = failure {
+        // Do NOT join the reader threads on failure paths: if the child is
+        // unkillable (D-state) its pipes stay open and a join would hang.
+        // The detached readers exit on their own once the pipes close.
         return Err(f);
     }
+
+    let _ = so.join();
+    let _ = se.join();
     let status = status.expect("status present when no failure");
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     if status.success() {
         Ok(GitOutput { stdout, stderr })
     } else {
+        // Full (already 64KB-capped) stderr: the renderer caps its toast at
+        // 200 chars but console-logs the whole thing for diagnostics.
         let code = status.code().unwrap_or(-1);
-        let head: String = stderr.chars().take(400).collect();
-        Err(format!("exit {code}: {head}"))
+        Err(format!("exit {code}: {stderr}"))
     }
 }
 

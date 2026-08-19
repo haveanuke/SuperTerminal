@@ -36,6 +36,8 @@ interface GitStore {
   graph: GraphData | null;
   graphLimit: number;
   busy: boolean;
+  /** Entries skipped by the last bulk action — persistent muted UI note. */
+  lastSkipped: number;
 
   toggle: () => void;
   refresh: () => void;
@@ -50,6 +52,7 @@ let pollMs = BASE_POLL_MS;
 let pollTimer: number | null = null;
 let unsubFocus: (() => void) | null = null;
 let lastFocused: string | null = null;
+let graphSeq = 0;
 
 /** Test-only: clear module-level engine state between vitest cases. */
 export function resetGitEngineForTests() {
@@ -88,7 +91,7 @@ async function refreshStatus(): Promise<void> {
     pollMs = elapsed > SLOW_STATUS_MS ? Math.min(pollMs * 2, MAX_POLL_MS) : BASE_POLL_MS;
     applyReport(repo.repoId, gen, report);
   } catch (err) {
-    reportError('status', errMsg(err));
+    if (gen === generation) reportError('status', errMsg(err)); // stale errors stay silent
   } finally {
     inflight.delete(repo.repoId);
   }
@@ -109,13 +112,16 @@ async function refreshGraph(): Promise<void> {
   const repo = s.repo;
   if (!repo || !s.open) return;
   const gen = generation;
+  const seq = ++graphSeq; // request identity: a late 300-row response must not
+  const limit = s.graphLimit; // clobber a newer 600-row one (or vice versa)
   try {
-    const graph = await gitBridge.graph(repo.repoId, s.graphLimit);
+    const graph = await gitBridge.graph(repo.repoId, limit);
     const now = useGitStore.getState();
-    if (gen !== generation || !now.repo || now.repo.repoId !== repo.repoId) return;
+    if (seq !== graphSeq || gen !== generation) return;
+    if (!now.repo || now.repo.repoId !== repo.repoId) return;
     useGitStore.setState({ graph });
   } catch (err) {
-    reportError('graph', errMsg(err));
+    if (gen === generation) reportError('graph', errMsg(err));
   }
 }
 
@@ -145,7 +151,10 @@ async function follow(terminalId: string | null): Promise<void> {
   }
   const prev = useGitStore.getState().repo;
   if (prev && prev.repoId === info.repoId) {
+    // Same repo, different pane: still a focus-triggered refresh — the
+    // display must not wait for the next poll to catch up.
     useGitStore.setState({ targetPath: cwd });
+    void refreshStatus();
     return;
   }
   useGitStore.setState({
@@ -206,16 +215,15 @@ async function pushFlow(repoId: string): Promise<ActionResult | null> {
   }
 }
 
-function applyActionResult(repoId: string, result: ActionResult) {
+function applyActionResult(repoId: string, gen: number, result: ActionResult) {
   const s = useGitStore.getState();
-  if (!s.repo || s.repo.repoId !== repoId) return;
+  // Generation + repo identity: an action result surviving an A -> B -> A
+  // focus cycle is stale even though the repoId matches again.
+  if (gen !== generation || !s.repo || s.repo.repoId !== repoId) return;
   const prevIdentity = s.report ? branchIdentity(s.report) : null;
-  useGitStore.setState({ report: result.report });
+  useGitStore.setState({ report: result.report, lastSkipped: result.skipped });
   if (prevIdentity !== null && prevIdentity !== branchIdentity(result.report)) {
     void refreshGraph();
-  }
-  if (result.skipped > 0) {
-    toastInfo(`${result.skipped} ${result.skipped === 1 ? 'entry' : 'entries'} skipped (non-actionable paths)`);
   }
 }
 
@@ -227,6 +235,7 @@ export const useGitStore = createStore<GitStore>((set, get) => ({
   graph: null,
   graphLimit: GRAPH_STEP,
   busy: false,
+  lastSkipped: 0,
 
   toggle: () => {
     const open = !get().open;
@@ -258,6 +267,7 @@ export const useGitStore = createStore<GitStore>((set, get) => ({
     const repo = get().repo;
     if (!repo || get().busy) return;
     set({ busy: true });
+    const gen = generation;
     const paths = Array.isArray(arg) ? arg : [];
     const message = typeof arg === 'string' ? arg : '';
     try {
@@ -291,14 +301,22 @@ export const useGitStore = createStore<GitStore>((set, get) => ({
           result = await gitBridge.fetch(repo.repoId);
           break;
         case 'sync': {
-          // Not atomic: report each step's outcome separately.
-          try {
-            result = await gitBridge.pull(repo.repoId);
-          } catch (err) {
-            reportError('sync (pull)', errMsg(err));
-            result = null;
+          // Not atomic: report each step's outcome separately. With no
+          // upstream, pull would always fail — skip straight to push so the
+          // publish-branch confirmation flow is reachable.
+          const hasUpstream = !!get().report?.upstream;
+          let pullOk = true;
+          if (hasUpstream) {
+            try {
+              result = await gitBridge.pull(repo.repoId);
+              toastInfo('Sync: pulled — pushing…');
+            } catch (err) {
+              reportError('sync (pull)', errMsg(err));
+              result = null;
+              pullOk = false;
+            }
           }
-          if (result) {
+          if (pullOk) {
             try {
               result = (await pushFlow(repo.repoId)) ?? result;
             } catch (err) {
@@ -309,7 +327,7 @@ export const useGitStore = createStore<GitStore>((set, get) => ({
         }
       }
       if (result) {
-        applyActionResult(repo.repoId, result);
+        applyActionResult(repo.repoId, gen, result);
         if (kind === 'commit' || kind === 'push' || kind === 'pull' || kind === 'fetch' || kind === 'sync') {
           void refreshGraph();
         }

@@ -21,6 +21,7 @@ export function GitSidebar() {
   const repo = useGitStore((s) => s.repo);
   const targetPath = useGitStore((s) => s.targetPath);
   const report = useGitStore((s) => s.report);
+  const lastSkipped = useGitStore((s) => s.lastSkipped);
 
   const [width, setWidth] = useState(loadWidth);
   const dragging = useRef(false);
@@ -80,12 +81,25 @@ export function GitSidebar() {
       {repo ? (
         <>
           <GitHeader />
-          <CommitBox />
-          <div style={{ overflowY: 'auto', maxHeight: '45%', flexShrink: 0 }}>
-            {conflicts.length > 0 && <FileSection kind="conflicts" entries={conflicts} />}
-            <FileSection kind="staged" entries={staged} />
-            <FileSection kind="changes" entries={changes} />
-          </div>
+          {report === null ? (
+            // Distinct loading state: zero-count sections would falsely read
+            // as a clean repo before the first status arrives.
+            <div style={{ padding: 12, fontSize: 12, color: theme.uiTextMuted }}>Loading status…</div>
+          ) : (
+            <>
+              <CommitBox />
+              {lastSkipped > 0 && (
+                <div style={{ padding: '4px 10px', fontSize: 11, color: theme.uiTextMuted, fontStyle: 'italic' }}>
+                  {lastSkipped} {lastSkipped === 1 ? 'entry' : 'entries'} skipped (non-actionable paths)
+                </div>
+              )}
+              <div style={{ overflowY: 'auto', maxHeight: '45%', flexShrink: 0 }}>
+                {conflicts.length > 0 && <FileSection kind="conflicts" entries={conflicts} />}
+                <FileSection kind="staged" entries={staged} />
+                <FileSection kind="changes" entries={changes} />
+              </div>
+            </>
+          )}
           <GitGraph />
         </>
       ) : (

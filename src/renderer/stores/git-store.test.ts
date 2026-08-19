@@ -187,6 +187,25 @@ describe('git-store', () => {
     expect(h.bridge.graph.mock.calls.length).toBeGreaterThan(callsAfterSame);
   });
 
+  it('sync without upstream skips pull and reaches the publish flow', async () => {
+    h.ptyCwd.mockResolvedValue('/a');
+    h.bridge.resolveRepo.mockResolvedValue(repoA);
+    h.bridge.status.mockResolvedValue(report({ upstream: null }));
+    useGitStore.getState().toggle();
+    await flush();
+    await flush();
+    h.bridge.push
+      .mockRejectedValueOnce(new Error('no upstream'))
+      .mockResolvedValueOnce({ report: report({ upstream: 'origin/main' }), skipped: 0 });
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await useGitStore.getState().runAction('sync');
+    expect(h.bridge.pull).not.toHaveBeenCalled();
+    expect(h.bridge.push).toHaveBeenCalledWith('repo-0', false);
+    expect(h.bridge.push).toHaveBeenCalledWith('repo-0', true);
+    expect(useGitStore.getState().report?.upstream).toBe('origin/main');
+    confirmSpy.mockRestore();
+  });
+
   it('action errors keep the previous report', async () => {
     h.ptyCwd.mockResolvedValue('/a');
     h.bridge.resolveRepo.mockResolvedValue(repoA);

@@ -115,18 +115,27 @@ export function PaneToolbar({ terminalId, tabId, onSplitH, onSplitV, onClose }: 
           title={`${cwd}\nClick to reveal in Finder`}
           style={{
             maxWidth: '40%',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            direction: 'rtl',
-            textAlign: 'left',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 3,
             cursor: 'pointer',
             fontSize: 11,
             color: theme.uiTextMuted,
             padding: '0 4px',
           }}
         >
-          {displayCwd}
+          <span aria-hidden style={{ flexShrink: 0 }}>📁</span>
+          <span
+            style={{
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              direction: 'rtl',
+              textAlign: 'left',
+            }}
+          >
+            {displayCwd}
+          </span>
         </span>
       )}
 

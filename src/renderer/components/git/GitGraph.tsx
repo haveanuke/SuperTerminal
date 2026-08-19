@@ -8,21 +8,23 @@ import type { GraphRow } from '../../lib/git-bridge';
 const ROW_H = 26;
 const LANE_W = 12;
 const OVERSCAN = 10;
-const MAX_VISIBLE_LANES = 8;
+const MAX_GUTTER_LANES = 12;
 
 function laneColors(theme: ThemeConfig): string[] {
   return [theme.uiAccent, theme.green, theme.yellow, theme.magenta, theme.cyan, theme.blue, theme.red];
 }
 
+// True x-coordinate per lane — never clamped onto a shared column; lanes past
+// the gutter width clip out of view instead of drawing a false topology.
 function laneX(lane: number): number {
-  return Math.min(lane, MAX_VISIBLE_LANES - 1) * LANE_W + LANE_W / 2 + 2;
+  return lane * LANE_W + LANE_W / 2 + 2;
 }
 
-function RowSvg({ row, colors }: { row: GraphRow; colors: string[] }) {
+function RowSvg({ row, colors, gutterW }: { row: GraphRow; colors: string[]; gutterW: number }) {
   const cy = ROW_H / 2;
   return (
     <svg
-      width={MAX_VISIBLE_LANES * LANE_W + 4}
+      width={gutterW}
       height={ROW_H}
       style={{ overflow: 'visible', flexShrink: 0 }}
     >
@@ -51,6 +53,8 @@ export function GitGraph() {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(400);
 
+  // The container div renders in EVERY state (loading/empty/rows) so the
+  // ResizeObserver attaches on first mount and survives data arriving later.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -60,14 +64,9 @@ export function GitGraph() {
     return () => ro.disconnect();
   }, []);
 
-  if (!graph || graph.rows.length === 0) {
-    return (
-      <div style={{ padding: 12, fontSize: 12, color: theme.uiTextMuted }}>No commits</div>
-    );
-  }
-
-  const rows = graph.rows;
+  const rows = graph?.rows ?? [];
   const colors = laneColors(theme);
+  const gutterW = Math.max(2, Math.min(graph?.laneCount ?? 1, MAX_GUTTER_LANES)) * LANE_W + 4;
   const showLoadMore = rows.length >= graphLimit && graphLimit < GRAPH_MAX;
   const totalH = rows.length * ROW_H + (showLoadMore ? ROW_H + 8 : 0);
   const first = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
@@ -79,6 +78,12 @@ export function GitGraph() {
       onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}
       style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', position: 'relative', minHeight: 80 }}
     >
+      {graph === null && (
+        <div style={{ padding: 12, fontSize: 12, color: theme.uiTextMuted }}>Loading history…</div>
+      )}
+      {graph !== null && rows.length === 0 && (
+        <div style={{ padding: 12, fontSize: 12, color: theme.uiTextMuted }}>No commits</div>
+      )}
       <div style={{ height: totalH, position: 'relative' }}>
         {rows.slice(first, last).map((row, i) => {
           const index = first + i;
@@ -103,7 +108,7 @@ export function GitGraph() {
                 overflow: isLastRow ? 'hidden' : undefined,
               }}
             >
-              <RowSvg row={row} colors={colors} />
+              <RowSvg row={row} colors={colors} gutterW={gutterW} />
               {row.refsDisplay && (
                 <span
                   style={{

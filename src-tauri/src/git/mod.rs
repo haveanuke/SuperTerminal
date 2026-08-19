@@ -104,9 +104,11 @@ pub fn git_status(
     state: State<'_, GitState>,
 ) -> Result<status::StatusReport, String> {
     let entry = state.entry(&repo_id).ok_or("unknown repo")?;
-    if entry.action_lock.try_lock().is_err() {
+    // Hold the action lock for the whole status run (a dropped try_lock guard
+    // would let an action start mid-status — TOCTOU).
+    let Ok(_guard) = entry.action_lock.try_lock() else {
         return Err("busy".to_string());
-    }
+    };
     if entry.status_inflight.swap(true, Ordering::SeqCst) {
         return Err("busy".to_string());
     }

@@ -46,7 +46,14 @@ pub fn git_push(
 
 #[tauri::command]
 pub fn git_pull(repo_id: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    network_action(&state, &repo_id, &["pull", "--ff-only"])
+    network_action(&state, &repo_id, &["pull", "--ff-only"]).map_err(|e| {
+        let lower = e.to_lowercase();
+        if lower.contains("fast-forward") || lower.contains("diverg") || lower.contains("not possible") {
+            format!("branches have diverged — pull cannot fast-forward; resolve in the terminal (merge or rebase). [{e}]")
+        } else {
+            e
+        }
+    })
 }
 
 #[tauri::command]

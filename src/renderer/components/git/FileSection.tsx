@@ -47,7 +47,12 @@ export function FileSection({ kind, entries }: FileSectionProps) {
 
   const confirmDiscard = (e: StatusEntry): boolean => {
     const untracked = e.kind === 'untracked';
-    const label = e.origPath ? `${e.origPath} → ${e.path}` : e.path;
+    // Mirror the backend's dispatch exactly: only a WORKTREE rename touches
+    // both paths; copies and staged-renames-with-modifications touch `path` only.
+    const isWorktreeRename = e.kind === 'rename_copy' && e.worktreeStatus === 'R';
+    const label = isWorktreeRename && e.origPath
+      ? `${e.path} (restoring ${e.origPath})`
+      : e.path;
     if (!window.confirm(`Discard changes to ${label}?`)) return false;
     if (untracked) {
       return window.confirm(`${label} is untracked — deleting it cannot be undone. Delete?`);
