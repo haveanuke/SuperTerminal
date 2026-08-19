@@ -1,4 +1,5 @@
 pub mod process;
+pub mod status;
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -83,6 +84,34 @@ pub fn git_resolve_repo(cwd: String, state: State<'_, GitState>) -> Option<RepoI
     state.resolve(&cwd)
 }
 
+/// Fresh status for a repo. Skipped (Err "busy") while an action holds the
+/// repo or another status refresh is running — the store drops "busy" silently.
+pub fn run_status(root: &Path) -> Result<status::StatusReport, String> {
+    let out = process::run_git(
+        Some(root),
+        &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
+        false,
+    )?;
+    Ok(status::parse_status(&out.stdout))
+}
+
+#[tauri::command]
+pub fn git_status(
+    repo_id: String,
+    state: State<'_, GitState>,
+) -> Result<status::StatusReport, String> {
+    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+    if entry.action_lock.try_lock().is_err() {
+        return Err("busy".to_string());
+    }
+    if entry.status_inflight.swap(true, Ordering::SeqCst) {
+        return Err("busy".to_string());
+    }
+    let result = run_status(&entry.root);
+    entry.status_inflight.store(false, Ordering::SeqCst);
+    result
+}
+
 #[cfg(test)]
 pub(crate) mod test_repo {
     use super::process::run_git;
@@ -94,7 +123,7 @@ pub(crate) mod test_repo {
     /// Fresh temp git repo with identity configured and one empty commit.
     pub fn tmp_repo() -> PathBuf {
         let dir = tmp_dir();
-        run_git(None, &["init", dir.to_str().unwrap()], false).unwrap();
+        run_git(None, &["init", "-b", "main", dir.to_str().unwrap()], false).unwrap();
         config_identity(&dir);
         run_git(
             Some(&dir),
@@ -108,7 +137,7 @@ pub(crate) mod test_repo {
     /// Fresh temp git repo with identity but NO commits (unborn HEAD).
     pub fn tmp_repo_unborn() -> PathBuf {
         let dir = tmp_dir();
-        run_git(None, &["init", dir.to_str().unwrap()], false).unwrap();
+        run_git(None, &["init", "-b", "main", dir.to_str().unwrap()], false).unwrap();
         config_identity(&dir);
         dir
     }
@@ -142,6 +171,55 @@ pub(crate) mod test_repo {
 mod tests {
     use super::*;
     use test_repo::*;
+
+    /// Integration fixture pinning porcelain arities against REAL git output:
+    /// staged file, modified file, untracked file, staged rename, and a real
+    /// merge conflict (the `u` record's field count is settled here).
+    #[test]
+    fn status_integration_covers_all_record_types() {
+        use super::process::run_git;
+        let dir = tmp_repo();
+        // tracked files
+        write(&dir, "modified.txt", "one");
+        write(&dir, "renamed-old.txt", "keep this content stable for rename detection");
+        write(&dir, "conflict.txt", "base");
+        run_git(Some(&dir), &["add", "-A"], false).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "base"], false).unwrap();
+
+        // branch with a conflicting change
+        run_git(Some(&dir), &["checkout", "-b", "other"], false).unwrap();
+        write(&dir, "conflict.txt", "other side");
+        run_git(Some(&dir), &["commit", "-am", "other"], false).unwrap();
+        run_git(Some(&dir), &["checkout", "-"], false).unwrap();
+        write(&dir, "conflict.txt", "main side");
+        run_git(Some(&dir), &["commit", "-am", "main"], false).unwrap();
+        let _ = run_git(Some(&dir), &["merge", "other"], false); // conflicts -> Err, fine
+
+        // staged rename + worktree modification + untracked
+        std::fs::rename(dir.join("renamed-old.txt"), dir.join("renamed new.txt")).unwrap();
+        run_git(Some(&dir), &["add", "renamed-old.txt", "renamed new.txt"], false).unwrap();
+        write(&dir, "modified.txt", "two");
+        write(&dir, "untracked dir/inner.txt", "new");
+
+        let report = run_status(&dir).unwrap();
+        let find = |k: &str| report.entries.iter().filter(|e| e.kind == k).collect::<Vec<_>>();
+
+        let unmerged = find("unmerged");
+        assert_eq!(unmerged.len(), 1, "entries: {:?}", report.entries);
+        assert_eq!(unmerged[0].path, "conflict.txt");
+        assert_eq!(unmerged[0].index_status, "U");
+        assert_eq!(unmerged[0].worktree_status, "U");
+
+        let renames = find("rename_copy");
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].path, "renamed new.txt");
+        assert_eq!(renames[0].orig_path.as_deref(), Some("renamed-old.txt"));
+        assert_eq!(renames[0].index_status, "R");
+
+        assert!(find("ordinary").iter().any(|e| e.path == "modified.txt" && e.worktree_status == "M"));
+        assert!(find("untracked").iter().any(|e| e.path == "untracked dir/inner.txt"));
+        assert_eq!(report.branch.as_deref(), Some("main"));
+    }
 
     #[test]
     fn resolves_and_interns_repo_ids() {

@@ -32,6 +32,7 @@ pub fn run() {
         .manage(git::GitState::default())
         .invoke_handler(tauri::generate_handler![
             git::git_resolve_repo,
+            git::git_status,
             pty::pty_create,
             pty::pty_write,
             pty::pty_write_broadcast,
