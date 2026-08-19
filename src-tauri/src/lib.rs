@@ -1,4 +1,5 @@
 pub mod pty;
+pub mod session;
 pub mod shell_env;
 
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
@@ -31,9 +32,22 @@ pub fn run() {
             pty::pty_write_broadcast,
             pty::pty_resize,
             pty::pty_dispose,
-            pty::pty_cwd
+            pty::pty_cwd,
+            session::session_save,
+            session::session_load,
+            session::session_list,
+            session::session_delete
         ])
         .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            let sessions = session::SessionManager::new(data_dir.join("sessions"));
+            #[cfg(target_os = "macos")]
+            if let Ok(home) = app.path().home_dir() {
+                sessions.migrate_from(
+                    &home.join("Library/Application Support/SuperTerminal/sessions"),
+                );
+            }
+            app.manage(sessions);
             create_main_window(app.handle())?;
             Ok(())
         })
