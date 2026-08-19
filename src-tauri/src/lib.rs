@@ -1,3 +1,5 @@
+pub mod shell_env;
+
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
 pub fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
