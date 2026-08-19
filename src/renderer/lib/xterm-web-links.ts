@@ -56,7 +56,11 @@ export function registerWebLinks(terminal: Terminal): IDisposable {
           activate(_event: MouseEvent, linkText: string) {
             let url = linkText;
             if (url.startsWith('www.')) url = 'https://' + url;
-            window.open(url);
+            if ('__TAURI_INTERNALS__' in window) {
+              import('@tauri-apps/plugin-opener').then((m) => m.openUrl(url));
+            } else {
+              window.open(url);
+            }
           },
         });
       }
