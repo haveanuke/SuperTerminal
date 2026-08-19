@@ -1,3 +1,4 @@
+pub mod pty;
 pub mod shell_env;
 
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
@@ -23,9 +24,26 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(pty::PtyManager::default())
+        .invoke_handler(tauri::generate_handler![
+            pty::pty_create,
+            pty::pty_write,
+            pty::pty_write_broadcast,
+            pty::pty_resize,
+            pty::pty_dispose,
+            pty::pty_cwd
+        ])
         .setup(|app| {
             create_main_window(app.handle())?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let app = window.app_handle();
+                if app.webview_windows().is_empty() {
+                    app.state::<pty::PtyManager>().dispose_all();
+                }
+            }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -34,6 +52,9 @@ pub fn run() {
                 if app.webview_windows().is_empty() {
                     let _ = create_main_window(app);
                 }
+            }
+            RunEvent::Exit => {
+                app.state::<pty::PtyManager>().dispose_all();
             }
             _ => {}
         });
