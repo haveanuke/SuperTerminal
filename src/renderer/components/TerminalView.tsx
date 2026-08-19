@@ -81,8 +81,9 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
     const entry = xtermRegistry.get(terminalId);
     if (entry) {
       entry.xterm.options.allowTransparency = !!backgroundImage;
-      // Transparency needs the DOM renderer; otherwise use the GPU renderer.
-      setWebglEnabled(entry, !backgroundImage);
+      // Keep the GPU renderer on (it supports transparency); this also
+      // re-engages it after a context loss.
+      setWebglEnabled(entry, true);
       entry.xterm.options.theme = {
         background: backgroundImage ? 'transparent' : theme.background,
         foreground: theme.foreground,

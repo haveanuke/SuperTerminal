@@ -18,9 +18,11 @@ export interface XtermEntry {
 
 /**
  * GPU renderer toggle. WebGL draws glyphs (and the cursor) into a canvas —
- * fast, and immune to the WebKit CSS-painting quirks of the DOM renderer.
- * Disabled while a background image needs terminal transparency; falls back
- * to the DOM renderer automatically if a GL context is unavailable or lost.
+ * fast, and immune to the WebKit CSS-painting quirks of the DOM renderer
+ * (root cause of the invisible-cursor bug: with a background image active,
+ * the DOM renderer's CSS-painted cursor never showed in WKWebView). The
+ * addon supports allowTransparency, so it stays on even with background
+ * images; DOM renderer remains only as a no-GL fallback.
  */
 export function setWebglEnabled(entry: XtermEntry, enabled: boolean) {
   if (enabled && !entry.webglAddon) {
@@ -59,6 +61,9 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     // WebKit fails to paint the default 1px hairline bar (inset box-shadow);
     // 2px paints reliably and reads better on Retina anyway.
     cursorWidth: 2,
+    // Option+Click moves the shell cursor via synthesized arrow keys
+    // (iTerm/VS Code convention).
+    altClickMovesCursor: true,
     allowProposedApi: true,
     allowTransparency: !!uiState.backgroundImage,
     theme: {
@@ -183,7 +188,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   });
 
   const entry: XtermEntry = { xterm, element, webglAddon: null, removeDataListener, removeExitListener, removeLinkProvider: () => linkDisposable.dispose() };
-  setWebglEnabled(entry, !uiState.backgroundImage);
+  setWebglEnabled(entry, true);
   xtermRegistry.set(terminalId, entry);
 
   return entry;
