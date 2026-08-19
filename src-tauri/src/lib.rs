@@ -70,6 +70,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
+            // Closing the last window emits an automatic ExitRequested (code None).
+            // Prevent it so the app stays in the dock, macOS-style; an explicit
+            // Quit carries a code and exits normally.
+            RunEvent::ExitRequested { code, api, .. } => {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
             RunEvent::Reopen { .. } => {
                 if app.webview_windows().is_empty() {
                     let _ = create_main_window(app);

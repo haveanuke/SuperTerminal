@@ -33,7 +33,7 @@ export function TabBar() {
       }}
     >
       {/* Drag region / window controls spacer */}
-      <div style={{ width: 78, flexShrink: 0, display: 'flex', alignItems: 'center' }} />
+      <div data-tauri-drag-region style={{ width: 78, flexShrink: 0, display: 'flex', alignItems: 'center' }} />
 
       {/* Tabs */}
       <div
@@ -128,7 +128,7 @@ export function TabBar() {
       </div>
 
       {/* Draggable spacer */}
-      <div style={{ flex: 1, minWidth: 40, display: 'flex', alignItems: 'center' }} />
+      <div data-tauri-drag-region style={{ flex: 1, minWidth: 40, display: 'flex', alignItems: 'center' }} />
 
       {/* Controls */}
       <div

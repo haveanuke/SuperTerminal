@@ -81,6 +81,7 @@ export function installTauriBridge(): void {
         } catch (err) {
           // Identity-guarded: if this id was disposed and recreated while our
           // invoke was in flight, never delete the replacement's entry.
+          entry.channel.onmessage = () => {};
           if (entries.get(id) === entry) entries.delete(id);
           throw err instanceof Error ? err : new Error(String(err));
         }
@@ -89,7 +90,18 @@ export function installTauriBridge(): void {
       writeBroadcast: (ids, data) => invoke('pty_write_broadcast', { ids, data }),
       resize: (id, cols, rows) => invoke('pty_resize', { id, cols, rows }),
       dispose: async (id) => {
-        entries.delete(id);
+        const entry = entries.get(id);
+        if (entry) {
+          // The Rust side retains the channel until it drops — trailing frames
+          // must never reach subscribers of a disposed terminal.
+          entry.channel.onmessage = () => {};
+          entry.dataSubs.clear();
+          entry.exitSubs.clear();
+          entry.pending.length = 0;
+          entry.pendingChars = 0;
+          entry.latchedExit = null;
+          entries.delete(id);
+        }
         await invoke('pty_dispose', { id });
       },
       onData: (id, callback) => {

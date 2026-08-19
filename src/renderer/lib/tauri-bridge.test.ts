@@ -93,6 +93,20 @@ describe('tauri-bridge pty', () => {
     expect(h.holder.lastChannel).not.toBe(first);
   });
 
+  it('dispose neutralizes the channel: trailing frames never reach subscribers', async () => {
+    await window.superTerminal.pty.create('g', 80, 24);
+    const chan = h.holder.lastChannel!;
+    const data: string[] = [];
+    const exits: number[] = [];
+    window.superTerminal.pty.onData('g', (d) => data.push(d));
+    window.superTerminal.pty.onExit('g', (c) => exits.push(c));
+    await window.superTerminal.pty.dispose('g');
+    chan.onmessage(utf8([120])); // trailing data frame after dispose
+    chan.onmessage({ exit: 0 }); // trailing exit frame after dispose
+    expect(data).toEqual([]);
+    expect(exits).toEqual([]);
+  });
+
   it('passes through write/resize/dispose and session calls', async () => {
     await window.superTerminal.pty.write('a', 'ls\n');
     expect(h.invokeMock).toHaveBeenCalledWith('pty_write', { id: 'a', data: 'ls\n' });

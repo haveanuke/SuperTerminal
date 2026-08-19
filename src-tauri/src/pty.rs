@@ -70,6 +70,9 @@ struct PtyRecord {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     pid: Option<u32>,
+    /// Set by the reader thread (under the slots lock) once the child has
+    /// exited; lets a late install know its pid is already dead.
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -80,12 +83,23 @@ pub struct PtyManager {
     /// used to open the dispose-during-create race window deterministically.
     #[cfg(test)]
     spawn_delay: Mutex<Option<std::time::Duration>>,
+    /// Test-only: one-shot delay between spawn and record installation, used
+    /// to open the fast-exit-before-install race window deterministically.
+    #[cfg(test)]
+    install_delay: Mutex<Option<std::time::Duration>>,
 }
 
 #[cfg(test)]
 impl PtyManager {
     fn slot_is_creating(&self, id: &str) -> bool {
         matches!(self.slots.lock().unwrap().get(id), Some(PtySlot::Creating(_)))
+    }
+
+    fn live_pid(&self, id: &str) -> Option<u32> {
+        match self.slots.lock().unwrap().get(id) {
+            Some(PtySlot::Live(_, rec)) => rec.pid,
+            _ => None,
+        }
     }
 }
 
@@ -179,9 +193,18 @@ impl PtyManager {
             // recv() has NO timeout: a process can close its PTY fds (reader EOF)
             // and keep running — the exit frame must carry the real code, never a
             // fabricated one. Dispose/shutdown kill the child, which unblocks wait().
+            //
+            // `exited` closes the fast-exit race: if the shell dies before the
+            // Live record is installed, the reader's cleanup finds no record to
+            // invalidate — so it flips this flag (under the slots lock) and the
+            // installer, holding the same lock, installs with pid None. pty_cwd
+            // therefore never sees a possibly-recycled pid.
+            let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let exited_for_reader = Arc::clone(&exited);
             let slots_for_reader = Arc::clone(&self.slots);
             let id_for_reader = id.to_string();
             std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
                 let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
@@ -206,6 +229,7 @@ impl PtyManager {
                         rec.pid = None;
                     }
                 }
+                exited_for_reader.store(true, Ordering::SeqCst);
             });
 
             Ok(PtyRecord {
@@ -213,15 +237,26 @@ impl PtyManager {
                 master: Arc::new(Mutex::new(pair.master)),
                 killer: Arc::new(Mutex::new(killer)),
                 pid,
+                exited,
             })
         })();
 
+        #[cfg(test)]
+        if let Some(d) = self.install_delay.lock().unwrap().take() {
+            std::thread::sleep(d);
+        }
+
         match spawned {
-            Ok(record) => {
+            Ok(mut record) => {
                 let mut slots = self.slots.lock().unwrap();
                 match slots.get(id) {
                     // Install only over our OWN reservation.
                     Some(PtySlot::Creating(g)) if *g == gen => {
+                        // Fast-exit race: reader finished before we installed —
+                        // its pid invalidation found nothing, so do it here.
+                        if record.exited.load(std::sync::atomic::Ordering::SeqCst) {
+                            record.pid = None;
+                        }
                         slots.insert(id.to_string(), PtySlot::Live(gen, record));
                         Ok(true)
                     }
@@ -456,6 +491,23 @@ mod tests {
         // with an exit frame (reader EOF -> real wait code).
         let (_ab, a_exit) = drain(&rx_a);
         assert!(a_exit.starts_with("{\"exit\":"));
+    }
+
+    #[test]
+    fn fast_exit_before_install_leaves_no_stale_pid() {
+        let mgr = PtyManager::default();
+        *mgr.install_delay.lock().unwrap() = Some(Duration::from_millis(700));
+        let (ch, rx) = test_channel();
+        // /usr/bin/true exits immediately — reader and waiter finish well
+        // before the delayed install, exercising the exited-flag handoff.
+        mgr.create_with_shell("fx", 80, 24, None, ch, "/usr/bin/true")
+            .unwrap();
+        let (_b, exit) = drain(&rx);
+        assert!(exit.starts_with("{\"exit\":"));
+        assert!(
+            mgr.live_pid("fx").is_none(),
+            "installed record must not retain the dead child's pid"
+        );
     }
 
     #[test]
