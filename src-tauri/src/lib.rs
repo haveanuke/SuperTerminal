@@ -1,3 +1,4 @@
+pub mod bg;
 pub mod buddy;
 pub mod pty;
 pub mod session;
@@ -38,7 +39,8 @@ pub fn run() {
             session::session_load,
             session::session_list,
             session::session_delete,
-            buddy::buddy_react
+            buddy::buddy_react,
+            bg::store_background_image
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
