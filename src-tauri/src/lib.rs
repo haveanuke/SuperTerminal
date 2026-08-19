@@ -33,6 +33,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             git::git_resolve_repo,
             git::git_status,
+            git::actions::git_stage,
+            git::actions::git_stage_all,
+            git::actions::git_unstage,
+            git::actions::git_unstage_all,
+            git::actions::git_discard,
+            git::actions::git_commit,
             pty::pty_create,
             pty::pty_write,
             pty::pty_write_broadcast,
