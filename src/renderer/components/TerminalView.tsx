@@ -40,6 +40,11 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
       try {
         safeFit(entry);
         window.superTerminal.pty.resize(terminalId, entry.xterm.cols, entry.xterm.rows);
+        // Focus the active terminal so typing (and the cursor) work at launch
+        // without requiring a click first.
+        if (useTerminalStore.getState().activeTerminalId === terminalId) {
+          entry.xterm.focus();
+        }
       } catch {
         // ignore
       }

@@ -29,6 +29,9 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     scrollback: 10000,
     cursorBlink: true,
     cursorStyle: 'bar',
+    // WebKit fails to paint the default 1px hairline bar (inset box-shadow);
+    // 2px paints reliably and reads better on Retina anyway.
+    cursorWidth: 2,
     allowProposedApi: true,
     allowTransparency: !!uiState.backgroundImage,
     theme: {
@@ -154,6 +157,7 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
 
   const entry: XtermEntry = { xterm, element, removeDataListener, removeExitListener, removeLinkProvider: () => linkDisposable.dispose() };
   xtermRegistry.set(terminalId, entry);
+
   return entry;
 }
 
