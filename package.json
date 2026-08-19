@@ -1,6 +1,6 @@
 {
   "name": "super-terminal",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A modern multi-terminal manager with splits, tabs, and grid layouts",
   "author": "Tomas Pinal",
   "scripts": {

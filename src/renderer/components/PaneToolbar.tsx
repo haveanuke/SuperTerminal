@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
-import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical } from './icons';
+import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical, Folder } from './icons';
 
 interface PaneToolbarProps {
   terminalId: string;
@@ -124,7 +124,7 @@ export function PaneToolbar({ terminalId, tabId, onSplitH, onSplitV, onClose }: 
             padding: '0 4px',
           }}
         >
-          <span aria-hidden style={{ flexShrink: 0 }}>📁</span>
+          <Folder size={11} style={{ flexShrink: 0 }} />
           <span
             style={{
               overflow: 'hidden',
