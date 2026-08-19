@@ -1,3 +1,4 @@
+pub mod buddy;
 pub mod pty;
 pub mod session;
 pub mod shell_env;
@@ -36,7 +37,8 @@ pub fn run() {
             session::session_save,
             session::session_load,
             session::session_list,
-            session::session_delete
+            session::session_delete,
+            buddy::buddy_react
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
