@@ -67,7 +67,9 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
     allowProposedApi: true,
     allowTransparency: !!uiState.backgroundImage,
     theme: {
-      background: uiState.backgroundImage ? 'transparent' : themeState.theme.background,
+      // Zero-alpha hex, not the 'transparent' keyword: the WebGL renderer's
+      // color parser treats the keyword as opaque black.
+      background: uiState.backgroundImage ? '#00000000' : themeState.theme.background,
       foreground: themeState.theme.foreground,
       cursor: themeState.theme.cursor,
       selectionBackground: themeState.theme.selection,
@@ -163,6 +165,36 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
 
   xterm.onTitleChange((title) => {
     useTerminalStore.getState().setTerminalTitle(terminalId, title);
+  });
+
+  // Plain-click cursor move: clicking within the line being typed jumps the
+  // shell cursor there via synthesized arrow keys (Option+Click also works,
+  // handled natively by xterm). Guards keep clicks harmless everywhere else:
+  // only on the cursor's own row, only in the normal buffer at the bottom,
+  // never while an app is tracking the mouse, never after a text selection.
+  element.addEventListener('click', (e) => {
+    if (e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+    if (xterm.hasSelection()) return;
+    const buf = xterm.buffer.active;
+    if (buf.type !== 'normal') return;
+    if (buf.viewportY < buf.baseY) return; // scrolled into history
+    if (xterm.modes.mouseTrackingMode !== 'none') return; // app owns the mouse
+    const screen = element.querySelector('.xterm-screen');
+    if (!screen) return;
+    const rect = screen.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const col = Math.min(
+      xterm.cols - 1,
+      Math.max(0, Math.floor(((e.clientX - rect.left) / rect.width) * xterm.cols))
+    );
+    const row = Math.floor(((e.clientY - rect.top) / rect.height) * xterm.rows);
+    if (row !== buf.cursorY) return; // same-line moves only
+    const delta = col - buf.cursorX;
+    if (delta === 0) return;
+    const arrow = xterm.modes.applicationCursorKeysMode
+      ? delta > 0 ? '\x1bOC' : '\x1bOD'
+      : delta > 0 ? '\x1b[C' : '\x1b[D';
+    writeToPty(arrow.repeat(Math.abs(delta)));
   });
 
   const { cols, rows } = xterm;

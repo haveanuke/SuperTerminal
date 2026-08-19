@@ -1,6 +1,6 @@
 [package]
 name = "superterminal"
-version = "0.3.3"
+version = "0.3.4"
 description = "A modern multi-terminal manager with splits, tabs, and grid layouts"
 edition = "2021"
 

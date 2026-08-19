@@ -85,7 +85,9 @@ export function TerminalView({ terminalId }: TerminalViewProps) {
       // re-engages it after a context loss.
       setWebglEnabled(entry, true);
       entry.xterm.options.theme = {
-        background: backgroundImage ? 'transparent' : theme.background,
+        // Zero-alpha hex, not 'transparent' — the WebGL color parser treats
+        // the keyword as opaque black.
+        background: backgroundImage ? '#00000000' : theme.background,
         foreground: theme.foreground,
         cursor: theme.cursor,
         selectionBackground: theme.selection,
