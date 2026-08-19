@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod graph;
 pub mod network;
 pub mod process;
 pub mod status;
@@ -221,6 +222,38 @@ mod tests {
         assert!(find("ordinary").iter().any(|e| e.path == "modified.txt" && e.worktree_status == "M"));
         assert!(find("untracked").iter().any(|e| e.path == "untracked dir/inner.txt"));
         assert_eq!(report.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn graph_integration_renders_real_merge() {
+        use super::process::run_git;
+        let dir = tmp_repo();
+        write(&dir, "f.txt", "base");
+        run_git(Some(&dir), &["add", "-A"], false).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "base"], false).unwrap();
+        run_git(Some(&dir), &["checkout", "-b", "feature"], false).unwrap();
+        write(&dir, "g.txt", "feat");
+        run_git(Some(&dir), &["add", "-A"], false).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "feat"], false).unwrap();
+        run_git(Some(&dir), &["checkout", "main"], false).unwrap();
+        write(&dir, "h.txt", "main");
+        run_git(Some(&dir), &["add", "-A"], false).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "mainline"], false).unwrap();
+        run_git(Some(&dir), &["merge", "--no-ff", "feature", "-m", "merge feat"], false).unwrap();
+
+        let out = run_git(
+            Some(&dir),
+            &["log", "--all", "--topo-order", "-z",
+              "--format=%H\u{1f}%P\u{1f}%D\u{1f}%an\u{1f}%at\u{1f}%s", "-n", "50"],
+            false,
+        )
+        .unwrap();
+        let g = super::graph::layout(&super::graph::parse_log(&out.stdout));
+        assert_eq!(g.rows.len(), 5);
+        assert_eq!(g.lane_count, 2);
+        assert_eq!(g.rows[0].subject, "merge feat");
+        assert!(g.rows[0].edges.len() >= 2, "merge row branches: {:?}", g.rows[0].edges);
+        assert!(g.rows[0].refs_display.contains("main"));
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub fn run() {
             git::network::git_push,
             git::network::git_pull,
             git::network::git_fetch,
+            git::graph::git_graph,
             pty::pty_create,
             pty::pty_write,
             pty::pty_write_broadcast,
