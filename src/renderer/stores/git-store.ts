@@ -146,7 +146,7 @@ async function follow(terminalId: string | null): Promise<void> {
   if (gen !== generation || !useGitStore.getState().open) return;
   if (!info) {
     // A real cwd that is not inside a repo -> explicit empty state.
-    useGitStore.setState({ repo: null, targetPath: cwd, report: null, graph: null });
+    useGitStore.setState({ repo: null, targetPath: cwd, report: null, graph: null, lastSkipped: 0 });
     return;
   }
   const prev = useGitStore.getState().repo;
@@ -163,6 +163,7 @@ async function follow(terminalId: string | null): Promise<void> {
     report: null,
     graph: null,
     graphLimit: GRAPH_STEP,
+    lastSkipped: 0,
   });
   void refreshStatus();
   void refreshGraph();

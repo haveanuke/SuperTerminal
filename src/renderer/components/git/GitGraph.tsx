@@ -22,23 +22,34 @@ function laneX(lane: number): number {
 
 function RowSvg({ row, colors, gutterW }: { row: GraphRow; colors: string[]; gutterW: number }) {
   const cy = ROW_H / 2;
+  // overflow:visible lets edges continue into the next row vertically; the
+  // clipPath (wide vertically, bounded horizontally) stops lanes beyond the
+  // gutter from drawing over the commit text.
+  const clipId = `lane-clip-${row.hash.slice(0, 12)}`;
   return (
     <svg
       width={gutterW}
       height={ROW_H}
       style={{ overflow: 'visible', flexShrink: 0 }}
     >
-      {row.edges.map((e, i) => {
-        const fx = laneX(e.fromLane);
-        const tx = laneX(e.toLane);
-        const color = colors[e.toLane % colors.length];
-        const d =
-          fx === tx
-            ? `M ${fx} ${cy} L ${fx} ${cy + ROW_H}`
-            : `M ${fx} ${cy} C ${fx} ${cy + ROW_H * 0.8}, ${tx} ${cy + ROW_H * 0.2}, ${tx} ${cy + ROW_H}`;
-        return <path key={i} d={d} stroke={color} strokeWidth={1.5} fill="none" />;
-      })}
-      <circle cx={laneX(row.lane)} cy={cy} r={3.5} fill={colors[row.lane % colors.length]} />
+      <defs>
+        <clipPath id={clipId}>
+          <rect x={0} y={-ROW_H} width={gutterW} height={ROW_H * 3} />
+        </clipPath>
+      </defs>
+      <g clipPath={`url(#${clipId})`}>
+        {row.edges.map((e, i) => {
+          const fx = laneX(e.fromLane);
+          const tx = laneX(e.toLane);
+          const color = colors[e.toLane % colors.length];
+          const d =
+            fx === tx
+              ? `M ${fx} ${cy} L ${fx} ${cy + ROW_H}`
+              : `M ${fx} ${cy} C ${fx} ${cy + ROW_H * 0.8}, ${tx} ${cy + ROW_H * 0.2}, ${tx} ${cy + ROW_H}`;
+          return <path key={i} d={d} stroke={color} strokeWidth={1.5} fill="none" />;
+        })}
+        <circle cx={laneX(row.lane)} cy={cy} r={3.5} fill={colors[row.lane % colors.length]} />
+      </g>
     </svg>
   );
 }
