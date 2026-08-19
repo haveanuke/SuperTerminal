@@ -154,10 +154,15 @@ fn main() {
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "opener:allow-open-url"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "http://*" }, { "url": "https://*" }]
+    }
   ]
 }
 ```
+
+(The opener permission is scoped to http/https only, per spec — the bare permission has no scope.)
 
 `src-tauri/src/main.rs`:
 
@@ -473,6 +478,53 @@ mod tests {
     }
 
     #[test]
+    fn dispose_during_create_installs_replacement_only() {
+        let mgr = Arc::new(PtyManager::default());
+        *mgr.spawn_delay.lock().unwrap() = Some(Duration::from_millis(600));
+        let (ch_a, rx_a) = test_channel();
+        let mgr2 = Arc::clone(&mgr);
+        let t = std::thread::spawn(move || {
+            mgr2.create_with_shell("r", 80, 24, None, ch_a, "/bin/sh").unwrap()
+        });
+        // Deterministic: wait until A's reservation is observably in place
+        // (A holds it while sleeping in the spawn_delay hook) before disposing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mgr.slot_is_creating("r") {
+            assert!(std::time::Instant::now() < deadline, "reservation never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        mgr.dispose("r"); // removes A's Creating reservation mid-flight
+        let (ch_b, rx_b) = test_channel();
+        assert!(mgr.create_with_shell("r", 80, 24, None, ch_b, "/bin/sh").unwrap());
+        t.join().unwrap();
+        // B's shell is the live one:
+        mgr.write("r", "printf B-alive; exit\n");
+        let (bytes, _exit) = drain(&rx_b);
+        assert!(String::from_utf8_lossy(&bytes).contains("B-alive"));
+        // A's child was killed at install-conflict time; its channel still ends
+        // with an exit frame (reader EOF -> real wait code).
+        let (_ab, a_exit) = drain(&rx_a);
+        assert!(a_exit.starts_with("{\"exit\":"));
+        // and B's record survived A's reader cleanup (pid still queryable on macOS)
+        #[cfg(target_os = "macos")]
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn exit_frame_carries_real_code_after_fd_close_eof() {
+        // The child closes its PTY fds (reader EOF) but keeps running, then
+        // exits 5. The exit frame must wait for the REAL code — never fabricate.
+        let mgr = PtyManager::default();
+        let (ch, rx) = test_channel();
+        mgr.create_with_shell("dl", 80, 24, None, ch, "/bin/sh").unwrap();
+        mgr.write("dl", "exec 0<&- 1>&- 2>&-; sleep 1; exit 5\n");
+        let (_bytes, exit) = drain(&rx);
+        assert_eq!(exit, "{\"exit\":5}");
+    }
+
+    #[test]
     fn write_and_resize_on_unknown_id_are_noops() {
         let mgr = PtyManager::default();
         mgr.write("nope", "x");
@@ -518,10 +570,14 @@ use tauri::State;
 use crate::shell_env;
 
 /// Reservation-based slot: `Creating` blocks duplicate creates without holding
-/// the map lock across the (slow) spawn.
+/// the map lock across the (slow) spawn. Every reservation carries a unique
+/// generation so a create that lost a dispose/recreate race can detect it —
+/// without the generation, create A could install its record over create B's
+/// reservation after A was disposed mid-flight, leaving the bridge holding B's
+/// channel while the backend streams to A's.
 enum PtySlot {
-    Creating,
-    Live(PtyRecord),
+    Creating(u64),
+    Live(u64, PtyRecord),
 }
 
 struct PtyRecord {
@@ -534,6 +590,18 @@ struct PtyRecord {
 #[derive(Default)]
 pub struct PtyManager {
     slots: Arc<Mutex<HashMap<String, PtySlot>>>,
+    next_gen: std::sync::atomic::AtomicU64,
+    /// Test-only: one-shot artificial delay between reservation and spawn,
+    /// used to open the dispose-during-create race window deterministically.
+    #[cfg(test)]
+    spawn_delay: Mutex<Option<std::time::Duration>>,
+}
+
+#[cfg(test)]
+impl PtyManager {
+    fn slot_is_creating(&self, id: &str) -> bool {
+        matches!(self.slots.lock().unwrap().get(id), Some(PtySlot::Creating(_)))
+    }
 }
 
 impl PtyManager {
@@ -559,13 +627,21 @@ impl PtyManager {
         channel: Channel<InvokeResponseBody>,
         shell: &str,
     ) -> Result<bool, String> {
+        use std::sync::atomic::Ordering;
+        let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
+
         // Reserve the slot (never spawn while holding the lock).
         {
             let mut slots = self.slots.lock().unwrap();
             if slots.contains_key(id) {
                 return Ok(false);
             }
-            slots.insert(id.to_string(), PtySlot::Creating);
+            slots.insert(id.to_string(), PtySlot::Creating(gen));
+        }
+
+        #[cfg(test)]
+        if let Some(d) = self.spawn_delay.lock().unwrap().take() {
+            std::thread::sleep(d);
         }
 
         let spawned = (|| -> Result<PtyRecord, String> {
@@ -585,9 +661,26 @@ impl PtyManager {
             drop(pair.slave);
 
             let pid = child.process_id();
-            let killer = child.clone_killer();
-            let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-            let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+            let mut killer = child.clone_killer();
+
+            // Any failure after spawn must kill the child, or it leaks.
+            let reader = match pair.master.try_clone_reader() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = killer.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+            };
+            let writer = match pair.master.take_writer() {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = killer.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+            };
+            let mut reader = reader;
 
             // Waiter thread: sole owner of child.wait(); hands the code to the
             // reader thread so the exit frame is always the LAST frame sent.
@@ -598,6 +691,9 @@ impl PtyManager {
             });
 
             // Reader thread: pump raw bytes until EOF, then send the exit frame.
+            // recv() has NO timeout: a process can close its PTY fds (reader EOF)
+            // and keep running — the exit frame must carry the real code, never a
+            // fabricated one. Dispose/shutdown kill the child, which unblocks wait().
             let slots_for_reader = Arc::clone(&self.slots);
             let id_for_reader = id.to_string();
             std::thread::spawn(move || {
@@ -615,14 +711,15 @@ impl PtyManager {
                         }
                     }
                 }
-                let code = exit_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap_or(0);
+                let code = exit_rx.recv().unwrap_or(-1);
                 let _ = channel.send(InvokeResponseBody::Json(format!("{{\"exit\":{code}}}")));
-                // Invalidate the pid so pty_cwd never queries a reused pid.
+                // Invalidate the pid so pty_cwd never queries a reused pid —
+                // but only on our own generation's record, never a replacement's.
                 let mut slots = slots_for_reader.lock().unwrap();
-                if let Some(PtySlot::Live(rec)) = slots.get_mut(&id_for_reader) {
-                    rec.pid = None;
+                if let Some(PtySlot::Live(g, rec)) = slots.get_mut(&id_for_reader) {
+                    if *g == gen {
+                        rec.pid = None;
+                    }
                 }
             });
 
@@ -638,11 +735,13 @@ impl PtyManager {
             Ok(record) => {
                 let mut slots = self.slots.lock().unwrap();
                 match slots.get(id) {
-                    Some(PtySlot::Creating) => {
-                        slots.insert(id.to_string(), PtySlot::Live(record));
+                    // Install only over our OWN reservation.
+                    Some(PtySlot::Creating(g)) if *g == gen => {
+                        slots.insert(id.to_string(), PtySlot::Live(gen, record));
                         Ok(true)
                     }
-                    // Disposed while creating: kill the fresh child, drop everything.
+                    // Disposed (and possibly replaced) while creating: kill the
+                    // fresh child; its reader sends the exit frame and unwinds.
                     _ => {
                         drop(slots);
                         let _ = record.killer.lock().unwrap().kill();
@@ -651,7 +750,12 @@ impl PtyManager {
                 }
             }
             Err(e) => {
-                self.slots.lock().unwrap().remove(id);
+                let mut slots = self.slots.lock().unwrap();
+                if let Some(PtySlot::Creating(g)) = slots.get(id) {
+                    if *g == gen {
+                        slots.remove(id);
+                    }
+                }
                 Err(e)
             }
         }
@@ -660,7 +764,7 @@ impl PtyManager {
     fn live_writer(&self, id: &str) -> Option<Arc<Mutex<Box<dyn Write + Send>>>> {
         let slots = self.slots.lock().unwrap();
         match slots.get(id) {
-            Some(PtySlot::Live(rec)) => Some(Arc::clone(&rec.writer)),
+            Some(PtySlot::Live(_, rec)) => Some(Arc::clone(&rec.writer)),
             _ => None,
         }
     }
@@ -677,7 +781,7 @@ impl PtyManager {
         let master = {
             let slots = self.slots.lock().unwrap();
             match slots.get(id) {
-                Some(PtySlot::Live(rec)) => Some(Arc::clone(&rec.master)),
+                Some(PtySlot::Live(_, rec)) => Some(Arc::clone(&rec.master)),
                 _ => None,
             }
         };
@@ -693,10 +797,12 @@ impl PtyManager {
 
     pub fn dispose(&self, id: &str) {
         let slot = self.slots.lock().unwrap().remove(id);
-        if let Some(PtySlot::Live(rec)) = slot {
+        if let Some(PtySlot::Live(_, rec)) = slot {
             let _ = rec.killer.lock().unwrap().kill();
             // reader hits EOF -> sends exit frame -> threads unwind
         }
+        // A `Creating` slot is simply removed: the in-flight create detects the
+        // missing/foreign reservation at install time and kills its child.
     }
 
     pub fn dispose_all(&self) {
@@ -710,15 +816,16 @@ impl PtyManager {
         let pid = {
             let slots = self.slots.lock().unwrap();
             match slots.get(id) {
-                Some(PtySlot::Live(rec)) => rec.pid,
+                Some(PtySlot::Live(_, rec)) => rec.pid,
                 _ => None,
             }
         }?;
         #[cfg(target_os = "macos")]
         {
-            libproc::libproc::proc_pid::pidcwd(pid as i32)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
+            // libproc 0.14's pidcwd returns Result<String> — no path conversion.
+            // (If the resolved version returns PathBuf instead, map through
+            // `to_string_lossy().into_owned()` — check at compile time.)
+            libproc::libproc::proc_pid::pidcwd(pid as i32).ok()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1264,10 +1371,12 @@ git add src-tauri && git commit -m "feat(tauri): background image storage + comp
 - [ ] **Step 1: Write failing bridge tests** (vitest, jsdom; mock `@tauri-apps/api/core`)
 
 ```ts
+// @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// vi.mock factories are hoisted above module-level consts — shared state must
-// come from vi.hoisted or the factories throw ReferenceError.
+// (vitest.config.ts defaults to environment 'node'; the pragma above gives this
+// file a `window`.) vi.mock factories are hoisted above module-level consts —
+// shared state must come from vi.hoisted or the factories throw ReferenceError.
 const h = vi.hoisted(() => {
   const invokeMock = vi.fn();
   const holder: { lastChannel: { onmessage: (msg: unknown) => void } | null } = { lastChannel: null };
@@ -1450,7 +1559,9 @@ export function installTauriBridge(): void {
         try {
           return await invoke<boolean>('pty_create', { id, cols, rows, cwd: cwd ?? null, channel: entry.channel });
         } catch (err) {
-          entries.delete(id);
+          // Identity-guarded: if this id was disposed and recreated while our
+          // invoke was in flight, never delete the replacement's entry.
+          if (entries.get(id) === entry) entries.delete(id);
           throw err instanceof Error ? err : new Error(String(err));
         }
       },
@@ -1657,7 +1768,7 @@ Replace the `Build DMGs` step and artifact path:
 
 Remove the `CSC_IDENTITY_AUTO_DISCOVERY` env (electron-builder-specific).
 
-- [ ] **Step 3: README** — update dev/build instructions: `npm run dev:tauri`, `npm run package:tauri`, Rust toolchain prerequisite (`rustup` or `brew install rust`), note the Electron→Tauri switch and the one-time settings reset.
+- [ ] **Step 3: README** — update dev/build instructions: `npm run dev:tauri`, `npm run package:tauri`, Rust toolchain prerequisite (`rustup` or `brew install rust`), note the Electron→Tauri switch and the one-time settings reset. (Task 9 renames these scripts to `dev`/`package` — it must touch the README again.)
 
 - [ ] **Step 4: Commit**
 
@@ -1671,7 +1782,7 @@ git add .github README.md && git commit -m "ci: build and test the Tauri app"
 
 **Files:**
 - Delete: `src/main/` (all files), `scripts/dev.mjs`, `tsconfig.main.json`
-- Modify: `package.json`, `src/renderer/components/App.tsx`, `src/renderer/components/TabBar.tsx`, `.github/workflows/ci.yml`
+- Modify: `package.json`, `tsconfig.json`, `README.md`, `src/renderer/components/App.tsx`, `src/renderer/components/TabBar.tsx`, `src/renderer/lib/xterm-web-links.ts`, `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Verify Rust ports cover the deleted tests**
 
@@ -1704,10 +1815,13 @@ npm uninstall electron electron-builder @electron/rebuild node-pty
 - `App.tsx`: `src={backgroundImage}` — drop the `file://` conditional (Electron-era stored paths die with the settings reset).
 - `TabBar.tsx`: remove both `WebkitAppRegion` styles, keep `data-tauri-drag-region`; also keep the 78px traffic-light spacer.
 - `xterm-web-links.ts`: keep the `__TAURI_INTERNALS__` conditional (vitest/jsdom still exercises the `window.open` path).
+- `tsconfig.json`: delete the `"references": [{ "path": "./tsconfig.main.json" }]` entry (the referenced file is gone).
+- `README.md`: dev/build commands become `npm run dev` and `npm run package`.
 
 - [ ] **Step 4: Full verification**
 
-Run: `npm run lint && npm run build && npx vitest run && cargo test --manifest-path src-tauri/Cargo.toml && npm run package`
+Run: `npm run lint && npx tsc --noEmit -p tsconfig.json && npm run build && npx vitest run && cargo test --manifest-path src-tauri/Cargo.toml && npm run package`
+(The explicit `tsc --noEmit` matters: `vite build` does not typecheck.)
 Expected: all green; `src-tauri/target/release/bundle/dmg/SuperTerminal_0.3.0_aarch64.dmg` exists. Mount it, launch the app, run smoke items 1, 5, 9, 10, 11 from Task 7 Step 6 against the **packaged** app.
 
 - [ ] **Step 5: Compare sizes** (the point of the port — record in the commit message)
