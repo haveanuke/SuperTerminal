@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
-import { Plus, X, Search, Radio } from './icons';
+import { useGitStore } from '../stores/git-store';
+import { Plus, X, Search, Radio, GitBranch } from './icons';
 
 export function TabBar() {
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -19,6 +20,8 @@ export function TabBar() {
   const setSearchQuery = useTerminalStore((s) => s.setSearchQuery);
   const setTabLabel = useTerminalStore((s) => s.setTabLabel);
   const theme = useThemeStore((s) => s.theme);
+  const gitOpen = useGitStore((s) => s.open);
+  const toggleGit = useGitStore((s) => s.toggle);
 
   return (
     <div
@@ -165,6 +168,15 @@ export function TabBar() {
             }}
           />
         )}
+        <button
+          className="toolbar-btn"
+          onClick={toggleGit}
+          title="Source control (Cmd+Shift+G)"
+          style={{ color: gitOpen ? theme.uiAccent : undefined }}
+        >
+          <GitBranch />
+        </button>
+
         <button
           className="toolbar-btn"
           onClick={() => setSearchOpen(!searchOpen)}

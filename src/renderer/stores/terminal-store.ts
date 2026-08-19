@@ -36,7 +36,7 @@ interface TerminalStore {
   setActiveTab: (tabId: string) => void;
   setTabLabel: (tabId: string, label: string) => void;
 
-  splitPane: (tabId: string, terminalId: string, direction: 'horizontal' | 'vertical') => void;
+  splitPane: (tabId: string, terminalId: string, direction: 'horizontal' | 'vertical', cwd?: string) => void;
   closePaneTerminal: (tabId: string, terminalId: string) => void;
 
   toggleBroadcast: () => void;
@@ -188,8 +188,8 @@ export const useTerminalStore = createStore<TerminalStore>((set, get) => {
       }));
     },
 
-    splitPane: (tabId: string, terminalId: string, direction) => {
-      const newTerm = get().addTerminal();
+    splitPane: (tabId: string, terminalId: string, direction, cwd?: string) => {
+      const newTerm = get().addTerminal(cwd);
       set((s) => ({
         tabs: s.tabs.map((t) =>
           t.id === tabId

@@ -140,3 +140,53 @@ export function Save(props: IconProps) {
     </Svg>
   );
 }
+
+export function GitBranch(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <line x1="6" y1="3" x2="6" y2="15" />
+      <circle cx="18" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <path d="M18 9a9 9 0 0 1-9 9" />
+    </Svg>
+  );
+}
+
+export function ArrowUp(props: IconProps) {
+  return <Svg {...props}><line x1="12" y1="19" x2="12" y2="5" /><polyline points="5 12 12 5 19 12" /></Svg>;
+}
+
+export function ArrowDown(props: IconProps) {
+  return <Svg {...props}><line x1="12" y1="5" x2="12" y2="19" /><polyline points="19 12 12 19 5 12" /></Svg>;
+}
+
+export function RefreshCw(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </Svg>
+  );
+}
+
+export function SyncArrows(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M8 21 4 17l4-4" /><path d="M4 17h11" />
+      <path d="m16 3 4 4-4 4" /><path d="M20 7H9" />
+    </Svg>
+  );
+}
+
+export function Undo(props: IconProps) {
+  return <Svg {...props}><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13" /></Svg>;
+}
+
+export function Minus(props: IconProps) {
+  return <Svg {...props}><line x1="5" y1="12" x2="19" y2="12" /></Svg>;
+}
+
+export function Check(props: IconProps) {
+  return <Svg {...props}><polyline points="20 6 9 17 4 12" /></Svg>;
+}

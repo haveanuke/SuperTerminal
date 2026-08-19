@@ -1,17 +1,19 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
 import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical } from './icons';
 
 interface PaneToolbarProps {
   terminalId: string;
+  tabId: string;
   onSplitH: () => void;
   onSplitV: () => void;
   onClose: () => void;
 }
 
-export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToolbarProps) {
+export function PaneToolbar({ terminalId, tabId, onSplitH, onSplitV, onClose }: PaneToolbarProps) {
   const terminal = useTerminalStore((s) => s.terminals.get(terminalId));
+  const isTabActive = useTerminalStore((s) => s.activeTabId === tabId);
   const theme = useThemeStore((s) => s.theme);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const broadcastTargets = useTerminalStore((s) => s.broadcastTargets);
@@ -24,6 +26,37 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
   const cancelSwap = useTerminalStore((s) => s.cancelSwap);
 
   const [showAutoRun, setShowAutoRun] = useState(false);
+  const [cwd, setCwd] = useState<string | null>(null);
+
+  // Live shell cwd (best-effort, via proc_pidinfo on the shell pid).
+  // Hidden tabs stay mounted, so only the active tab's toolbars poll.
+  useEffect(() => {
+    if (!isTabActive) return;
+    let alive = true;
+    const refresh = () => {
+      window.superTerminal.pty
+        .cwd(terminalId)
+        .then((c) => {
+          if (alive && c) setCwd(c);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [terminalId, isTabActive]);
+
+  const displayCwd = cwd ? cwd.replace(/^\/Users\/[^/]+/, '~') : null;
+
+  const revealCwd = () => {
+    if (!cwd) return;
+    import('@tauri-apps/plugin-opener')
+      .then((m) => m.revealItemInDir(cwd))
+      .catch(() => {});
+  };
   const [command, setCommand] = useState(terminal?.autoRun?.command || '');
   const [interval, setInterval] = useState(terminal?.autoRun?.intervalSeconds?.toString() || '5');
   const [sendEscape, setSendEscape] = useState(terminal?.autoRun?.sendEscape || false);
@@ -75,6 +108,36 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
           </span>
         )}
       </span>
+
+      {displayCwd && (
+        <span
+          onClick={revealCwd}
+          title={`${cwd}\nClick to reveal in Finder`}
+          style={{
+            maxWidth: '40%',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 3,
+            cursor: 'pointer',
+            fontSize: 11,
+            color: theme.uiTextMuted,
+            padding: '0 4px',
+          }}
+        >
+          <span aria-hidden style={{ flexShrink: 0 }}>📁</span>
+          <span
+            style={{
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              direction: 'rtl',
+              textAlign: 'left',
+            }}
+          >
+            {displayCwd}
+          </span>
+        </span>
+      )}
 
       {/* Broadcast toggle (only when broadcast mode is on) */}
       {broadcastMode && (

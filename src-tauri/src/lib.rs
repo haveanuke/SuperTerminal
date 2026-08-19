@@ -1,5 +1,6 @@
 pub mod bg;
 pub mod buddy;
+pub mod git;
 pub mod pty;
 pub mod session;
 pub mod shell_env;
@@ -28,7 +29,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(pty::PtyManager::default())
+        .manage(git::GitState::default())
         .invoke_handler(tauri::generate_handler![
+            git::git_resolve_repo,
+            git::git_status,
+            git::actions::git_stage,
+            git::actions::git_stage_all,
+            git::actions::git_unstage,
+            git::actions::git_unstage_all,
+            git::actions::git_discard,
+            git::actions::git_commit,
+            git::network::git_push,
+            git::network::git_pull,
+            git::network::git_fetch,
+            git::graph::git_graph,
             pty::pty_create,
             pty::pty_write,
             pty::pty_write_broadcast,
