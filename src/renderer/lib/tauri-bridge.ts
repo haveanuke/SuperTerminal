@@ -104,6 +104,7 @@ export function installTauriBridge(): void {
         }
         await invoke('pty_dispose', { id });
       },
+      cwd: (id) => invoke('pty_cwd', { id }),
       onData: (id, callback) => {
         const entry = entries.get(id);
         if (!entry) return () => {};

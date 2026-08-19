@@ -65,6 +65,7 @@ declare global {
         writeBroadcast: (ids: string[], data: string) => Promise<void>;
         resize: (id: string, cols: number, rows: number) => Promise<void>;
         dispose: (id: string) => Promise<void>;
+        cwd: (id: string) => Promise<string | null>;
         onData: (id: string, callback: (data: string) => void) => () => void;
         onExit: (id: string, callback: (exitCode: number) => void) => () => void;
       };

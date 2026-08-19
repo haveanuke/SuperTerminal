@@ -131,7 +131,8 @@ export function getOrCreateXterm(terminalId: string): XtermEntry {
   });
 
   const { cols, rows } = xterm;
-  window.superTerminal.pty.create(terminalId, cols, rows).catch((err) => {
+  const cwd = useTerminalStore.getState().terminals.get(terminalId)?.cwd;
+  window.superTerminal.pty.create(terminalId, cols, rows, cwd).catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     xterm.write(`\r\n[Failed to start terminal: ${msg}]\r\n`);
     toastError(`Failed to start terminal: ${msg}`);

@@ -107,6 +107,13 @@ describe('tauri-bridge pty', () => {
     expect(exits).toEqual([]);
   });
 
+  it('exposes pty.cwd via invoke', async () => {
+    h.invokeMock.mockResolvedValueOnce('/Users/x/project');
+    const cwd = await window.superTerminal.pty.cwd('a');
+    expect(h.invokeMock).toHaveBeenCalledWith('pty_cwd', { id: 'a' });
+    expect(cwd).toBe('/Users/x/project');
+  });
+
   it('passes through write/resize/dispose and session calls', async () => {
     await window.superTerminal.pty.write('a', 'ls\n');
     expect(h.invokeMock).toHaveBeenCalledWith('pty_write', { id: 'a', data: 'ls\n' });

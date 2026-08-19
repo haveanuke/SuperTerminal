@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useTerminalStore } from '../stores/terminal-store';
 import { useThemeStore } from '../stores/theme-store';
 import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical } from './icons';
@@ -24,6 +24,35 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
   const cancelSwap = useTerminalStore((s) => s.cancelSwap);
 
   const [showAutoRun, setShowAutoRun] = useState(false);
+  const [cwd, setCwd] = useState<string | null>(null);
+
+  // Live shell cwd (best-effort, via proc_pidinfo on the shell pid).
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      window.superTerminal.pty
+        .cwd(terminalId)
+        .then((c) => {
+          if (alive && c) setCwd(c);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [terminalId]);
+
+  const displayCwd = cwd ? cwd.replace(/^\/Users\/[^/]+/, '~') : null;
+
+  const revealCwd = () => {
+    if (!cwd) return;
+    import('@tauri-apps/plugin-opener')
+      .then((m) => m.revealItemInDir(cwd))
+      .catch(() => {});
+  };
   const [command, setCommand] = useState(terminal?.autoRun?.command || '');
   const [interval, setInterval] = useState(terminal?.autoRun?.intervalSeconds?.toString() || '5');
   const [sendEscape, setSendEscape] = useState(terminal?.autoRun?.sendEscape || false);
@@ -75,6 +104,27 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
           </span>
         )}
       </span>
+
+      {displayCwd && (
+        <span
+          onClick={revealCwd}
+          title={`${cwd}\nClick to reveal in Finder`}
+          style={{
+            maxWidth: '40%',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            direction: 'rtl',
+            textAlign: 'left',
+            cursor: 'pointer',
+            fontSize: 11,
+            color: theme.uiTextMuted,
+            padding: '0 4px',
+          }}
+        >
+          {displayCwd}
+        </span>
+      )}
 
       {/* Broadcast toggle (only when broadcast mode is on) */}
       {broadcastMode && (

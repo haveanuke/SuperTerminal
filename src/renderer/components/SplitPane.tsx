@@ -131,12 +131,22 @@ export function SplitPane({ pane, tabId }: SplitPaneProps) {
   const splitPane = useTerminalStore((s) => s.splitPane);
 
   if (pane.type === 'terminal') {
+    // New shells start where the source pane's shell currently is, not $HOME.
+    const splitFrom = async (direction: 'horizontal' | 'vertical') => {
+      let cwd: string | undefined;
+      try {
+        cwd = (await window.superTerminal.pty.cwd(pane.terminalId)) ?? undefined;
+      } catch {
+        // best-effort: fall back to default cwd
+      }
+      splitPane(tabId, pane.terminalId, direction, cwd);
+    };
     return (
       <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
         <PaneToolbar
           terminalId={pane.terminalId}
-          onSplitH={() => splitPane(tabId, pane.terminalId, 'horizontal')}
-          onSplitV={() => splitPane(tabId, pane.terminalId, 'vertical')}
+          onSplitH={() => void splitFrom('horizontal')}
+          onSplitV={() => void splitFrom('vertical')}
           onClose={() => closePaneTerminal(tabId, pane.terminalId)}
         />
         <div style={{ flex: 1, overflow: 'hidden' }}>
