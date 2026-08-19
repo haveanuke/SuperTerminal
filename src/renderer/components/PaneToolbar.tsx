@@ -5,13 +5,15 @@ import { X, Radio, ArrowRightLeft, Timer, SplitHorizontal, SplitVertical } from 
 
 interface PaneToolbarProps {
   terminalId: string;
+  tabId: string;
   onSplitH: () => void;
   onSplitV: () => void;
   onClose: () => void;
 }
 
-export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToolbarProps) {
+export function PaneToolbar({ terminalId, tabId, onSplitH, onSplitV, onClose }: PaneToolbarProps) {
   const terminal = useTerminalStore((s) => s.terminals.get(terminalId));
+  const isTabActive = useTerminalStore((s) => s.activeTabId === tabId);
   const theme = useThemeStore((s) => s.theme);
   const broadcastMode = useTerminalStore((s) => s.broadcastMode);
   const broadcastTargets = useTerminalStore((s) => s.broadcastTargets);
@@ -27,7 +29,9 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
   const [cwd, setCwd] = useState<string | null>(null);
 
   // Live shell cwd (best-effort, via proc_pidinfo on the shell pid).
+  // Hidden tabs stay mounted, so only the active tab's toolbars poll.
   useEffect(() => {
+    if (!isTabActive) return;
     let alive = true;
     const refresh = () => {
       window.superTerminal.pty
@@ -43,7 +47,7 @@ export function PaneToolbar({ terminalId, onSplitH, onSplitV, onClose }: PaneToo
       alive = false;
       window.clearInterval(timer);
     };
-  }, [terminalId]);
+  }, [terminalId, isTabActive]);
 
   const displayCwd = cwd ? cwd.replace(/^\/Users\/[^/]+/, '~') : null;
 

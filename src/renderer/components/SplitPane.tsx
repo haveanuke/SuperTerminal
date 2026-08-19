@@ -145,6 +145,7 @@ export function SplitPane({ pane, tabId }: SplitPaneProps) {
       <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
         <PaneToolbar
           terminalId={pane.terminalId}
+          tabId={tabId}
           onSplitH={() => void splitFrom('horizontal')}
           onSplitV={() => void splitFrom('vertical')}
           onClose={() => closePaneTerminal(tabId, pane.terminalId)}
