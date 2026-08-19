@@ -23,17 +23,17 @@ export function TabBar() {
   return (
     <div
       className="tab-bar"
+      data-tauri-drag-region
       style={{
         display: 'flex',
         alignItems: 'stretch',
         minHeight: 40,
         backgroundColor: theme.uiSurface,
         borderBottom: `1px solid ${theme.uiBorder}`,
-        WebkitAppRegion: 'drag' as unknown as string,
       }}
     >
       {/* Drag region / window controls spacer */}
-      <div style={{ width: 78, flexShrink: 0, display: 'flex', alignItems: 'center' }} />
+      <div data-tauri-drag-region style={{ width: 78, flexShrink: 0, display: 'flex', alignItems: 'center' }} />
 
       {/* Tabs */}
       <div
@@ -41,7 +41,6 @@ export function TabBar() {
           display: 'flex',
           overflow: 'auto',
           flexShrink: 1,
-          WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
         {tabs.map((tab) => {
@@ -122,7 +121,6 @@ export function TabBar() {
           title="New tab"
           style={{
             padding: '6px 10px',
-            WebkitAppRegion: 'no-drag' as unknown as string,
           }}
         >
           <Plus size={14} />
@@ -130,7 +128,7 @@ export function TabBar() {
       </div>
 
       {/* Draggable spacer */}
-      <div style={{ flex: 1, minWidth: 40, display: 'flex', alignItems: 'center' }} />
+      <div data-tauri-drag-region style={{ flex: 1, minWidth: 40, display: 'flex', alignItems: 'center' }} />
 
       {/* Controls */}
       <div
@@ -139,7 +137,6 @@ export function TabBar() {
           alignItems: 'center',
           gap: 2,
           padding: '0 8px',
-          WebkitAppRegion: 'no-drag' as unknown as string,
         }}
       >
         {/* Search */}

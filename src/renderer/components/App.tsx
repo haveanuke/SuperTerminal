@@ -42,7 +42,7 @@ export function App() {
           }}
         >
           <img
-            src={`file://${backgroundImage}`}
+            src={backgroundImage}
             alt=""
             style={{
               width: '100%',

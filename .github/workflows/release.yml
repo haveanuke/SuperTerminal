@@ -1,7 +1,7 @@
 name: Release
 
-# Triggered by pushing a tag like v0.2.0. Produces unsigned DMGs for both
-# Intel and Apple Silicon Macs and attaches them to a GitHub release.
+# Triggered by pushing a tag like v0.3.0. Builds an unsigned arm64 DMG with
+# Tauri and attaches it to a GitHub release.
 on:
   push:
     tags: ['v*']
@@ -19,19 +19,21 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - run: npm ci
 
-      - name: Build DMGs
-        run: npm run package
-        env:
-          # electron-builder will refuse to publish without explicit credentials —
-          # we only want it to build artifacts; the upload step below handles release.
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Build DMG
+        run: npx tauri build
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*.dmg
+          files: src-tauri/target/release/bundle/dmg/*.dmg
           generate_release_notes: true
           draft: false
           prerelease: false
