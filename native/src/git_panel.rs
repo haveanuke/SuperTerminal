@@ -107,6 +107,8 @@ impl GitPanel {
 
     pub fn set_theme(&mut self, theme: &'static Theme, cx: &mut Context<Self>) {
         self.theme = theme;
+        self.commit_field
+            .update(cx, |field, field_cx| field.set_theme(theme, field_cx));
         cx.notify();
     }
 

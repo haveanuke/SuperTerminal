@@ -57,6 +57,9 @@ gpui::actions!(
 /// Split-container bounds captured by measuring canvases: (x, y, w, h).
 type SplitBoundsMap = HashMap<String, (Pixels, Pixels, Pixels, Pixels)>;
 
+/// Boxed click handler for sheet chips/steppers.
+type BoxedChipHandler = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
 /// Sessions live in the directory SHARED with the Tauri app (contract rev 2
 /// §6) — both apps read and write the same session files.
 pub fn sessions_dir() -> PathBuf {
@@ -146,6 +149,12 @@ pub struct Workspace {
     /// Debounce for pet-count persistence: rapid petting must not write
     /// settings to disk on every click.
     pet_save_at: Option<std::time::Instant>,
+    /// The pet card remembers when it was opened from the theme sheet so
+    /// closing it steps BACK there instead of dropping every sheet.
+    pet_card_from_theme: bool,
+    /// Blur-commit for the tab rename arms only after the field's first
+    /// rendered frame — protects against a focus race on creation.
+    rename_blur_armed: bool,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -204,6 +213,8 @@ impl Workspace {
             pet_name_field: None,
             pet_reroll_armed: false,
             pet_save_at: None,
+            pet_card_from_theme: false,
+            rename_blur_armed: false,
             swap_source: None,
         };
         // First launch (or a healed save): persist the hatched identity so
@@ -655,6 +666,7 @@ impl Workspace {
         });
         field.read(cx).focus(window);
         self.rename_field = Some((index, field));
+        self.rename_blur_armed = false;
         cx.notify();
     }
 
@@ -682,6 +694,18 @@ impl Workspace {
         }
         if let Some(panel) = self.git_panel.clone() {
             panel.update(cx, |panel, panel_cx| panel.set_theme(theme, panel_cx));
+        }
+        // Text fields capture the theme at creation; keep them current.
+        let fields = [
+            self.session_field.clone(),
+            self.auto_run_field.clone(),
+            self.search_field.clone(),
+            self.buddy_field.clone(),
+            self.pet_name_field.clone(),
+            self.rename_field.as_ref().map(|(_, field)| field.clone()),
+        ];
+        for field in fields.into_iter().flatten() {
+            field.update(cx, |field, field_cx| field.set_theme(theme, field_cx));
         }
         cx.notify();
     }
@@ -770,6 +794,15 @@ impl Workspace {
     /// highlights — every close path must go through here, not just the
     /// field's own Escape handler.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A pet card opened from the theme sheet steps back to it.
+        if self.overlay == Overlay::PetCard && self.pet_card_from_theme {
+            self.pet_card_from_theme = false;
+            self.pet_reroll_armed = false;
+            self.overlay = Overlay::ThemePicker;
+            window.focus(&self.focus_handle);
+            cx.notify();
+            return;
+        }
         if self.overlay == Overlay::Search {
             if let Some(pane) = self
                 .focused_terminal
@@ -1183,6 +1216,93 @@ impl Workspace {
         }
     }
 
+    /// Bordered chip for sheet controls: visibly a button, with an accent
+    /// state when the option it represents is active. The bar keeps the
+    /// text-style `overlay_button` look; sheets use these.
+    fn chip_button(
+        &self,
+        label: &'static str,
+        active: bool,
+        on_click: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id(SharedString::from(format!("chip-{label}")))
+            .cursor_pointer()
+            .px(px(7.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(if active {
+                theme.ui_accent
+            } else {
+                theme.ui_border
+            }))
+            .bg(rgb(theme.ui_surface))
+            .text_color(rgb(if active {
+                theme.ui_accent
+            } else {
+                theme.ui_text
+            }))
+            .hover(|style| {
+                style
+                    .border_color(rgb(theme.ui_accent))
+                    .bg(rgb(theme.ui_border))
+            })
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _, window, cx| on_click(ws, window, cx)),
+            )
+    }
+
+    /// A `[-] value [+]` control drawn as ONE bordered group, so the
+    /// buttons visibly belong to the value they step.
+    fn stepper(
+        &self,
+        id: &'static str,
+        value: String,
+        on_minus: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+        on_plus: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let step = |suffix: &'static str,
+                    label: &'static str,
+                    handler: BoxedChipHandler,
+                    cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!("{id}-{suffix}")))
+                .cursor_pointer()
+                .px(px(7.0))
+                .text_color(rgb(theme.ui_text))
+                .hover(|style| style.bg(rgb(theme.ui_border)))
+                .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ws, _, window, cx| handler(ws, window, cx)),
+                )
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(theme.ui_border))
+            .bg(rgb(theme.ui_surface))
+            .child(step("minus", "-", Box::new(on_minus), cx))
+            .child(
+                div()
+                    .px(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(value)),
+            )
+            .child(step("plus", "+", Box::new(on_plus), cx))
+    }
+
     fn overlay_button(
         &self,
         label: &'static str,
@@ -1352,13 +1472,19 @@ impl Workspace {
             .text_color(rgb(theme.ui_text_muted))
             .child(div().w(px(72.0)).child("background"))
             .child(div().text_size(px(11.0)).child(label))
-            .child(self.overlay_button(
+            .child(self.chip_button(
                 "choose",
+                false,
                 |ws, _window, cx| ws.pick_background_image(cx),
                 cx,
             ))
             .children(has_image.then(|| {
-                self.overlay_button("clear", |ws, _window, cx| ws.clear_background_image(cx), cx)
+                self.chip_button(
+                    "clear",
+                    false,
+                    |ws, _window, cx| ws.clear_background_image(cx),
+                    cx,
+                )
             }))
             .children(has_image.then(|| {
                 div()
@@ -1366,16 +1492,13 @@ impl Workspace {
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
-                    .child(self.overlay_button(
-                        "dim",
+                    .child(div().text_size(px(10.0)).child("opacity"))
+                    .child(self.stepper(
+                        "bg-opacity",
+                        format!("{:.0}%", opacity * 100.0),
                         |ws, _window, cx| {
                             ws.set_background_opacity(ws.settings.background_opacity - 0.1, cx)
                         },
-                        cx,
-                    ))
-                    .child(SharedString::from(format!("{:.0}%", opacity * 100.0)))
-                    .child(self.overlay_button(
-                        "brighten",
                         |ws, _window, cx| {
                             ws.set_background_opacity(ws.settings.background_opacity + 0.1, cx)
                         },
@@ -1417,52 +1540,106 @@ impl Workspace {
         }
         let enabled = self.settings.buddy_enabled;
         let configured = !self.settings.buddy_command.trim().is_empty();
+        // Quick agent presets (old-app parity): one click configures and
+        // enables the reviewer; the field stays for custom commands.
+        let local_active = self.settings.buddy_command == "ollama";
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
+            .flex_col()
+            .gap(px(5.0))
             .text_color(rgb(theme.ui_text_muted))
-            .child(div().w(px(72.0)).child("buddy"))
-            .child(self.overlay_button(
-                if enabled {
-                    "reviewer: on"
-                } else {
-                    "reviewer: off"
-                },
-                |ws, _window, cx| {
-                    ws.settings.buddy_enabled = !ws.settings.buddy_enabled;
-                    let _ = ws.settings.save();
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(self.overlay_button(
-                if self.settings.buddy_pet_visible {
-                    "pet: shown"
-                } else {
-                    "pet: hidden"
-                },
-                |ws, _window, cx| {
-                    ws.settings.buddy_pet_visible = !ws.settings.buddy_pet_visible;
-                    let _ = ws.settings.save();
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(self.overlay_button(
-                "pet card",
-                |ws, window, cx| ws.open_pet_card(window, cx),
-                cx,
-            ))
-            .child(div().flex_grow().child(self.buddy_field.clone().unwrap()))
-            .children(configured.then(|| {
-                div().text_size(px(10.0)).child(SharedString::from(format!(
-                    "using: {} {}",
-                    self.settings.buddy_command,
-                    self.settings.buddy_args.join(" ")
-                )))
-            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("buddy"))
+                    .child(self.chip_button(
+                        if enabled {
+                            "reviewer: on"
+                        } else {
+                            "reviewer: off"
+                        },
+                        enabled,
+                        |ws, _window, cx| {
+                            ws.settings.buddy_enabled = !ws.settings.buddy_enabled;
+                            let _ = ws.settings.save();
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(div().text_size(px(10.0)).child("agent:"))
+                    .child(self.chip_button(
+                        "claude",
+                        self.settings.buddy_command == "claude",
+                        |ws, _window, cx| {
+                            ws.set_buddy_agent("claude", &["-p", "{prompt}"], cx);
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        "codex",
+                        self.settings.buddy_command == "codex",
+                        |ws, _window, cx| {
+                            ws.set_buddy_agent("codex", &["exec", "{prompt}"], cx);
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        "local",
+                        local_active,
+                        |ws, _window, cx| {
+                            ws.set_buddy_agent("ollama", &["run", "llama3", "{prompt}"], cx);
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        if self.settings.buddy_pet_visible {
+                            "pet: shown"
+                        } else {
+                            "pet: hidden"
+                        },
+                        self.settings.buddy_pet_visible,
+                        |ws, _window, cx| {
+                            ws.settings.buddy_pet_visible = !ws.settings.buddy_pet_visible;
+                            let _ = ws.settings.save();
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        "pet card",
+                        false,
+                        |ws, window, cx| ws.open_pet_card(window, cx),
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)))
+                    .child(div().flex_grow().child(self.buddy_field.clone().unwrap()))
+                    .children(configured.then(|| {
+                        div().text_size(px(10.0)).child(SharedString::from(format!(
+                            "using: {} {}",
+                            self.settings.buddy_command,
+                            self.settings.buddy_args.join(" ")
+                        )))
+                    })),
+            )
+    }
+
+    /// Configure and enable the reviewer with a preset agent command.
+    fn set_buddy_agent(&mut self, command: &str, args: &[&str], cx: &mut Context<Self>) {
+        self.settings.buddy_command = command.to_string();
+        self.settings.buddy_args = args.iter().map(|arg| (*arg).to_string()).collect();
+        self.settings.buddy_enabled = true;
+        let _ = self.settings.save();
+        cx.notify();
     }
 
     fn open_pet_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1497,6 +1674,7 @@ impl Workspace {
             field.read(cx).focus(window);
         }
         self.pet_reroll_armed = false;
+        self.pet_card_from_theme = self.overlay == Overlay::ThemePicker;
         self.overlay = Overlay::PetCard;
         cx.notify();
     }
@@ -1939,16 +2117,13 @@ impl Workspace {
                                 .gap(px(8.0))
                                 .pt(px(4.0))
                                 .text_color(rgb(theme.ui_text_muted))
-                                .child(self.overlay_button(
-                                    "-",
+                                .child(div().w(px(72.0)).child("size"))
+                                .child(self.stepper(
+                                    "font-size",
+                                    format!("{font_size:.0} px"),
                                     |ws, _window, cx| {
                                         ws.set_font_size(ws.settings.font_size - 1.0, cx)
                                     },
-                                    cx,
-                                ))
-                                .child(SharedString::from(format!("{font_size:.0} px")))
-                                .child(self.overlay_button(
-                                    "+",
                                     |ws, _window, cx| {
                                         ws.set_font_size(ws.settings.font_size + 1.0, cx)
                                     },
@@ -1966,13 +2141,15 @@ impl Workspace {
                                 .gap(px(8.0))
                                 .text_color(rgb(theme.ui_text_muted))
                                 .child(div().w(px(72.0)).child("custom"))
-                                .child(self.overlay_button(
+                                .child(self.chip_button(
                                     "import theme",
+                                    false,
                                     |ws, _window, cx| ws.import_theme(cx),
                                     cx,
                                 ))
-                                .child(self.overlay_button(
+                                .child(self.chip_button(
                                     "export current",
+                                    false,
                                     |ws, _window, cx| ws.export_theme(cx),
                                     cx,
                                 ))
@@ -2090,30 +2267,27 @@ impl Workspace {
                                 .items_center()
                                 .gap(px(8.0))
                                 .text_color(rgb(theme.ui_text_muted))
-                                .child(SharedString::from(format!("every {interval}s")))
-                                .child(self.overlay_button(
-                                    "-",
+                                .child(self.stepper(
+                                    "auto-run-interval",
+                                    format!("every {interval}s"),
                                     |ws, _window, cx| {
                                         ws.auto_run_interval =
                                             ws.auto_run_interval.saturating_sub(1).max(1);
                                         cx.notify();
                                     },
-                                    cx,
-                                ))
-                                .child(self.overlay_button(
-                                    "+",
                                     |ws, _window, cx| {
                                         ws.auto_run_interval = (ws.auto_run_interval + 1).min(3600);
                                         cx.notify();
                                     },
                                     cx,
                                 ))
-                                .child(self.overlay_button(
+                                .child(self.chip_button(
                                     if escape {
                                         "esc after: on"
                                     } else {
                                         "esc after: off"
                                     },
+                                    escape,
                                     |ws, _window, cx| {
                                         ws.auto_run_escape = !ws.auto_run_escape;
                                         cx.notify();
@@ -2126,8 +2300,9 @@ impl Workspace {
                                     }),
                                 )
                                 .children(active.then(|| {
-                                    self.overlay_button(
+                                    self.chip_button(
                                         "stop",
+                                        false,
                                         |ws, window, cx| {
                                             if let Some(pane) = ws
                                                 .focused_terminal
@@ -2544,7 +2719,13 @@ impl Render for Workspace {
         // app's blur behavior) — never re-steal focus from whatever the
         // user clicked.
         if let Some((index, field)) = self.rename_field.clone() {
-            if !field.read(cx).is_focused(window) {
+            if !self.rename_blur_armed {
+                // First frame after creation: (re)assert focus, then arm the
+                // blur check — a same-frame focus race must not instantly
+                // commit and dismiss an editor the user never saw.
+                field.read(cx).focus(window);
+                self.rename_blur_armed = true;
+            } else if !field.read(cx).is_focused(window) {
                 let name = field.read(cx).value.trim().to_string();
                 if !name.is_empty() {
                     if let Some(tab) = self.tabs.get_mut(index) {

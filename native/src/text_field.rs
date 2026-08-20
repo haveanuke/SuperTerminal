@@ -71,6 +71,11 @@ impl TextField {
         cx.notify();
     }
 
+    pub fn set_theme(&mut self, theme: &'static Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        cx.notify();
+    }
+
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
     }

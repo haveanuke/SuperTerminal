@@ -628,13 +628,24 @@ pub fn contrast_boost(fg: u32, bg: u32) -> u32 {
     if diff >= MIN_DIFF {
         return fg;
     }
-    let target = if luminance(bg) < 128.0 { 255.0 } else { 0.0 };
     let t = ((MIN_DIFF - diff) / MIN_DIFF) * 0.7;
-    let blend = |channel: u32| -> u32 {
-        let v = channel as f32;
-        (v + (target - v) * t).round().clamp(0.0, 255.0) as u32
+    let toward = |target: f32| -> u32 {
+        let blend = |channel: u32| -> u32 {
+            let v = channel as f32;
+            (v + (target - v) * t).round().clamp(0.0, 255.0) as u32
+        };
+        (blend((fg >> 16) & 0xff) << 16) | (blend((fg >> 8) & 0xff) << 8) | blend(fg & 0xff)
     };
-    (blend((fg >> 16) & 0xff) << 16) | (blend((fg >> 8) & 0xff) << 8) | blend(fg & 0xff)
+    // Try both directions and keep whichever lands further from the
+    // background — pushing purely by the background's side can drag a
+    // foreground on the far side ACROSS it.
+    let lighter = toward(255.0);
+    let darker = toward(0.0);
+    if (luminance(lighter) - luminance(bg)).abs() >= (luminance(darker) - luminance(bg)).abs() {
+        lighter
+    } else {
+        darker
+    }
 }
 
 #[cfg(test)]
@@ -661,6 +672,33 @@ mod tests {
         // Pale gray on white must come out darker.
         let dimmed = contrast_boost(0xdddddd, 0xffffff);
         assert!(luminance(dimmed) < luminance(0xdddddd));
+    }
+
+    #[test]
+    fn contrast_boost_never_reduces_separation() {
+        fn luminance(color: u32) -> f32 {
+            let r = ((color >> 16) & 0xff) as f32;
+            let g = ((color >> 8) & 0xff) as f32;
+            let b = (color & 0xff) as f32;
+            0.299 * r + 0.587 * g + 0.114 * b
+        }
+        // Foregrounds on the far side of the push target must not be
+        // dragged across the background (the wrong-side regression).
+        for (fg, bg) in [
+            (0x3c3c3c_u32, 0x787878_u32), // dark fg, mid-dark bg
+            (0xb4b4b4, 0x787878),         // light fg, mid-dark bg
+            (0x646464, 0x646464),         // identical pair
+            (0x202020, 0x101010),
+            (0xf0f0f0, 0xfafafa),
+        ] {
+            let out = contrast_boost(fg, bg);
+            let before = (luminance(fg) - luminance(bg)).abs();
+            let after = (luminance(out) - luminance(bg)).abs();
+            assert!(
+                after >= before,
+                "separation shrank for fg={fg:06x} bg={bg:06x}: {before} -> {after}"
+            );
+        }
     }
 
     #[test]
