@@ -15,6 +15,35 @@ use gpui::{
 };
 
 use crate::keys::{self, KeyInput};
+use alacritty_terminal::event_loop::{EventLoopSender, Msg};
+
+/// Shared broadcast state: when enabled, keystrokes from any member pane fan
+/// out to every member's PTY.
+#[derive(Default)]
+pub struct BroadcastHub {
+    pub enabled: std::sync::atomic::AtomicBool,
+    pub members: std::sync::Mutex<std::collections::HashMap<String, (bool, EventLoopSender)>>,
+}
+
+impl BroadcastHub {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_member(&self, id: &str) -> bool {
+        self.members
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|(on, _)| *on)
+    }
+
+    pub fn toggle_member(&self, id: &str) {
+        if let Some((on, _)) = self.members.lock().unwrap().get_mut(id) {
+            *on = !*on;
+        }
+    }
+}
 use crate::term_session::{
     CellColor, CursorStyle, RenderableSnapshot, SessionEvent, ShutdownHandle, TermSession,
 };
@@ -38,7 +67,13 @@ pub struct TerminalPane {
     focus_handle: FocusHandle,
     theme: &'static Theme,
     font_family: SharedString,
+    /// The family that is actually installed (settings family may be absent);
+    /// used for BOTH row rendering and cell measurement so they never drift.
+    resolved_family: Option<SharedString>,
     font_size: f32,
+    /// When the workspace shows a background image, panes render their
+    /// background translucent so the image shows through.
+    translucent: bool,
     cell_width: Pixels,
     line_height: Pixels,
     selecting: bool,
@@ -46,6 +81,10 @@ pub struct TerminalPane {
     blink_tick: u32,
     /// Held marked text during IME composition (not yet sent to the PTY).
     marked_text: Option<String>,
+    broadcast: std::sync::Arc<BroadcastHub>,
+    /// Auto-run: (command, interval_secs, send_escape, escape_delay_secs).
+    pub auto_run: Option<(String, u32, bool, u32)>,
+    auto_run_tick: u32,
     /// Pane origin in window coordinates (for mouse cell math), updated from
     /// the measuring canvas via `pending_bounds` on each pump tick.
     origin: (Pixels, Pixels),
@@ -63,6 +102,7 @@ impl TerminalPane {
         theme: &'static Theme,
         font_family: String,
         font_size: f32,
+        broadcast: std::sync::Arc<BroadcastHub>,
         cx: &mut Context<Self>,
     ) -> Self {
         // Metrics are estimates until the first render measures for real.
@@ -95,6 +135,26 @@ impl TerminalPane {
                         pane.origin = (x, y);
                         pane.resize_to(w, h);
                         cx.notify();
+                    }
+                    // Auto-run: fire the command every interval (ticks are
+                    // ~16ms). ESC-after-delay reuses the same tick clock.
+                    if let Some((command, interval, send_escape, escape_delay)) =
+                        pane.auto_run.clone()
+                    {
+                        pane.auto_run_tick += 1;
+                        let interval_ticks = interval.max(1) * 62;
+                        let escape_ticks = escape_delay.max(1) * 62;
+                        if pane.auto_run_tick == interval_ticks {
+                            let mut bytes = command.into_bytes();
+                            bytes.push(b'\r');
+                            pane.write(bytes);
+                        }
+                        if send_escape && pane.auto_run_tick == interval_ticks + escape_ticks {
+                            pane.write(vec![0x1b]);
+                        }
+                        if pane.auto_run_tick >= interval_ticks + escape_ticks {
+                            pane.auto_run_tick = 0;
+                        }
                     }
                     // Cursor blink: ~530ms phase flip while focused.
                     pane.blink_tick += 1;
@@ -134,6 +194,10 @@ impl TerminalPane {
             selection_text: None,
         };
 
+        if let Some(session) = &session {
+            broadcast_register(&broadcast, &id, session.input_sender());
+        }
+
         Self {
             id,
             session,
@@ -141,13 +205,18 @@ impl TerminalPane {
             focus_handle: cx.focus_handle(),
             theme,
             font_family: font_family.into(),
+            resolved_family: None,
             font_size,
+            translucent: false,
             cell_width,
             line_height,
             selecting: false,
             blink_on: true,
             blink_tick: 0,
             marked_text: None,
+            broadcast,
+            auto_run: None,
+            auto_run_tick: 0,
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -158,10 +227,13 @@ impl TerminalPane {
         theme: &'static Theme,
         font_family: &str,
         font_size: f32,
+        translucent: bool,
         cx: &mut Context<Self>,
     ) {
+        self.translucent = translucent;
         self.theme = theme;
         self.font_family = font_family.to_string().into();
+        self.resolved_family = None; // re-resolve on next render
         self.font_size = font_size;
         cx.notify();
     }
@@ -183,6 +255,7 @@ impl TerminalPane {
 
     /// Begin teardown; the returned handle must be joined off the UI thread.
     pub fn shutdown(&mut self) -> Option<ShutdownHandle> {
+        self.broadcast.members.lock().unwrap().remove(&self.id);
         self.session.take().map(TermSession::shutdown)
     }
 
@@ -205,21 +278,57 @@ impl TerminalPane {
     }
 
     fn write(&self, bytes: Vec<u8>) {
+        if self.broadcast.is_enabled() && self.broadcast.is_member(&self.id) {
+            for (on, sender) in self.broadcast.members.lock().unwrap().values() {
+                if *on {
+                    let _ = sender.send(Msg::Input(bytes.clone().into()));
+                }
+            }
+            return;
+        }
         if let Some(session) = &self.session {
             session.write(bytes);
         }
     }
 
+    pub fn set_auto_run(&mut self, config: Option<(String, u32, bool, u32)>) {
+        self.auto_run = config;
+        self.auto_run_tick = 0;
+    }
+
     fn measure_cell(&mut self, window: &mut Window, cx: &mut App) {
-        // Contract rev 2 §9: explicit fallback chain; Menlo ships with macOS.
-        let mut font = gpui::font(self.font_family.clone());
-        font.fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
-            "Menlo".to_string(),
-            "Monaco".to_string(),
-        ]));
-        let font_id = window.text_system().resolve_font(&font);
-        if let Ok(advance) = window.text_system().em_advance(font_id, px(self.font_size)) {
-            self.cell_width = advance;
+        // Pick the first INSTALLED family from the fallback chain, then
+        // measure by shaping through the same pipeline that renders rows —
+        // measuring a different font than the one that draws is exactly how
+        // the cursor drifts ahead of the text.
+        if self.resolved_family.is_none() {
+            let available = window.text_system().all_font_names();
+            let preferred = self.font_family.to_string();
+            let resolved = [preferred.as_str(), "Menlo", "Monaco"]
+                .into_iter()
+                .find(|candidate| available.iter().any(|name| name == candidate))
+                .unwrap_or("Menlo")
+                .to_string();
+            self.resolved_family = Some(resolved.into());
+        }
+        let family = self
+            .resolved_family
+            .clone()
+            .unwrap_or_else(|| "Menlo".into());
+        let text: SharedString = "MMMMMMMMMM".into();
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(family),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text, px(self.font_size), &[run], None);
+        if f32::from(shaped.width) > 0.0 {
+            self.cell_width = shaped.width / 10.0;
         }
         self.line_height = px((self.font_size * 1.4).round());
         let _ = cx;
@@ -348,6 +457,13 @@ impl TerminalPane {
             CellColor::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
         }
     }
+}
+
+fn broadcast_register(hub: &std::sync::Arc<BroadcastHub>, id: &str, sender: EventLoopSender) {
+    hub.members
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), (true, sender));
 }
 
 /// Scale an 0xRRGGBB color's channels by 2/3 (DIM), never via alpha.
@@ -614,10 +730,18 @@ impl Render for TerminalPane {
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .relative()
-            .bg(rgb(theme.background))
+            .bg(if self.translucent {
+                gpui::rgba((theme.background << 8) | 0xB8)
+            } else {
+                gpui::rgba((theme.background << 8) | 0xFF)
+            })
             .p(px(PADDING))
             .overflow_hidden()
-            .font_family(self.font_family.clone())
+            .font_family(
+                self.resolved_family
+                    .clone()
+                    .unwrap_or_else(|| self.font_family.clone()),
+            )
             .text_size(px(self.font_size))
             .line_height(line_h)
             .text_color(rgb(theme.foreground))

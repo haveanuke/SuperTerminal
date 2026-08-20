@@ -20,7 +20,7 @@ use superterminal_core::session::SessionManager;
 use crate::layout::{
     collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
 };
-use crate::pane::{PaneEvent, TerminalPane};
+use crate::pane::{BroadcastHub, PaneEvent, TerminalPane};
 use crate::settings::Settings;
 use crate::term_session::ShutdownHandle;
 use crate::text_field::{TextField, TextFieldEvent};
@@ -31,6 +31,7 @@ gpui::actions!(
     [
         NewTab,
         CloseFocused,
+        CloseTab,
         SplitRight,
         SplitDown,
         ToggleThemePicker,
@@ -65,6 +66,7 @@ enum Overlay {
     None,
     ThemePicker,
     Sessions,
+    AutoRun,
 }
 
 struct DragState {
@@ -85,6 +87,11 @@ pub struct Workspace {
     session_manager: SessionManager,
     session_names: Vec<String>,
     session_field: Option<Entity<TextField>>,
+    rename_field: Option<(usize, Entity<TextField>)>,
+    auto_run_field: Option<Entity<TextField>>,
+    auto_run_interval: u32,
+    auto_run_escape: bool,
+    auto_run_escape_delay: u32,
     focus_handle: FocusHandle,
     drag: Option<DragState>,
     /// Split-container bounds (window coords) written by measuring canvases,
@@ -93,6 +100,9 @@ pub struct Workspace {
     next_id: u64,
     /// Shutdown handles for panes being torn down; joined on app quit.
     pending_shutdowns: Arc<Mutex<Vec<ShutdownHandle>>>,
+    broadcast: Arc<BroadcastHub>,
+    /// Swap mode: the pane waiting to trade places, if any.
+    swap_source: Option<String>,
 }
 
 impl Workspace {
@@ -110,11 +120,18 @@ impl Workspace {
             session_manager: SessionManager::new(sessions_dir()),
             session_names: Vec::new(),
             session_field: None,
+            rename_field: None,
+            auto_run_field: None,
+            auto_run_interval: 5,
+            auto_run_escape: false,
+            auto_run_escape_delay: 2,
             focus_handle: cx.focus_handle(),
             drag: None,
             split_bounds: Arc::new(Mutex::new(HashMap::new())),
             next_id: 1,
             pending_shutdowns: Arc::new(Mutex::new(Vec::new())),
+            broadcast: Arc::new(BroadcastHub::default()),
+            swap_source: None,
         };
         this.add_tab(None, cx);
         this
@@ -149,8 +166,20 @@ impl Workspace {
         let theme = self.theme;
         let family = self.settings.font_family.clone();
         let size = self.settings.font_size;
+        let translucent = self.settings.background_image.is_some();
         let pane_id = id.clone();
-        let pane = cx.new(|pane_cx| TerminalPane::new(pane_id, cwd, theme, family, size, pane_cx));
+        let hub = Arc::clone(&self.broadcast);
+        let pane =
+            cx.new(|pane_cx| TerminalPane::new(pane_id, cwd, theme, family, size, hub, pane_cx));
+        pane.update(cx, |pane, pane_cx| {
+            pane.set_appearance(
+                theme,
+                &self.settings.font_family,
+                size,
+                translucent,
+                pane_cx,
+            )
+        });
         cx.subscribe(&pane, Self::on_pane_event).detach();
         self.panes.insert(id, pane.clone());
         pane
@@ -165,6 +194,13 @@ impl Workspace {
         let pane_id = pane.read(cx).id.clone();
         match event {
             PaneEvent::Focused => {
+                if let Some(source) = self.swap_source.take() {
+                    if source != pane_id {
+                        for tab in &mut self.tabs {
+                            tab.pane = crate::layout::swap_terminals(&tab.pane, &source, &pane_id);
+                        }
+                    }
+                }
                 self.focused_terminal = Some(pane_id);
                 cx.notify();
             }
@@ -268,10 +304,67 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close a whole tab: every terminal in its tree shuts down (the old
+    /// app's removeTab). The last remaining tab is respawned fresh.
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        for id in collect_terminal_ids(&tab.pane) {
+            if let Some(pane) = self.panes.remove(&id) {
+                pane.update(cx, move |pane, _| {
+                    if let Some(handle) = pane.shutdown() {
+                        std::thread::spawn(move || {
+                            handle.join_with_deadline(std::time::Duration::from_secs(3))
+                        });
+                    }
+                });
+            }
+        }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.add_tab(None, cx);
+        } else {
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
+                .into_iter()
+                .next();
+        }
+        cx.notify();
+    }
+
     fn close_focused(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.focused_terminal.clone() {
             self.close_terminal(&id, cx);
         }
+    }
+
+    fn start_tab_rename(&mut self, index: usize, cx: &mut Context<Self>) {
+        let theme = self.theme;
+        let field = cx.new(|field_cx| TextField::new("tab name", theme, field_cx));
+        cx.subscribe(
+            &field,
+            move |ws, _field, event: &TextFieldEvent, cx| match event {
+                TextFieldEvent::Submitted(name) => {
+                    if let Some((idx, _)) = ws.rename_field.take() {
+                        if let Some(tab) = ws.tabs.get_mut(idx) {
+                            let trimmed = name.trim();
+                            if !trimmed.is_empty() {
+                                tab.label = trimmed.to_string();
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                TextFieldEvent::Cancelled => {
+                    ws.rename_field = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.rename_field = Some((index, field));
+        cx.notify();
     }
 
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -284,33 +377,98 @@ impl Workspace {
         }
     }
 
+    /// Push the current settings to every pane and persist them.
+    fn apply_appearance(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.save();
+        let theme = self.theme;
+        let family = self.settings.font_family.clone();
+        let size = self.settings.font_size;
+        let translucent = self.settings.background_image.is_some();
+        for pane in self.panes.values() {
+            pane.update(cx, |pane, pane_cx| {
+                pane.set_appearance(theme, &family, size, translucent, pane_cx)
+            });
+        }
+        cx.notify();
+    }
+
     fn apply_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Some(theme) = themes::by_name(name) {
             self.theme = theme;
             self.settings.theme = name.to_string();
-            let _ = self.settings.save();
-            let family = self.settings.font_family.clone();
-            let size = self.settings.font_size;
-            for pane in self.panes.values() {
-                pane.update(cx, |pane, pane_cx| {
-                    pane.set_appearance(theme, &family, size, pane_cx)
-                });
-            }
-            cx.notify();
+            self.apply_appearance(cx);
         }
     }
 
+    fn set_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
+        self.settings.font_family = family.to_string();
+        self.apply_appearance(cx);
+    }
+
+    fn set_background_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
+        self.settings.background_opacity = opacity.clamp(0.05, 1.0);
+        self.apply_appearance(cx);
+    }
+
+    /// Native file picker without dependencies: osascript's choose-file,
+    /// run off the UI thread.
+    fn pick_background_image(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |ws, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("/usr/bin/osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose file of type {\"public.image\"} with prompt \"Background image\")",
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .filter(|path| !path.is_empty())
+                })
+                .await;
+            if let Some(path) = picked {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.settings.background_image = Some(path);
+                    ws.apply_appearance(cx);
+                });
+            }
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    fn clear_background_image(&mut self, cx: &mut Context<Self>) {
+        self.settings.background_image = None;
+        self.apply_appearance(cx);
+    }
+
     fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        let size = size.clamp(8.0, 32.0);
-        self.settings.font_size = size;
-        let _ = self.settings.save();
-        let theme = self.theme;
-        let family = self.settings.font_family.clone();
-        for pane in self.panes.values() {
-            pane.update(cx, |pane, pane_cx| {
-                pane.set_appearance(theme, &family, size, pane_cx)
-            });
+        self.settings.font_size = size.clamp(8.0, 32.0);
+        self.apply_appearance(cx);
+    }
+
+    fn apply_auto_run(&mut self, command: String, cx: &mut Context<Self>) {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return;
         }
+        let config = Some((
+            command,
+            self.auto_run_interval,
+            self.auto_run_escape,
+            self.auto_run_escape_delay,
+        ));
+        if let Some(pane) = self
+            .focused_terminal
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+        {
+            pane.update(cx, |pane, _| pane.set_auto_run(config));
+        }
+        self.overlay = Overlay::None;
         cx.notify();
     }
 
@@ -409,6 +567,7 @@ impl Workspace {
                     .as_deref()
                     .is_some_and(|f| f == terminal_id);
                 let theme = self.theme;
+                let close_id = terminal_id.clone();
 
                 div()
                     .size_full()
@@ -420,6 +579,68 @@ impl Workspace {
                         theme.ui_border
                     }))
                     .child(pane.clone())
+                    .children(self.broadcast.is_enabled().then(|| {
+                        let member = self.broadcast.is_member(terminal_id);
+                        let toggle_id = terminal_id.clone();
+                        div()
+                            .id(SharedString::from(format!("bc-{terminal_id}")))
+                            .absolute()
+                            .top(px(2.0))
+                            .right(px(22.0))
+                            .px(px(4.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(9.0))
+                            .bg(rgb(if member {
+                                theme.ui_accent
+                            } else {
+                                theme.ui_surface
+                            }))
+                            .text_color(rgb(if member {
+                                theme.ui_background
+                            } else {
+                                theme.ui_text_muted
+                            }))
+                            .child("bc")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, _, cx| {
+                                    ws.broadcast.toggle_member(&toggle_id);
+                                    cx.notify();
+                                }),
+                            )
+                    }))
+                    .child(
+                        // Per-pane close: one click on any pane, focused or
+                        // not — no focus-then-close dance.
+                        div()
+                            .id(SharedString::from(format!("close-{terminal_id}")))
+                            .absolute()
+                            .top(px(2.0))
+                            .right(px(2.0))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .opacity(0.55)
+                            .hover(|style| style.opacity(1.0).bg(rgb(theme.ui_border)))
+                            .child("x")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    ws.close_terminal(&close_id, cx);
+                                    ws.focus_active_pane(window, cx);
+                                }),
+                            ),
+                    )
                     .into_any_element()
             }
             PaneNode::Split {
@@ -602,8 +823,153 @@ impl Workspace {
                         ws.focus_active_pane(window, cx);
                     },
                     cx,
-                )),
+                ))
+                .child(self.overlay_button(
+                    "swap",
+                    |ws, _window, cx| {
+                        ws.swap_source = if ws.swap_source.is_some() {
+                            None
+                        } else {
+                            ws.focused_terminal.clone()
+                        };
+                        cx.notify();
+                    },
+                    cx,
+                ))
+                .child(self.overlay_button(
+                    "timer",
+                    |ws, window, cx| {
+                        ws.overlay = if ws.overlay == Overlay::AutoRun {
+                            Overlay::None
+                        } else {
+                            Overlay::AutoRun
+                        };
+                        let _ = window;
+                        cx.notify();
+                    },
+                    cx,
+                ))
+                .children(self.swap_source.is_some().then(|| {
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.yellow))
+                        .child("click a pane to swap")
+                })),
         )
+    }
+
+    fn render_font_family_row(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let current = self.settings.font_family.clone();
+        const MONO_HINTS: [&str; 10] = [
+            "Mono", "Menlo", "Monaco", "Courier", "Consolas", "Code", "Term", "Hack", "Fira",
+            "Input",
+        ];
+        let mut families: Vec<String> = window
+            .text_system()
+            .all_font_names()
+            .into_iter()
+            .filter(|name| MONO_HINTS.iter().any(|hint| name.contains(hint)))
+            .collect();
+        families.sort();
+        families.dedup();
+        let chips: Vec<_> = families
+            .into_iter()
+            .map(|family| {
+                let selected = family == current;
+                let apply = family.clone();
+                div()
+                    .id(SharedString::from(format!("font-{family}")))
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(if selected {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_border
+                    }))
+                    .text_size(px(11.0))
+                    .font_family(SharedString::from(family.clone()))
+                    .child(SharedString::from(family))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, _, cx| ws.set_font_family(&apply, cx)),
+                    )
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(8.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .child(div().w(px(72.0)).pt(px(3.0)).child("font"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .children(chips),
+            )
+    }
+
+    fn render_background_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let opacity = self.settings.background_opacity;
+        let has_image = self.settings.background_image.is_some();
+        let label: SharedString = match &self.settings.background_image {
+            Some(path) => std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone())
+                .into(),
+            None => "none".into(),
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .child(div().w(px(72.0)).child("background"))
+            .child(div().text_size(px(11.0)).child(label))
+            .child(self.overlay_button(
+                "choose",
+                |ws, _window, cx| ws.pick_background_image(cx),
+                cx,
+            ))
+            .children(has_image.then(|| {
+                self.overlay_button("clear", |ws, _window, cx| ws.clear_background_image(cx), cx)
+            }))
+            .children(has_image.then(|| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(self.overlay_button(
+                        "dim",
+                        |ws, _window, cx| {
+                            ws.set_background_opacity(ws.settings.background_opacity - 0.1, cx)
+                        },
+                        cx,
+                    ))
+                    .child(SharedString::from(format!("{:.0}%", opacity * 100.0)))
+                    .child(self.overlay_button(
+                        "brighten",
+                        |ws, _window, cx| {
+                            ws.set_background_opacity(ws.settings.background_opacity + 0.1, cx)
+                        },
+                        cx,
+                    ))
+            }))
     }
 
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -628,12 +994,29 @@ impl Workspace {
                     } else {
                         theme.ui_text_muted
                     }))
-                    .child(SharedString::from(format!("{}:{}", index + 1, tab.label)))
+                    .child(
+                        if let Some((rename_index, field)) = self
+                            .rename_field
+                            .as_ref()
+                            .filter(|(rename_index, _)| *rename_index == index)
+                        {
+                            let _ = rename_index;
+                            div().w(px(120.0)).child(field.clone()).into_any_element()
+                        } else {
+                            div()
+                                .child(SharedString::from(format!("{}:{}", index + 1, tab.label)))
+                                .into_any_element()
+                        },
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |ws, _, window, cx| {
-                            ws.select_tab(index, cx);
-                            ws.focus_active_pane(window, cx);
+                        cx.listener(move |ws, event: &gpui::MouseDownEvent, window, cx| {
+                            if event.click_count >= 2 {
+                                ws.start_tab_rename(index, cx);
+                            } else {
+                                ws.select_tab(index, cx);
+                                ws.focus_active_pane(window, cx);
+                            }
                         }),
                     ),
             );
@@ -662,6 +1045,38 @@ impl Workspace {
             ))
             .child(div().flex_grow())
             .children(self.render_focused_controls(cx))
+            .child({
+                let enabled = self.broadcast.is_enabled();
+                let theme = self.theme;
+                div()
+                    .id("bc-toggle")
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(if enabled {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_surface
+                    }))
+                    .text_color(rgb(if enabled {
+                        theme.ui_background
+                    } else {
+                        theme.ui_text_muted
+                    }))
+                    .child("broadcast")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, window, cx| {
+                            let now = !ws.broadcast.is_enabled();
+                            ws.broadcast
+                                .enabled
+                                .store(now, std::sync::atomic::Ordering::Relaxed);
+                            ws.focus_active_pane(window, cx);
+                            cx.notify();
+                        }),
+                    )
+            })
             .child(self.overlay_button(
                 "sessions",
                 |ws, _window, cx| {
@@ -699,56 +1114,76 @@ impl Workspace {
             Overlay::None => None,
             Overlay::ThemePicker => {
                 let current = self.settings.theme.clone();
-                let items: Vec<_> = themes::presets()
+                let chips: Vec<_> = themes::presets()
                     .iter()
                     .map(|preset| {
                         let name = preset.name;
                         let selected = name == current;
+                        // The palette IS the content: bg swatch + four accents.
+                        let strip = [
+                            preset.background,
+                            preset.red,
+                            preset.green,
+                            preset.blue,
+                            preset.magenta,
+                        ];
                         div()
                             .id(SharedString::from(format!("theme-{name}")))
                             .cursor_pointer()
                             .px(px(10.0))
-                            .py(px(4.0))
-                            .rounded(px(4.0))
-                            .bg(rgb(if selected {
-                                theme.ui_border
+                            .py(px(6.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(rgb(if selected {
+                                theme.ui_accent
                             } else {
-                                theme.ui_surface
+                                theme.ui_border
                             }))
-                            .hover(|style| style.bg(rgb(theme.ui_border)))
+                            .bg(rgb(preset.background))
+                            .hover(|style| style.border_color(rgb(theme.ui_accent)))
                             .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
+                            .flex_col()
+                            .gap(px(5.0))
+                            .child(div().flex().flex_row().gap(px(3.0)).children(
+                                strip.into_iter().map(|color| {
+                                    div().w(px(14.0)).h(px(6.0)).rounded(px(2.0)).bg(rgb(color))
+                                }),
+                            ))
                             .child(
                                 div()
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .rounded(px(3.0))
-                                    .bg(rgb(preset.background))
-                                    .border_1()
-                                    .border_color(rgb(preset.ui_accent)),
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(preset.foreground))
+                                    .child(SharedString::from(name)),
                             )
-                            .child(SharedString::from(name))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |ws, _, _, cx| {
+                                cx.listener(move |ws, _, window, cx| {
                                     ws.apply_theme(name, cx);
                                     ws.overlay = Overlay::None;
+                                    ws.focus_active_pane(window, cx);
                                 }),
                             )
                     })
                     .collect();
                 let font_size = self.settings.font_size;
                 Some(
-                    self.modal_frame("Theme", cx)
+                    self.sheet("theme", "click to apply - esc closes", cx)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap(px(6.0))
+                                .children(chips),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(SharedString::from(format!("font size: {font_size:.0}")))
+                                .pt(px(4.0))
+                                .text_color(rgb(theme.ui_text_muted))
                                 .child(self.overlay_button(
                                     "-",
                                     |ws, _window, cx| {
@@ -756,6 +1191,7 @@ impl Workspace {
                                     },
                                     cx,
                                 ))
+                                .child(SharedString::from(format!("{font_size:.0} px")))
                                 .child(self.overlay_button(
                                     "+",
                                     |ws, _window, cx| {
@@ -764,7 +1200,114 @@ impl Workspace {
                                     cx,
                                 )),
                         )
-                        .child(div().flex().flex_col().gap(px(2.0)).children(items))
+                        .child(self.render_font_family_row(window, cx))
+                        .child(self.render_background_row(cx))
+                        .into_any_element(),
+                )
+            }
+            Overlay::AutoRun => {
+                if self.auto_run_field.is_none() {
+                    let theme_ref = self.theme;
+                    let field = cx.new(|field_cx| {
+                        TextField::new("command, e.g. kubectl get pods", theme_ref, field_cx)
+                    });
+                    cx.subscribe(
+                        &field,
+                        |ws, _field, event: &TextFieldEvent, cx| match event {
+                            TextFieldEvent::Submitted(command) => {
+                                ws.apply_auto_run(command.clone(), cx);
+                            }
+                            TextFieldEvent::Cancelled => {
+                                ws.overlay = Overlay::None;
+                                cx.notify();
+                            }
+                        },
+                    )
+                    .detach();
+                    self.auto_run_field = Some(field);
+                }
+                let field = self.auto_run_field.clone().unwrap();
+                field.read(cx).focus(window);
+                let interval = self.auto_run_interval;
+                let escape = self.auto_run_escape;
+                let escape_delay = self.auto_run_escape_delay;
+                let active = self
+                    .focused_terminal
+                    .as_ref()
+                    .and_then(|id| self.panes.get(id))
+                    .is_some_and(|pane| pane.read(cx).auto_run.is_some());
+                Some(
+                    self.sheet("auto-run", "enter starts - esc closes", cx)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().text_color(rgb(theme.ui_accent)).child("run >"))
+                                .child(div().flex_grow().child(field)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_color(rgb(theme.ui_text_muted))
+                                .child(SharedString::from(format!("every {interval}s")))
+                                .child(self.overlay_button(
+                                    "-",
+                                    |ws, _window, cx| {
+                                        ws.auto_run_interval =
+                                            ws.auto_run_interval.saturating_sub(1).max(1);
+                                        cx.notify();
+                                    },
+                                    cx,
+                                ))
+                                .child(self.overlay_button(
+                                    "+",
+                                    |ws, _window, cx| {
+                                        ws.auto_run_interval = (ws.auto_run_interval + 1).min(3600);
+                                        cx.notify();
+                                    },
+                                    cx,
+                                ))
+                                .child(self.overlay_button(
+                                    if escape {
+                                        "esc after: on"
+                                    } else {
+                                        "esc after: off"
+                                    },
+                                    |ws, _window, cx| {
+                                        ws.auto_run_escape = !ws.auto_run_escape;
+                                        cx.notify();
+                                    },
+                                    cx,
+                                ))
+                                .children(
+                                    escape.then(|| {
+                                        SharedString::from(format!("{escape_delay}s delay"))
+                                    }),
+                                )
+                                .children(active.then(|| {
+                                    self.overlay_button(
+                                        "stop",
+                                        |ws, window, cx| {
+                                            if let Some(pane) = ws
+                                                .focused_terminal
+                                                .as_ref()
+                                                .and_then(|id| ws.panes.get(id))
+                                            {
+                                                pane.update(cx, |pane, _| pane.set_auto_run(None));
+                                            }
+                                            ws.overlay = Overlay::None;
+                                            ws.focus_active_pane(window, cx);
+                                            cx.notify();
+                                        },
+                                        cx,
+                                    )
+                                })),
+                        )
                         .into_any_element(),
                 )
             }
@@ -793,7 +1336,7 @@ impl Workspace {
                 let field = self.session_field.clone().unwrap();
                 field.read(cx).focus(window);
 
-                let items: Vec<_> = self
+                let rows: Vec<_> = self
                     .session_names
                     .clone()
                     .into_iter()
@@ -802,24 +1345,26 @@ impl Workspace {
                         let delete_name = name.clone();
                         div()
                             .id(SharedString::from(format!("session-{name}")))
-                            .px(px(10.0))
+                            .px(px(8.0))
                             .py(px(4.0))
                             .rounded(px(4.0))
-                            .hover(|style| style.bg(rgb(theme.ui_border)))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(8.0))
+                            .hover(|style| style.bg(rgb(theme.ui_surface)))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("session-load-{name}")))
                                     .cursor_pointer()
                                     .flex_grow()
+                                    .text_color(rgb(theme.ui_text))
                                     .child(SharedString::from(name.clone()))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |ws, _, _, cx| {
+                                        cx.listener(move |ws, _, window, cx| {
                                             ws.load_session(&load_name, cx);
+                                            ws.focus_active_pane(window, cx);
                                         }),
                                     ),
                             )
@@ -827,8 +1372,12 @@ impl Workspace {
                                 div()
                                     .id(SharedString::from(format!("session-del-{name}")))
                                     .cursor_pointer()
+                                    .px(px(4.0))
+                                    .rounded(px(3.0))
+                                    .opacity(0.5)
+                                    .hover(|style| style.opacity(1.0).bg(rgb(theme.ui_surface)))
                                     .text_color(rgb(theme.red))
-                                    .child("delete")
+                                    .child("x")
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |ws, _, _, cx| {
@@ -840,65 +1389,75 @@ impl Workspace {
                             )
                     })
                     .collect();
+                let empty = rows.is_empty();
                 Some(
-                    self.modal_frame("Sessions", cx)
-                        .child(field)
+                    self.sheet("sessions", "enter saves - click loads - esc closes", cx)
                         .child(
+                            // Prompt-style save line.
                             div()
-                                .text_size(px(10.0))
-                                .text_color(rgb(theme.ui_text_muted))
-                                .child("enter saves the current layout - click a name to load"),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().text_color(rgb(theme.ui_accent)).child("save as >"))
+                                .child(div().flex_grow().child(field)),
                         )
-                        .child(div().flex().flex_col().gap(px(2.0)).children(items))
+                        .child(div().flex().flex_col().gap(px(1.0)).children(rows))
+                        .children(empty.then(|| {
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(theme.ui_text_muted))
+                                .child("no saved sessions yet - type a name and press enter")
+                        }))
                         .into_any_element(),
                 )
             }
         }
     }
 
-    fn modal_frame(
+    /// Bottom sheet anchored above the bar: panels read as extensions of the
+    /// tmux bar, not floating dialogs.
+    fn sheet(
         &self,
         title: &'static str,
-        cx: &mut Context<Self>,
+        hint: &'static str,
+        _cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         div()
+            .id(SharedString::from(format!("sheet-{title}")))
             .absolute()
-            .inset_0()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .max_h(px(360.0))
+            .bg(rgb(theme.ui_background))
+            .border_t_2()
+            .border_color(rgb(theme.ui_accent))
+            .px(px(14.0))
+            .py(px(10.0))
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::rgba(0x00000088))
-            .id(SharedString::from(format!("modal-{title}")))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|ws, _, _, cx| {
-                    ws.overlay = Overlay::None;
-                    cx.notify();
-                }),
-            )
+            .flex_col()
+            .gap(px(8.0))
+            .text_size(px(12.0))
+            .text_color(rgb(theme.ui_text))
+            .on_mouse_down(MouseButton::Left, |_, _, _| {}) // swallow
             .child(
                 div()
-                    .id(SharedString::from(format!("modal-body-{title}")))
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {}) // swallow
-                    .w(px(380.0))
-                    .max_h(px(460.0))
-                    .overflow_hidden()
-                    .rounded(px(8.0))
-                    .bg(rgb(theme.ui_surface))
-                    .border_1()
-                    .border_color(rgb(theme.ui_border))
-                    .p(px(12.0))
                     .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .text_color(rgb(theme.ui_text))
-                    .text_size(px(12.0))
+                    .flex_row()
+                    .items_center()
                     .child(
                         div()
-                            .text_size(px(13.0))
                             .text_color(rgb(theme.ui_accent))
                             .child(SharedString::from(title)),
+                    )
+                    .child(div().flex_grow())
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(hint)),
                     ),
             )
     }
@@ -940,13 +1499,29 @@ impl Render for Workspace {
             None => div().size_full().into_any_element(),
         };
 
+        let background_layer = self.settings.background_image.as_ref().map(|path| {
+            gpui::img(std::path::PathBuf::from(path))
+                .absolute()
+                .inset_0()
+                .size_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .opacity(self.settings.background_opacity)
+        });
+
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(theme.ui_background))
+            .children(background_layer)
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
                 ws.add_tab(None, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &CloseTab, window, cx| {
+                let index = ws.active_tab;
+                ws.close_tab(index, cx);
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &CloseFocused, window, cx| {
@@ -1050,7 +1625,7 @@ impl Render for Workspace {
                 // Titlebar drag strip under the traffic lights.
                 div()
                     .flex_none()
-                    .h(px(28.0))
+                    .h(px(34.0))
                     .w_full()
                     .bg(rgb(theme.ui_background))
                     .window_control_area(gpui::WindowControlArea::Drag),

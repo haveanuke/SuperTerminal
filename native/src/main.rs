@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use workspace::{
-    CloseFocused, NewTab, SaveSessionAs, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    CloseFocused, CloseTab, NewTab, SaveSessionAs, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
     SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitRight,
     ToggleSessions, ToggleThemePicker, Workspace,
 };
@@ -31,6 +31,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-w", CloseFocused, None),
+            KeyBinding::new("cmd-shift-w", CloseTab, None),
             KeyBinding::new("cmd-d", SplitRight, None),
             KeyBinding::new("cmd-shift-d", SplitDown, None),
             KeyBinding::new("cmd-,", ToggleThemePicker, None),
@@ -55,7 +56,7 @@ fn main() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("SuperTerminal".into()),
                         appears_transparent: true,
-                        traffic_light_position: Some(gpui::point(px(12.0), px(12.0))),
+                        traffic_light_position: Some(gpui::point(px(12.0), px(11.0))),
                     }),
                     window_min_size: Some(size(px(400.0), px(300.0))),
                     ..Default::default()

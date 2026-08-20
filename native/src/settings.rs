@@ -14,6 +14,8 @@ pub struct Settings {
     pub theme: String,
     pub font_size: f32,
     pub font_family: String,
+    pub background_image: Option<String>,
+    pub background_opacity: f32,
 }
 
 impl Default for Settings {
@@ -24,6 +26,8 @@ impl Default for Settings {
             // when JetBrains Mono is not installed (pane font fallbacks).
             font_size: 14.0,
             font_family: "JetBrains Mono".to_string(),
+            background_image: None,
+            background_opacity: 0.3,
         }
     }
 }
@@ -104,6 +108,8 @@ mod tests {
             theme: "Nord".into(),
             font_size: 16.0,
             font_family: "Menlo".into(),
+            background_image: Some("/tmp/bg.png".into()),
+            background_opacity: 0.5,
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);

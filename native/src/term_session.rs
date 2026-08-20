@@ -362,6 +362,11 @@ impl TermSession {
         self.notifier.notify(bytes);
     }
 
+    /// A cloned input handle for broadcast fan-out.
+    pub fn input_sender(&self) -> EventLoopSender {
+        self.sender.clone()
+    }
+
     /// True when new output arrived since the last sync (cleared by sync).
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
