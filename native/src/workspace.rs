@@ -61,6 +61,17 @@ type SplitBoundsMap = HashMap<String, (Pixels, Pixels, Pixels, Pixels)>;
 /// Boxed click handler for sheet chips/steppers.
 type BoxedChipHandler = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
+/// Which settings section shows in the settings sheet.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsSection {
+    Themes,
+    Font,
+    Background,
+    Buddy,
+    Alerts,
+    Custom,
+}
+
 /// Which view the left sidebar shows; the rail tabs between them.
 #[derive(Clone, Copy, PartialEq)]
 enum SidebarView {
@@ -195,6 +206,9 @@ pub struct Workspace {
     /// Installed `say` voices, loaded lazily for the alerts row.
     tts_voices: Option<Vec<String>>,
     tts_voices_loading: bool,
+    /// Voice dropdown open in the alerts section.
+    tts_voice_list_open: bool,
+    settings_section: SettingsSection,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -284,6 +298,8 @@ impl Workspace {
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
+            tts_voice_list_open: false,
+            settings_section: SettingsSection::Themes,
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -470,34 +486,6 @@ impl Workspace {
             Ok::<(), ()>(())
         })
         .detach();
-    }
-
-    /// Step the configured voice forward/backward through the installed
-    /// list ("system" default sits before the first entry).
-    fn step_tts_voice(&mut self, delta: i64) {
-        let Some(voices) = &self.tts_voices else {
-            return;
-        };
-        if voices.is_empty() {
-            // Nothing to step through; at least allow returning to default.
-            self.settings.buddy_tts_voice = None;
-            let _ = self.settings.save();
-            return;
-        }
-        let current = self
-            .settings
-            .buddy_tts_voice
-            .as_ref()
-            .and_then(|v| voices.iter().position(|name| name == v))
-            .map(|i| i as i64)
-            .unwrap_or(-1); // -1 = system default
-        let next = (current + delta).clamp(-1, voices.len() as i64 - 1);
-        self.settings.buddy_tts_voice = if next < 0 {
-            None
-        } else {
-            Some(voices[next as usize].clone())
-        };
-        let _ = self.settings.save();
     }
 
     /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
@@ -2622,13 +2610,43 @@ impl Workspace {
                 .items_center()
                 .gap(px(8.0))
                 .child(div().w(px(72.0)))
-                .child(self.stepper(
-                    "tts-voice",
-                    voice_label,
-                    |ws, _window, _cx| ws.step_tts_voice(-1),
-                    |ws, _window, _cx| ws.step_tts_voice(1),
-                    cx,
-                ))
+                .child(
+                    // Dropdown toggle, fixed width so the row never shifts.
+                    div()
+                        .id("tts-voice-toggle")
+                        .cursor_pointer()
+                        .w(px(170.0))
+                        .px(px(7.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(if self.tts_voice_list_open {
+                            theme.ui_accent
+                        } else {
+                            theme.ui_border
+                        }))
+                        .bg(rgb(theme.ui_surface))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme.ui_text))
+                        .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                        .child(SharedString::from(format!(
+                            "{} voice: {voice_label}",
+                            if self.tts_voice_list_open {
+                                "\u{25be}"
+                            } else {
+                                "\u{25b8}"
+                            }
+                        )))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _, _, cx| {
+                                ws.tts_voice_list_open = !ws.tts_voice_list_open;
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .child(self.stepper(
                     "tts-rate",
                     format!("{rate} wpm"),
@@ -2726,6 +2744,72 @@ impl Workspace {
                     ),
             )
             .children(voice_line)
+            .children(self.render_voice_list(cx))
+    }
+
+    /// Scrollable dropdown list of installed voices (below the toggle).
+    fn render_voice_list(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !(self.settings.buddy_tts && self.tts_voice_list_open) {
+            return None;
+        }
+        let theme = self.theme;
+        let selected = self.settings.buddy_tts_voice.clone();
+        let mut entries: Vec<(Option<String>, String)> = vec![(None, "system voice".to_string())];
+        if let Some(voices) = &self.tts_voices {
+            for voice in voices {
+                entries.push((Some(voice.clone()), voice.clone()));
+            }
+        }
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .child(div().w(px(72.0)).flex_none())
+                .child(
+                    div()
+                        .id("tts-voice-list")
+                        .w(px(240.0))
+                        .max_h(px(150.0))
+                        .overflow_y_scroll()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(theme.ui_border))
+                        .bg(rgb(theme.ui_surface))
+                        .flex()
+                        .flex_col()
+                        .children(entries.into_iter().enumerate().map(
+                            |(index, (value, label))| {
+                                let active = selected == value;
+                                div()
+                                    .id(index)
+                                    .cursor_pointer()
+                                    .px(px(8.0))
+                                    .h(px(20.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .text_color(rgb(if active {
+                                        theme.ui_accent
+                                    } else {
+                                        theme.ui_text
+                                    }))
+                                    .when(active, |d| d.bg(rgb(theme.ui_background)))
+                                    .hover(|style| style.bg(rgb(theme.ui_border)))
+                                    .child(SharedString::from(label))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |ws, _, _, cx| {
+                                            ws.settings.buddy_tts_voice = value.clone();
+                                            let _ = ws.settings.save();
+                                            ws.tts_voice_list_open = false;
+                                            ws.speak_note("Hello! This is your buddy's voice.");
+                                            cx.notify();
+                                        }),
+                                    )
+                            },
+                        )),
+                ),
+        )
     }
 
     /// Configure and enable the reviewer with a preset agent command.
@@ -3109,64 +3193,149 @@ impl Workspace {
                     })
                     .collect();
                 let font_size = self.settings.font_size;
+
+                // Section content — exactly ONE section shows at a time; the
+                // nav column switches. This keeps every section fully in
+                // view no matter how settings grow.
+                let content: Vec<gpui::AnyElement> = match self.settings_section {
+                    SettingsSection::Themes => vec![div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .children(chips)
+                        .into_any_element()],
+                    SettingsSection::Font => vec![
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(div().w(px(72.0)).child("size"))
+                            .child(self.stepper(
+                                "font-size",
+                                format!("{font_size:.0} px"),
+                                |ws, _window, cx| ws.set_font_size(ws.settings.font_size - 1.0, cx),
+                                |ws, _window, cx| ws.set_font_size(ws.settings.font_size + 1.0, cx),
+                                cx,
+                            ))
+                            .into_any_element(),
+                        self.render_font_family_row(window, cx).into_any_element(),
+                    ],
+                    SettingsSection::Background => {
+                        vec![self.render_background_row(cx).into_any_element()]
+                    }
+                    SettingsSection::Buddy => vec![self.render_buddy_row(cx).into_any_element()],
+                    SettingsSection::Alerts => vec![self.render_alerts_row(cx).into_any_element()],
+                    SettingsSection::Custom => {
+                        vec![div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(self.chip_button(
+                                "import theme",
+                                false,
+                                |ws, _window, cx| ws.import_theme(cx),
+                                cx,
+                            ))
+                            .child(self.chip_button(
+                                "export current",
+                                false,
+                                |ws, _window, cx| ws.export_theme(cx),
+                                cx,
+                            ))
+                            .children(self.theme_action_note.clone().map(|note| {
+                                div().text_size(px(10.0)).child(SharedString::from(note))
+                            }))
+                            .into_any_element()]
+                    }
+                };
+
+                let nav_item = |ws: &Self,
+                                label: &'static str,
+                                section: SettingsSection,
+                                cx: &mut Context<Self>| {
+                    let active = ws.settings_section == section;
+                    div()
+                        .id(SharedString::from(label))
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(4.0))
+                        .text_color(rgb(if active {
+                            theme.ui_accent
+                        } else {
+                            theme.ui_text_muted
+                        }))
+                        .when(active, |d| d.bg(rgb(theme.ui_surface)))
+                        .hover(|style| style.bg(rgb(theme.ui_border)))
+                        .child(SharedString::from(label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _, _, cx| {
+                                ws.settings_section = section;
+                                ws.tts_voice_list_open = false;
+                                cx.notify();
+                            }),
+                        )
+                };
+
                 Some(
-                    self.sheet("settings", "click to apply - esc closes", cx)
+                    self.sheet("settings", "esc closes", cx)
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
-                                .flex_wrap()
-                                .gap(px(6.0))
-                                .children(chips),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .pt(px(4.0))
-                                .text_color(rgb(theme.ui_text_muted))
-                                .child(div().w(px(72.0)).child("size"))
-                                .child(self.stepper(
-                                    "font-size",
-                                    format!("{font_size:.0} px"),
-                                    |ws, _window, cx| {
-                                        ws.set_font_size(ws.settings.font_size - 1.0, cx)
-                                    },
-                                    |ws, _window, cx| {
-                                        ws.set_font_size(ws.settings.font_size + 1.0, cx)
-                                    },
-                                    cx,
-                                )),
-                        )
-                        .child(self.render_font_family_row(window, cx))
-                        .child(self.render_background_row(cx))
-                        .child(self.render_buddy_row(cx))
-                        .child(self.render_alerts_row(cx))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .text_color(rgb(theme.ui_text_muted))
-                                .child(div().w(px(72.0)).child("custom"))
-                                .child(self.chip_button(
-                                    "import theme",
-                                    false,
-                                    |ws, _window, cx| ws.import_theme(cx),
-                                    cx,
-                                ))
-                                .child(self.chip_button(
-                                    "export current",
-                                    false,
-                                    |ws, _window, cx| ws.export_theme(cx),
-                                    cx,
-                                ))
-                                .children(self.theme_action_note.clone().map(|note| {
-                                    div().text_size(px(10.0)).child(SharedString::from(note))
-                                })),
+                                .gap(px(14.0))
+                                .items_start()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(96.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(nav_item(
+                                            self,
+                                            "themes",
+                                            SettingsSection::Themes,
+                                            cx,
+                                        ))
+                                        .child(nav_item(self, "font", SettingsSection::Font, cx))
+                                        .child(nav_item(
+                                            self,
+                                            "background",
+                                            SettingsSection::Background,
+                                            cx,
+                                        ))
+                                        .child(nav_item(self, "buddy", SettingsSection::Buddy, cx))
+                                        .child(nav_item(
+                                            self,
+                                            "alerts",
+                                            SettingsSection::Alerts,
+                                            cx,
+                                        ))
+                                        .child(nav_item(
+                                            self,
+                                            "custom",
+                                            SettingsSection::Custom,
+                                            cx,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-content")
+                                        .flex_grow()
+                                        .max_h(px(280.0))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .children(content),
+                                ),
                         )
                         .into_any_element(),
                 )
