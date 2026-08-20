@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    px, size, App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, App, Application, Bounds, KeyBinding, Menu, MenuItem, SystemMenuType,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
 
 use workspace::{
@@ -26,6 +27,63 @@ use workspace::{
     SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitRight,
     ToggleGitPanel, ToggleSearch, ToggleSessions, ToggleSettingsSheet, Workspace,
 };
+
+// App-level actions reachable only from the menu bar / global chords; the
+// per-workspace actions live in workspace.rs.
+gpui::actions!(superterminal, [Quit, Hide, HideOthers, ShowAll]);
+
+/// Menu bar. gpui builds the macOS main menu solely from `set_menus`;
+/// without this the app menu next to  is an empty dropdown. The first
+/// menu becomes the application menu (macOS titles it from the bundle
+/// name, ignoring `name`), and the menu named "Window" is handed to
+/// AppKit as the windows menu so the open-windows list fills in itself.
+/// Key equivalents are looked up from the keymap, so `bind_keys` must
+/// run before `set_menus`.
+fn menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "SuperTerminal".into(),
+            items: vec![
+                MenuItem::action("Settings…", ToggleSettingsSheet),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide SuperTerminal", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit SuperTerminal", Quit),
+            ],
+        },
+        Menu {
+            name: "Shell".into(),
+            items: vec![
+                MenuItem::action("New Tab", NewTab),
+                MenuItem::action("New Window", NewWindow),
+                MenuItem::separator(),
+                MenuItem::action("Split Right", SplitRight),
+                MenuItem::action("Split Down", SplitDown),
+                MenuItem::separator(),
+                MenuItem::action("Save Session As…", SaveSessionAs),
+                MenuItem::action("Sessions", ToggleSessions),
+                MenuItem::separator(),
+                MenuItem::action("Close Pane", CloseFocused),
+                MenuItem::action("Close Tab", CloseTab),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Search", ToggleSearch),
+                MenuItem::action("Git Panel", ToggleGitPanel),
+            ],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![],
+        },
+    ]
+}
 
 fn main() {
     // When the app is launched FROM a terminal session (dev installs run
@@ -69,7 +127,16 @@ fn main() {
             KeyBinding::new("cmd-7", SelectTab7, None),
             KeyBinding::new("cmd-8", SelectTab8, None),
             KeyBinding::new("cmd-9", SelectTab9, None),
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-h", Hide, None),
+            KeyBinding::new("cmd-alt-h", HideOthers, None),
         ]);
+
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+        cx.set_menus(menus());
 
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         let window = cx

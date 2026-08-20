@@ -541,7 +541,7 @@ impl TerminalPane {
                     | "pageup"
                     | "pagedown"
             )
-            || ks.key.starts_with('f') && ks.key.len() <= 3
+            || keys::is_function_key(ks.key.as_str())
         {
             if m.platform && ks.key == "c" {
                 if let Some(text) = self.snapshot.selection_text.clone() {

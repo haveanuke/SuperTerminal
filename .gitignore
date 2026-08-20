@@ -11,4 +11,5 @@ release/
 .env
 .env.*
 .claude/
-/target/
+/target
+/target.noindex

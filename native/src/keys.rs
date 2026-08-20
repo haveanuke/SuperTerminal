@@ -162,6 +162,13 @@ pub fn click_to_move_bytes(
     Some(out)
 }
 
+/// True for named function keys (`"f1"`, `"f12"`, ...). A bare `"f"` is NOT
+/// a function key: it is printable input, owned by the IME insertion path —
+/// treating it as a chord makes the pane write it a second time.
+pub fn is_function_key(key: &str) -> bool {
+    key.len() >= 2 && key.starts_with('f') && key[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Arrow/home/end sequence: CSI (`ESC [ x`) normally, SS3 (`ESC O x`) in
 /// application cursor keys mode.
 fn cursor_seq(final_byte: u8, app_cursor: bool) -> Vec<u8> {
@@ -423,6 +430,20 @@ mod tests {
                 Some(*expected),
                 "{k}"
             );
+        }
+    }
+
+    #[test]
+    fn function_key_detection() {
+        for k in [
+            "f1", "f2", "f9", "f10", "f12", "f13", "f19", // named function keys
+        ] {
+            assert!(is_function_key(k), "{k} should be a function key");
+        }
+        // The regression that doubled every typed 'f': a bare printable "f"
+        // must never be treated as a function-key chord.
+        for k in ["f", "a", "g", "enter", "fn", "foo", "f1x"] {
+            assert!(!is_function_key(k), "{k} should NOT be a function key");
         }
     }
 
