@@ -235,10 +235,13 @@ impl From<TabDto> for Tab {
             Some(windows) if !windows.is_empty() => windows,
             _ => match dto.pane {
                 Some(pane) => vec![pane],
-                None => vec![PaneNode::terminal("orphan")],
+                // Neither source: leave empty — `from_session_json`
+                // REJECTS empty-window tabs, preserving the old contract
+                // that malformed tabs fail to load.
+                None => Vec::new(),
             },
         };
-        let active_window = dto.active_window.min(windows.len() - 1);
+        let active_window = dto.active_window.min(windows.len().saturating_sub(1));
         Tab {
             id: dto.id,
             label: dto.label,

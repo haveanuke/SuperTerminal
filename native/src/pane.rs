@@ -254,6 +254,11 @@ impl TerminalPane {
         self.session.as_ref()?.cwd()
     }
 
+    /// True while a foreground job runs in this pane's terminal.
+    pub fn is_busy(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.is_busy())
+    }
+
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
     }

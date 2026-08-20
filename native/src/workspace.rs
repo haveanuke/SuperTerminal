@@ -99,6 +99,9 @@ struct PetDrag {
 
 struct DragState {
     tab_index: usize,
+    /// The window this drag started in — resizes must never follow an
+    /// active-window switch mid-drag.
+    window_index: usize,
     /// Path of child indices from the tab root to the split being resized.
     path: Vec<usize>,
     direction: SplitDirection,
@@ -137,9 +140,11 @@ pub struct Workspace {
     file_viewer: Option<Entity<crate::file_viewer::FileViewer>>,
     sidebar_open: bool,
     sidebar_view: SidebarView,
-    /// cwd per terminal for the projects view, refreshed on the sidebar
-    /// poll — rendering must never do per-pane process queries itself.
-    sidebar_cwd_cache: HashMap<String, String>,
+    /// (cwd, busy) per terminal for the projects view, refreshed on the
+    /// sidebar poll — rendering must never do per-pane process queries.
+    sidebar_status_cache: HashMap<String, (String, bool)>,
+    /// Projects collapsed in the sidebar (by tab id).
+    collapsed_projects: std::collections::HashSet<String>,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -222,7 +227,8 @@ impl Workspace {
             file_viewer: None,
             sidebar_open: true,
             sidebar_view: SidebarView::Projects,
-            sidebar_cwd_cache: HashMap::new(),
+            sidebar_status_cache: HashMap::new(),
+            collapsed_projects: std::collections::HashSet::new(),
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -309,13 +315,16 @@ impl Workspace {
             // poll while it's open, never during render.
             if self.sidebar_view == SidebarView::Projects {
                 let home = std::env::var("HOME").unwrap_or_default();
-                self.sidebar_cwd_cache = self
+                self.sidebar_status_cache = self
                     .panes
                     .iter()
-                    .filter_map(|(id, pane)| {
-                        pane.read(cx)
+                    .map(|(id, pane)| {
+                        let pane_ref = pane.read(cx);
+                        let cwd = pane_ref
                             .cwd()
-                            .map(|cwd| (id.clone(), cwd.replace(&home, "~")))
+                            .map(|cwd| cwd.replace(&home, "~"))
+                            .unwrap_or_default();
+                        (id.clone(), (cwd, pane_ref.is_busy()))
                     })
                     .collect();
                 cx.notify();
@@ -1060,6 +1069,8 @@ impl Workspace {
                     .child(SharedString::from(tab.label.clone()))
                     .into_any_element()
             };
+            let collapsed = self.collapsed_projects.contains(&tab.id);
+            let collapse_tab_id = tab.id.clone();
             rows.push(
                 div()
                     .id(SharedString::from(format!("project-{}", tab.id)))
@@ -1072,6 +1083,30 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active_tab, |d| d.bg(rgb(theme.ui_surface)))
                     .hover(|style| style.bg(rgb(theme.ui_surface)))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("project-fold-{}", tab.id)))
+                            .cursor_pointer()
+                            .w(px(12.0))
+                            .flex_none()
+                            .text_size(px(8.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(if collapsed {
+                                "\u{25b8}"
+                            } else {
+                                "\u{25be}"
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !ws.collapsed_projects.remove(&collapse_tab_id) {
+                                        ws.collapsed_projects.insert(collapse_tab_id.clone());
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                     .child(label_element)
                     .child(
                         div()
@@ -1157,6 +1192,9 @@ impl Workspace {
                     )
                     .into_any_element(),
             );
+            if collapsed {
+                continue;
+            }
             let multi_window = tab.windows.len() > 1;
             let window_groups: Vec<(usize, Vec<String>)> = tab
                 .windows
@@ -1205,23 +1243,17 @@ impl Workspace {
                     };
                     let pane_ref = pane.read(cx);
                     let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
-                    let active_recently =
-                        pane_ref.last_activity.elapsed() < std::time::Duration::from_secs(3);
                     let title = pane_ref.title();
-                    let cwd: SharedString = self
-                        .sidebar_cwd_cache
+                    let (cwd, busy) = self
+                        .sidebar_status_cache
                         .get(&terminal_id)
                         .cloned()
-                        .unwrap_or_default()
-                        .into();
-                    // Quick status dot: green = output within the last 3s,
-                    // muted = idle. (Exited panes close themselves, so there is
-                    // no dead state to show.)
-                    let dot_color = if active_recently {
-                        theme.green
-                    } else {
-                        theme.ui_border
-                    };
+                        .unwrap_or_default();
+                    let cwd: SharedString = cwd.into();
+                    // Quick status dot, Orca-style: yellow = a foreground
+                    // job is running; green = at the prompt, awaiting
+                    // commands.
+                    let dot_color = if busy { theme.yellow } else { theme.green };
                     let jump_id = terminal_id.clone();
                     rows.push(
                         div()
@@ -1780,7 +1812,12 @@ impl Workspace {
             } => {
                 let ratios = sizes.unwrap_or([0.5, 0.5]);
                 let horizontal = *direction == SplitDirection::Horizontal;
-                let key = format!("{tab_index}:{path:?}");
+                let window_index = self
+                    .tabs
+                    .get(tab_index)
+                    .map(|tab| tab.active_window)
+                    .unwrap_or(0);
+                let key = format!("{tab_index}:{window_index}:{path:?}");
                 let bounds_map = Arc::clone(&self.split_bounds);
                 let key_for_canvas = key.clone();
 
@@ -1838,6 +1875,7 @@ impl Workspace {
                                 cx.listener(move |ws, _, _, cx| {
                                     ws.drag = Some(DragState {
                                         tab_index,
+                                        window_index,
                                         path: drag_path.clone(),
                                         direction: drag_dir,
                                     });
@@ -1969,7 +2007,13 @@ impl Workspace {
             )
     }
 
-    fn set_split_sizes(&mut self, tab_index: usize, path: &[usize], sizes: [f32; 2]) {
+    fn set_split_sizes(
+        &mut self,
+        tab_index: usize,
+        window_index: usize,
+        path: &[usize],
+        sizes: [f32; 2],
+    ) {
         fn walk(node: &mut PaneNode, path: &[usize], sizes: [f32; 2]) {
             match (node, path) {
                 (PaneNode::Split { sizes: s, .. }, []) => *s = Some(sizes),
@@ -1981,8 +2025,12 @@ impl Workspace {
                 _ => {}
             }
         }
-        if let Some(tab) = self.tabs.get_mut(tab_index) {
-            walk(tab.active_pane_mut(), path, sizes);
+        if let Some(window) = self
+            .tabs
+            .get_mut(tab_index)
+            .and_then(|tab| tab.windows.get_mut(window_index))
+        {
+            walk(window, path, sizes);
         }
     }
 
@@ -3451,7 +3499,7 @@ impl Render for Workspace {
                     return;
                 }
                 let Some(drag) = &ws.drag else { return };
-                let key = format!("{}:{:?}", drag.tab_index, drag.path);
+                let key = format!("{}:{}:{:?}", drag.tab_index, drag.window_index, drag.path);
                 let Some((x, y, w, h)) = ws.split_bounds.lock().unwrap().get(&key).copied() else {
                     return;
                 };
@@ -3464,8 +3512,9 @@ impl Render for Workspace {
                     }
                 }
                 .clamp(0.1, 0.9);
-                let (tab_index, path) = (drag.tab_index, drag.path.clone());
-                ws.set_split_sizes(tab_index, &path, [ratio, 1.0 - ratio]);
+                let (tab_index, window_index, path) =
+                    (drag.tab_index, drag.window_index, drag.path.clone());
+                ws.set_split_sizes(tab_index, window_index, &path, [ratio, 1.0 - ratio]);
                 cx.notify();
             }))
             .on_mouse_up(

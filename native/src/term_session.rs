@@ -436,6 +436,16 @@ impl TermSession {
 
     /// Current working directory of the foreground process in this terminal
     /// (falls back to the shell process; best-effort).
+    /// True while a foreground job (not the shell itself) owns the
+    /// terminal — i.e. something is running; false at the prompt.
+    pub fn is_busy(&self) -> bool {
+        if self.exited.is_some() {
+            return false;
+        }
+        let fg = unsafe { tcgetpgrp(self.master_fd) };
+        fg > 0 && fg != self.shell_pid
+    }
+
     pub fn cwd(&self) -> Option<String> {
         if self.exited.is_some() {
             return None;
