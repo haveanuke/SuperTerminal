@@ -139,23 +139,23 @@ impl TerminalPane {
                         cx.notify();
                     }
                     // Auto-run: fire the command every interval (ticks are
-                    // ~16ms). ESC-after-delay reuses the same tick clock.
+                    // ~16ms). ESC lands escape_delay into each cycle without
+                    // stretching the cycle. Writes go straight to this pane's
+                    // PTY — a timer must never fan out over broadcast.
                     if let Some((command, interval, send_escape, escape_delay)) =
                         pane.auto_run.clone()
                     {
                         pane.auto_run_tick += 1;
                         let interval_ticks = interval.max(1) * 62;
-                        let escape_ticks = escape_delay.max(1) * 62;
-                        if pane.auto_run_tick == interval_ticks {
+                        let escape_ticks = (escape_delay.max(1) * 62).min(interval_ticks - 1);
+                        if send_escape && pane.auto_run_tick == escape_ticks {
+                            pane.write_self(vec![0x1b]);
+                        }
+                        if pane.auto_run_tick >= interval_ticks {
+                            pane.auto_run_tick = 0;
                             let mut bytes = command.into_bytes();
                             bytes.push(b'\r');
-                            pane.write(bytes);
-                        }
-                        if send_escape && pane.auto_run_tick == interval_ticks + escape_ticks {
-                            pane.write(vec![0x1b]);
-                        }
-                        if pane.auto_run_tick >= interval_ticks + escape_ticks {
-                            pane.auto_run_tick = 0;
+                            pane.write_self(bytes);
                         }
                     }
                     // Cursor blink: ~530ms phase flip while focused.
@@ -291,6 +291,11 @@ impl TerminalPane {
             }
             return;
         }
+        self.write_self(bytes);
+    }
+
+    /// Write to this pane's PTY only, ignoring broadcast (timers, escapes).
+    fn write_self(&self, bytes: Vec<u8>) {
         if let Some(session) = &self.session {
             session.write(bytes);
         }
@@ -329,6 +334,13 @@ impl TerminalPane {
     pub fn set_auto_run(&mut self, config: Option<(String, u32, bool, u32)>) {
         self.auto_run = config;
         self.auto_run_tick = 0;
+        // First run fires immediately (old-app behavior); the tick loop
+        // handles every repeat after this.
+        if let Some((command, _, _, _)) = &self.auto_run {
+            let mut bytes = command.clone().into_bytes();
+            bytes.push(b'\r');
+            self.write_self(bytes);
+        }
     }
 
     fn measure_cell(&mut self, window: &mut Window, cx: &mut App) {
@@ -772,7 +784,10 @@ impl Render for TerminalPane {
             .size_full()
             .relative()
             .bg(if self.translucent {
-                gpui::rgba((theme.background << 8) | 0xB8)
+                // Fully transparent over a background image: the image layer
+                // already applies the user's chosen opacity, so any alpha here
+                // would dim it a second time.
+                gpui::rgba(0x0000_0000)
             } else {
                 gpui::rgba((theme.background << 8) | 0xFF)
             })

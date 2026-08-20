@@ -550,18 +550,28 @@ impl TermSession {
 
             let mut search_matches = Vec::new();
             if let Some((_, needle)) = &self.search {
-                let needle_lower = needle.to_lowercase();
-                let needle_len = needle.chars().count();
-                for (row_index, row) in rows.iter().enumerate() {
-                    let text: String = row.iter().map(|cell| cell.ch).collect();
-                    let lower = text.to_lowercase();
-                    let mut from = 0;
-                    while let Some(found) = lower[from..].find(&needle_lower) {
-                        let start = lower[..from + found].chars().count();
-                        for offset in 0..needle_len {
-                            search_matches.push((start + offset, row_index));
+                // Char-wise case-folded scan: columns must map 1:1 to grid
+                // cells, so never lowercase the whole row (one-to-many
+                // expansions like 'İ' would shift every column after them).
+                let needle_chars: Vec<char> = needle.chars().collect();
+                if !needle_chars.is_empty() {
+                    for (row_index, row) in rows.iter().enumerate() {
+                        let row_chars: Vec<char> = row.iter().map(|cell| cell.ch).collect();
+                        let mut col = 0;
+                        while col + needle_chars.len() <= row_chars.len() {
+                            let matched = needle_chars
+                                .iter()
+                                .zip(&row_chars[col..])
+                                .all(|(n, c)| n == c || n.to_lowercase().eq(c.to_lowercase()));
+                            if matched {
+                                for offset in 0..needle_chars.len() {
+                                    search_matches.push((col + offset, row_index));
+                                }
+                                col += needle_chars.len();
+                            } else {
+                                col += 1;
+                            }
                         }
-                        from += found + needle_lower.len().max(1);
                     }
                 }
             }

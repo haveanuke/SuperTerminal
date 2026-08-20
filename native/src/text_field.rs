@@ -7,7 +7,7 @@
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    SharedString, Window,
+    MouseButton, SharedString, Window,
 };
 
 use crate::themes::Theme;
@@ -323,6 +323,16 @@ impl Render for TextField {
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|field, _, window, cx| {
+                    field.focus_handle.focus(window);
+                    field.caret = field.value.chars().count();
+                    field.anchor = None;
+                    cx.notify();
+                }),
+            )
+            .cursor_text()
             .w_full()
             .when(self.compact, |d| d.h(px(15.0)).text_size(px(10.0)))
             .px(px(pad_x))

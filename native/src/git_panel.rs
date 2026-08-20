@@ -45,6 +45,12 @@ pub struct GitPanel {
     commit_field: Entity<TextField>,
     /// Monotonic guard: results only apply if the repo generation matches.
     generation: u64,
+    /// Monotonic guard for graph loads: an older in-flight request must not
+    /// overwrite a newer one landing first.
+    graph_seq: u64,
+    /// Two-click discard confirm: path armed by the first click. Discarding
+    /// an untracked entry deletes it permanently, so nothing runs unarmed.
+    pending_discard: Option<String>,
 }
 
 pub struct PanelClosed;
@@ -56,12 +62,13 @@ impl GitPanel {
         let commit_field = cx.new(|field_cx| TextField::new("commit message", theme, field_cx));
         cx.subscribe(
             &commit_field,
-            |panel, field, event: &TextFieldEvent, cx| match event {
+            |panel, _field, event: &TextFieldEvent, cx| match event {
                 TextFieldEvent::Submitted(message) => {
                     let message = message.trim().to_string();
                     if !message.is_empty() {
+                        // The field keeps the message; it only clears once the
+                        // commit lands (see the success path in `run`).
                         panel.run(GitOp::Commit(message), cx);
-                        field.update(cx, |f, cx| f.reset(cx));
                     }
                 }
                 TextFieldEvent::Cancelled => cx.emit(PanelClosed),
@@ -93,6 +100,8 @@ impl GitPanel {
             error: None,
             commit_field,
             generation: 0,
+            graph_seq: 0,
+            pending_discard: None,
         }
     }
 
@@ -126,6 +135,7 @@ impl GitPanel {
                 if changed {
                     panel.report = None;
                     panel.graph = None;
+                    panel.pending_discard = None;
                     panel.refresh_status(cx);
                     panel.refresh_graph(cx);
                 }
@@ -152,7 +162,15 @@ impl GitPanel {
                 }
                 match result {
                     Ok(report) => {
+                        // A checkout done in the terminal changes the branch
+                        // under us; the poll must refresh the log too.
+                        let branch_changed = panel.report.as_ref().is_some_and(|prev| {
+                            prev.branch != report.branch || prev.detached != report.detached
+                        });
                         panel.report = Some(report);
+                        if branch_changed {
+                            panel.refresh_graph(cx);
+                        }
                         cx.notify();
                     }
                     Err(err) if err == "busy" => {}
@@ -173,6 +191,8 @@ impl GitPanel {
         };
         let state = Arc::clone(&self.state);
         let generation = self.generation;
+        self.graph_seq += 1;
+        let seq = self.graph_seq;
         cx.spawn(async move |panel, cx| {
             let result = cx
                 .background_executor()
@@ -181,7 +201,7 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation {
+                if panel.generation != generation || panel.graph_seq != seq {
                     return;
                 }
                 if let Ok(graph) = result {
@@ -203,7 +223,9 @@ impl GitPanel {
         }
         self.busy = true;
         self.error = None;
+        self.pending_discard = None;
         cx.notify();
+        let is_commit = matches!(op, GitOp::Commit(_));
         let state = Arc::clone(&self.state);
         let generation = self.generation;
         cx.spawn(async move |panel, cx| {
@@ -244,6 +266,11 @@ impl GitPanel {
                 match result {
                     Ok(action) => {
                         panel.report = Some(action.report);
+                        if is_commit {
+                            panel.commit_field.update(cx, |field, field_cx| {
+                                field.reset(field_cx);
+                            });
+                        }
                         panel.refresh_graph(cx);
                     }
                     Err(err) if err == "no upstream" => {
@@ -281,6 +308,53 @@ impl GitPanel {
                 cx.listener(move |panel, _, _, cx| {
                     if !panel.busy {
                         panel.run(op.clone(), cx);
+                    }
+                }),
+            )
+    }
+
+    /// Discard is destructive (untracked entries are deleted outright, via
+    /// `git clean`), so it arms on the first click and only runs on the
+    /// second. Any other panel action disarms it.
+    fn discard_button(
+        &self,
+        path: String,
+        untracked: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        let armed = self.pending_discard.as_deref() == Some(path.as_str());
+        let label = if !armed {
+            "discard"
+        } else if untracked {
+            "delete file?"
+        } else {
+            "sure?"
+        };
+        div()
+            .id(SharedString::from(format!("git-discard-{path}")))
+            .cursor_pointer()
+            .px(px(5.0))
+            .rounded(px(3.0))
+            .text_color(rgb(if armed {
+                theme.red
+            } else {
+                theme.ui_text_muted
+            }))
+            .opacity(if self.busy { 0.4 } else { 1.0 })
+            .hover(|style| style.bg(rgb(theme.ui_border)))
+            .child(SharedString::from(label))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _, _, cx| {
+                    if panel.busy {
+                        return;
+                    }
+                    if panel.pending_discard.as_deref() == Some(path.as_str()) {
+                        panel.run(GitOp::Discard(vec![path.clone()]), cx);
+                    } else {
+                        panel.pending_discard = Some(path.clone());
+                        cx.notify();
                     }
                 }),
             )
@@ -352,7 +426,7 @@ impl GitPanel {
                         .flex()
                         .flex_row()
                         .gap(px(2.0))
-                        .child(self.button("discard", GitOp::Discard(vec![path.clone()]), cx))
+                        .child(self.discard_button(path.clone(), entry.kind == "untracked", cx))
                         .child(self.button("stage", GitOp::Stage(vec![path]), cx))
                         .into_any_element()
                 }

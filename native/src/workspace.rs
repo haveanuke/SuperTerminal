@@ -115,6 +115,9 @@ pub struct Workspace {
     buddy_note: Option<String>,
     buddy_busy: Arc<std::sync::atomic::AtomicBool>,
     buddy_last_hash: u64,
+    /// After a failed run, hold off retries until this instant so a broken
+    /// command doesn't respawn every tick.
+    buddy_backoff_until: Option<std::time::Instant>,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -155,6 +158,7 @@ impl Workspace {
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             buddy_last_hash: 0,
+            buddy_backoff_until: None,
             swap_source: None,
         };
         this.add_tab(None, cx);
@@ -204,7 +208,12 @@ impl Workspace {
         if hash == self.buddy_last_hash {
             return;
         }
-        self.buddy_last_hash = hash;
+        if self
+            .buddy_backoff_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return;
+        }
         let cwd = pane_ref.cwd();
         let command = self.settings.buddy_command.clone();
         let args = self.settings.buddy_args.clone();
@@ -248,8 +257,15 @@ impl Workspace {
                 ws.buddy_busy
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 if result.ok {
+                    // Only a successful review consumes the content hash: a
+                    // timeout or launch failure retries once the backoff ends.
+                    ws.buddy_last_hash = hash;
+                    ws.buddy_backoff_until = None;
                     ws.buddy_note = Some(result.text);
                     cx.notify();
+                } else {
+                    ws.buddy_backoff_until =
+                        Some(std::time::Instant::now() + Duration::from_secs(30));
                 }
             });
             Ok::<(), ()>(())
@@ -411,14 +427,25 @@ impl Workspace {
                 }
             }
             None => {
+                let was_active = tab_index == self.active_tab
+                    || self.focused_terminal.as_deref() == Some(terminal_id);
                 self.tabs.remove(tab_index);
                 if self.tabs.is_empty() {
                     self.add_tab(None, cx);
                 } else {
+                    // Removing a tab before the active one shifts every later
+                    // index down; follow the shift so the same tab stays
+                    // selected. Only an active-tab close moves focus.
+                    if tab_index < self.active_tab {
+                        self.active_tab -= 1;
+                    }
                     self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-                    self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
-                        .into_iter()
-                        .next();
+                    if was_active {
+                        self.focused_terminal =
+                            collect_terminal_ids(&self.tabs[self.active_tab].pane)
+                                .into_iter()
+                                .next();
+                    }
                 }
             }
         }
@@ -431,7 +458,13 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        for id in collect_terminal_ids(&tab.pane) {
+        let ids = collect_terminal_ids(&tab.pane);
+        let was_active = index == self.active_tab
+            || self
+                .focused_terminal
+                .as_ref()
+                .is_some_and(|focused| ids.contains(focused));
+        for id in ids {
             if let Some(pane) = self.panes.remove(&id) {
                 pane.update(cx, move |pane, _| {
                     if let Some(handle) = pane.shutdown() {
@@ -446,10 +479,15 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.add_tab(None, cx);
         } else {
+            if index < self.active_tab {
+                self.active_tab -= 1;
+            }
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-            self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
-                .into_iter()
-                .next();
+            if was_active {
+                self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
+                    .into_iter()
+                    .next();
+            }
         }
         cx.notify();
     }
@@ -603,6 +641,33 @@ impl Workspace {
         }
         self.overlay = Overlay::None;
         cx.notify();
+    }
+
+    /// Close whatever sheet is open. Closing search also clears the pane's
+    /// highlights — every close path must go through here, not just the
+    /// field's own Escape handler.
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay == Overlay::Search {
+            if let Some(pane) = self
+                .focused_terminal
+                .as_ref()
+                .and_then(|id| self.panes.get(id))
+            {
+                pane.update(cx, |pane, pane_cx| pane.set_search(None, pane_cx));
+            }
+        }
+        self.overlay = Overlay::None;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlay == Overlay::Search {
+            self.close_overlay(window, cx);
+        } else {
+            self.overlay = Overlay::Search;
+            cx.notify();
+        }
     }
 
     fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
@@ -1378,18 +1443,7 @@ impl Workspace {
                     )
             })
             .child(self.overlay_button("git", |ws, _window, cx| ws.toggle_git_panel(cx), cx))
-            .child(self.overlay_button(
-                "search",
-                |ws, _window, cx| {
-                    ws.overlay = if ws.overlay == Overlay::Search {
-                        Overlay::None
-                    } else {
-                        Overlay::Search
-                    };
-                    cx.notify();
-                },
-                cx,
-            ))
+            .child(self.overlay_button("search", |ws, window, cx| ws.toggle_search(window, cx), cx))
             .child(self.overlay_button(
                 "sessions",
                 |ws, _window, cx| {
@@ -1931,9 +1985,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|ws, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && ws.overlay != Overlay::None {
-                    ws.overlay = Overlay::None;
-                    ws.focus_active_pane(window, cx);
-                    cx.notify();
+                    ws.close_overlay(window, cx);
                 }
             }))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
@@ -1974,6 +2026,13 @@ impl Render for Workspace {
                     Overlay::Sessions
                 };
                 cx.notify();
+            }))
+            .on_action(cx.listener(|ws, _: &ToggleSearch, window, cx| {
+                ws.toggle_search(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &ToggleGitPanel, window, cx| {
+                ws.toggle_git_panel(cx);
+                ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &SaveSessionAs, _, cx| {
                 ws.refresh_sessions();
