@@ -3364,15 +3364,16 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .child(
-                // Titlebar drag strip under the traffic lights.
+            .children((!window.is_fullscreen()).then(|| {
+                // Titlebar drag strip under the traffic lights — macOS hides
+                // them in fullscreen, so the strip collapses there too.
                 div()
                     .flex_none()
                     .h(px(34.0))
                     .w_full()
                     .bg(rgb(theme.ui_background))
-                    .window_control_area(gpui::WindowControlArea::Drag),
-            )
+                    .window_control_area(gpui::WindowControlArea::Drag)
+            }))
             .child(
                 // Content row: the sidebar (activity rail + view) on the
                 // left, the terminal tree filling the rest.
