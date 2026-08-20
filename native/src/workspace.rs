@@ -106,11 +106,12 @@ struct CueState {
     last_cue: Option<std::time::Instant>,
 }
 
-/// Fire-and-forget system sound.
-fn play_sound(name: &str) {
-    let _ = std::process::Command::new("/usr/bin/afplay")
+/// Spawn a system sound; the caller keeps the child for reaping.
+fn play_sound(name: &str) -> Option<std::process::Child> {
+    std::process::Command::new("/usr/bin/afplay")
         .arg(format!("/System/Library/Sounds/{name}.aiff"))
-        .spawn();
+        .spawn()
+        .ok()
 }
 
 struct DragState {
@@ -165,6 +166,8 @@ pub struct Workspace {
     cue_track: HashMap<String, CueState>,
     /// The currently speaking `say` process (killed before a new note).
     tts_child: Option<std::process::Child>,
+    /// Spawned afplay children, reaped on the poll (no zombies).
+    audio_children: Vec<std::process::Child>,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -251,6 +254,7 @@ impl Workspace {
             collapsed_projects: std::collections::HashSet::new(),
             cue_track: HashMap::new(),
             tts_child: None,
+            audio_children: Vec::new(),
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -317,7 +321,10 @@ impl Workspace {
         const MIN_GAP: Duration = Duration::from_secs(5);
         const QUIET: Duration = Duration::from_secs(3);
         let now = std::time::Instant::now();
-        let mut cues: Vec<&'static str> = Vec::new();
+        // Reap finished sound players so they never linger as zombies.
+        self.audio_children
+            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+        let mut cue_kinds: Vec<&'static str> = Vec::new();
         for (id, pane) in &self.panes {
             let pane_ref = pane.read(cx);
             let busy = pane_ref.foreground_busy();
@@ -337,7 +344,7 @@ impl Workspace {
             if state.busy && !busy {
                 // Job finished, back at the prompt.
                 if worked_long_enough && gap_ok {
-                    cues.push("Glass");
+                    cue_kinds.push("Glass");
                     state.last_cue = Some(now);
                 }
                 state.busy_since = None;
@@ -347,11 +354,13 @@ impl Workspace {
                 state.quiet_cued = false;
             } else if busy && quiet && !state.quiet_cued {
                 // Interactive job stopped producing output: awaiting input.
+                // Latch ONLY when the cue actually fires — latching while
+                // still under MIN_BUSY would suppress the Ping forever.
                 if worked_long_enough && gap_ok {
-                    cues.push("Ping");
+                    cue_kinds.push("Ping");
                     state.last_cue = Some(now);
+                    state.quiet_cued = true;
                 }
-                state.quiet_cued = true;
             } else if busy && !quiet {
                 state.quiet_cued = false;
             }
@@ -359,9 +368,15 @@ impl Workspace {
         }
         let live: std::collections::HashSet<&String> = self.panes.keys().collect();
         self.cue_track.retain(|id, _| live.contains(id));
-        // One chime per tick even if several terminals finished together.
-        if let Some(name) = cues.first() {
-            play_sound(name);
+        // Each DISTINCT chime kind plays once, so every cued terminal's
+        // sound is really heard even when several finish together.
+        cue_kinds.dedup();
+        cue_kinds.sort_unstable();
+        cue_kinds.dedup();
+        for kind in cue_kinds {
+            if let Some(child) = play_sound(kind) {
+                self.audio_children.push(child);
+            }
         }
     }
 
@@ -369,6 +384,7 @@ impl Workspace {
     fn speak_note(&mut self, text: &str) {
         if let Some(mut child) = self.tts_child.take() {
             let _ = child.kill();
+            let _ = child.wait(); // reap
         }
         let capped: String = text.chars().take(400).collect();
         self.tts_child = std::process::Command::new("/usr/bin/say")
@@ -2500,7 +2516,12 @@ impl Workspace {
                     ws.settings.audio_cues = !ws.settings.audio_cues;
                     let _ = ws.settings.save();
                     if ws.settings.audio_cues {
-                        play_sound("Glass");
+                        // Resnapshot so transitions that happened while
+                        // disabled don't chime retroactively.
+                        ws.cue_track.clear();
+                        if let Some(child) = play_sound("Glass") {
+                            ws.audio_children.push(child);
+                        }
                     }
                     cx.notify();
                 },
@@ -2520,6 +2541,7 @@ impl Workspace {
                         ws.speak_note("buddy voice on");
                     } else if let Some(mut child) = ws.tts_child.take() {
                         let _ = child.kill();
+                        let _ = child.wait(); // reap
                     }
                     cx.notify();
                 },
