@@ -398,6 +398,17 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Keep an in-progress tab rename pointing at the same tab after a tab
+    /// removal shifts the indices; drop it if its own tab was closed.
+    fn fix_rename_after_removal(&mut self, removed: usize) {
+        if let Some((rename_index, field)) = self.rename_field.take() {
+            if rename_index != removed {
+                let adjusted = rename_index - usize::from(rename_index > removed);
+                self.rename_field = Some((adjusted, field));
+            }
+        }
+    }
+
     fn close_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         if let Some(pane) = self.panes.remove(terminal_id) {
             pane.update(cx, move |pane, _| {
@@ -430,6 +441,7 @@ impl Workspace {
                 let was_active = tab_index == self.active_tab
                     || self.focused_terminal.as_deref() == Some(terminal_id);
                 self.tabs.remove(tab_index);
+                self.fix_rename_after_removal(tab_index);
                 if self.tabs.is_empty() {
                     self.add_tab(None, cx);
                 } else {
@@ -476,6 +488,7 @@ impl Workspace {
             }
         }
         self.tabs.remove(index);
+        self.fix_rename_after_removal(index);
         if self.tabs.is_empty() {
             self.add_tab(None, cx);
         } else {
