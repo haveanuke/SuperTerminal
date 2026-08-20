@@ -20,6 +20,11 @@ pub struct Settings {
     pub buddy_command: String,
     /// `{prompt}` is substituted with the review prompt.
     pub buddy_args: Vec<String>,
+    /// The pet's persisted identity (bones regenerate from its user id).
+    pub buddy_companion: Option<crate::buddy_pet::CompanionSave>,
+    pub buddy_pet_visible: bool,
+    /// Last dragged pet position (window coordinates), clamped on render.
+    pub buddy_pet_pos: Option<(f32, f32)>,
     /// Imported custom themes, in the old app's export JSON format.
     pub custom_themes: Vec<serde_json::Value>,
 }
@@ -37,6 +42,9 @@ impl Default for Settings {
             buddy_enabled: false,
             buddy_command: String::new(),
             buddy_args: vec!["-p".to_string(), "{prompt}".to_string()],
+            buddy_companion: None,
+            buddy_pet_visible: true,
+            buddy_pet_pos: None,
             custom_themes: Vec::new(),
         }
     }
@@ -123,6 +131,14 @@ mod tests {
             buddy_enabled: true,
             buddy_command: "claude".into(),
             buddy_args: vec!["-p".into(), "{prompt}".into()],
+            buddy_companion: Some(crate::buddy_pet::CompanionSave {
+                user_id: "roundtrip".into(),
+                name: "Pixel".into(),
+                pet_count: 7,
+                hatched_at: 1,
+            }),
+            buddy_pet_visible: false,
+            buddy_pet_pos: Some((120.0, 240.0)),
             custom_themes: Vec::new(),
         };
         s.save_to(&path).unwrap();

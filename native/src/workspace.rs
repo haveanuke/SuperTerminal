@@ -18,6 +18,7 @@ use gpui::{
 
 use superterminal_core::session::SessionManager;
 
+use crate::buddy_pet::Companion;
 use crate::git_panel::GitPanel;
 use crate::layout::{
     collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
@@ -72,6 +73,16 @@ enum Overlay {
     Sessions,
     AutoRun,
     Search,
+    PetCard,
+}
+
+/// An in-progress pet drag: grab offset inside the pet box, the mouse-down
+/// position (to tell a click from a drag), and whether it crossed the
+/// click threshold.
+struct PetDrag {
+    offset: (f32, f32),
+    down: (f32, f32),
+    moved: bool,
 }
 
 struct DragState {
@@ -118,6 +129,20 @@ pub struct Workspace {
     /// After a failed run, hold off retries until this instant so a broken
     /// command doesn't respawn every tick.
     buddy_backoff_until: Option<std::time::Instant>,
+    /// The pet: visual personality only — its bubble text is reviewer output.
+    companion: Companion,
+    pet_frame: usize,
+    pet_blink: bool,
+    /// Hop animation countdown (300ms ticks) after being petted.
+    pet_hop: u8,
+    pet_tick_count: u32,
+    pet_bubble: Option<(String, std::time::Instant)>,
+    pet_drag: Option<PetDrag>,
+    /// Runtime position (window coords); None = default corner.
+    pet_pos: Option<(f32, f32)>,
+    pet_name_field: Option<Entity<TextField>>,
+    /// Two-click confirm for re-roll (it permanently replaces the pet).
+    pet_reroll_armed: bool,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -129,6 +154,12 @@ impl Workspace {
             let _ = themes::import_custom(custom);
         }
         let theme = themes::by_name(&settings.theme).unwrap_or_else(themes::default_theme);
+        let companion = settings
+            .buddy_companion
+            .clone()
+            .map(Companion::from_save)
+            .unwrap_or_else(Companion::hatch);
+        let pet_pos = settings.buddy_pet_pos;
         let mut this = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -159,8 +190,23 @@ impl Workspace {
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             buddy_last_hash: 0,
             buddy_backoff_until: None,
+            companion,
+            pet_frame: 0,
+            pet_blink: false,
+            pet_hop: 0,
+            pet_tick_count: 0,
+            pet_bubble: None,
+            pet_drag: None,
+            pet_pos,
+            pet_name_field: None,
+            pet_reroll_armed: false,
             swap_source: None,
         };
+        // First launch (or a healed save): persist the hatched identity so
+        // the same pet comes back next session.
+        if this.settings.buddy_companion.as_ref() != Some(&this.companion.save) {
+            this.save_companion();
+        }
         this.add_tab(None, cx);
         cx.spawn(async move |ws, cx| loop {
             cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -172,7 +218,55 @@ impl Workspace {
             }
         })
         .detach();
+        cx.spawn(async move |ws, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            if ws
+                .update(cx, |ws: &mut Workspace, cx| ws.pet_tick(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         this
+    }
+
+    fn save_companion(&mut self) {
+        self.settings.buddy_companion = Some(self.companion.save.clone());
+        let _ = self.settings.save();
+    }
+
+    /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
+    /// decay, and speech-bubble expiry.
+    fn pet_tick(&mut self, cx: &mut Context<Self>) {
+        if self
+            .pet_bubble
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(45))
+        {
+            self.pet_bubble = None;
+            cx.notify();
+        }
+        if !self.settings.buddy_pet_visible {
+            return;
+        }
+        self.pet_tick_count = self.pet_tick_count.wrapping_add(1);
+        if self.pet_hop > 0 {
+            self.pet_hop -= 1;
+            cx.notify();
+        }
+        if self.pet_tick_count.is_multiple_of(3) {
+            self.pet_frame = (self.pet_frame + 1) % 3;
+            // ~1-in-5 frames blink for one tick (300ms), like the old app.
+            self.pet_blink = crate::buddy_pet::hash_string(&self.pet_tick_count.to_string(), 7)
+                .is_multiple_of(5);
+            cx.notify();
+        } else if self.pet_blink {
+            self.pet_blink = false;
+            cx.notify();
+        }
     }
 
     /// Buddy-as-reviewer: after a burst of terminal activity settles, send
@@ -261,7 +355,8 @@ impl Workspace {
                     // timeout or launch failure retries once the backoff ends.
                     ws.buddy_last_hash = hash;
                     ws.buddy_backoff_until = None;
-                    ws.buddy_note = Some(result.text);
+                    ws.buddy_note = Some(result.text.clone());
+                    ws.pet_bubble = Some((result.text, std::time::Instant::now()));
                     cx.notify();
                 } else {
                     ws.buddy_backoff_until =
@@ -670,6 +765,7 @@ impl Workspace {
             }
         }
         self.overlay = Overlay::None;
+        self.pet_reroll_armed = false;
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -1322,6 +1418,24 @@ impl Workspace {
                 },
                 cx,
             ))
+            .child(self.overlay_button(
+                if self.settings.buddy_pet_visible {
+                    "pet: shown"
+                } else {
+                    "pet: hidden"
+                },
+                |ws, _window, cx| {
+                    ws.settings.buddy_pet_visible = !ws.settings.buddy_pet_visible;
+                    let _ = ws.settings.save();
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.overlay_button(
+                "pet card",
+                |ws, window, cx| ws.open_pet_card(window, cx),
+                cx,
+            ))
             .child(div().flex_grow().child(self.buddy_field.clone().unwrap()))
             .children(configured.then(|| {
                 div().text_size(px(10.0)).child(SharedString::from(format!(
@@ -1330,6 +1444,161 @@ impl Workspace {
                     self.settings.buddy_args.join(" ")
                 )))
             }))
+    }
+
+    fn open_pet_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pet_name_field.is_none() {
+            let theme_ref = self.theme;
+            let field = cx.new(|field_cx| TextField::new("name", theme_ref, field_cx));
+            cx.subscribe(
+                &field,
+                |ws, _field, event: &TextFieldEvent, cx| match event {
+                    TextFieldEvent::Submitted(name) => {
+                        let name: String = name.trim().chars().take(14).collect();
+                        if !name.is_empty() {
+                            ws.companion.save.name = name;
+                            ws.save_companion();
+                        }
+                        cx.notify();
+                    }
+                    TextFieldEvent::Cancelled => {
+                        ws.overlay = Overlay::None;
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+            self.pet_name_field = Some(field);
+        }
+        let name = self.companion.save.name.clone();
+        if let Some(field) = &self.pet_name_field {
+            field.update(cx, |field, field_cx| {
+                field.set_text_selected(&name, field_cx)
+            });
+        }
+        self.pet_reroll_armed = false;
+        window.focus(&self.focus_handle);
+        self.overlay = Overlay::PetCard;
+        cx.notify();
+    }
+
+    /// The floating pet. Drag to move, click to pet, right-click for its
+    /// card. The bubble carries reviewer notes only — click copies it.
+    fn render_pet(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.settings.buddy_pet_visible {
+            return None;
+        }
+        const PET_W: f32 = 110.0;
+        const PET_H: f32 = 100.0;
+        let theme = self.theme;
+        let viewport = window.viewport_size();
+        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        let (x, y) = self
+            .pet_pos
+            .unwrap_or((vw - PET_W - 24.0, vh - PET_H - 60.0));
+        let x = x.clamp(0.0, (vw - PET_W).max(0.0));
+        let y = y.clamp(34.0, (vh - PET_H).max(34.0));
+        let hop = if self.pet_hop > 0 { -5.0 } else { 0.0 };
+        let art = self.companion.art_frame(self.pet_frame, self.pet_blink);
+        let color = self.companion.rarity_color();
+        let bubble = self.pet_bubble.as_ref().map(|(text, _)| text.clone());
+        Some(
+            div()
+                .id("buddy-pet")
+                .absolute()
+                .left(px(x))
+                .top(px(y + hop))
+                .flex()
+                .flex_col()
+                .items_end()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ws, event: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let down = (f32::from(event.position.x), f32::from(event.position.y));
+                        ws.pet_drag = Some(PetDrag {
+                            offset: (down.0 - x, down.1 - y),
+                            down,
+                            moved: false,
+                        });
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|ws, _, window, cx| {
+                        cx.stop_propagation();
+                        ws.open_pet_card(window, cx);
+                    }),
+                )
+                .children(bubble.map(|text| {
+                    div()
+                        .id("buddy-bubble")
+                        .max_w(px(280.0))
+                        .mb(px(6.0))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(theme.ui_surface))
+                        .border_1()
+                        .border_color(rgb(theme.ui_border))
+                        .text_size(px(11.0))
+                        .text_color(rgb(theme.ui_text))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _, _, cx| {
+                                cx.stop_propagation();
+                                // Click a note to copy it; the bubble closes.
+                                if let Some((text, _)) = ws.pet_bubble.take() {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(SharedString::from(text))
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .font_family(self.settings.font_family.clone())
+                        .text_size(px(12.0))
+                        .line_height(px(13.0))
+                        .text_color(rgb(color))
+                        .children(
+                            art.into_iter().map(|line| {
+                                div().whitespace_nowrap().child(SharedString::from(line))
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(4.0))
+                                .text_size(px(10.0))
+                                .child(
+                                    div()
+                                        .text_color(rgb(color))
+                                        .child(SharedString::from(self.companion.stars())),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(theme.ui_text))
+                                        .child(SharedString::from(
+                                            self.companion.save.name.clone(),
+                                        )),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1436,17 +1705,22 @@ impl Workspace {
                 cx,
             ))
             .child(div().flex_grow())
-            .children(self.buddy_note.clone().map(|note| {
-                div()
-                    .id("buddy-note")
-                    .max_w(px(420.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(10.0))
-                    .text_color(rgb(theme.ui_text_muted))
-                    .child(SharedString::from(note))
-            }))
+            .children(
+                self.buddy_note
+                    .clone()
+                    .filter(|_| !self.settings.buddy_pet_visible)
+                    .map(|note| {
+                        div()
+                            .id("buddy-note")
+                            .max_w(px(420.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(note))
+                    }),
+            )
             .children(self.render_focused_controls(cx))
             .child({
                 let enabled = self.broadcast.is_enabled();
@@ -1899,7 +2173,191 @@ impl Workspace {
                         .into_any_element(),
                 )
             }
+            Overlay::PetCard => Some(self.render_pet_card(cx)),
         }
+    }
+
+    fn render_pet_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let color = self.companion.rarity_color();
+        let art = self.companion.art_frame(0, false);
+        let identity = format!(
+            "{}{} {} {}",
+            if self.companion.bones.shiny {
+                "shiny "
+            } else {
+                ""
+            },
+            self.companion.rarity_name(),
+            self.companion.species_name(),
+            self.companion.stars(),
+        );
+        let pets = format!("pets: {}", self.companion.save.pet_count);
+
+        let stat_rows = crate::buddy_pet::STAT_NAMES
+            .iter()
+            .enumerate()
+            .map(|(index, stat)| {
+                let value = self.companion.bones.stats[index];
+                let filled = ((value as f64 / 10.0).round() as usize).min(10);
+                let bar = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(10 - filled);
+                let marker = if index == self.companion.bones.peak {
+                    " \u{25b2}"
+                } else if index == self.companion.bones.dump {
+                    " \u{25bc}"
+                } else {
+                    ""
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_size(px(10.0))
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(*stat)),
+                    )
+                    .child(div().text_color(rgb(color)).child(SharedString::from(bar)))
+                    .child(SharedString::from(format!("{value}{marker}")))
+            })
+            .collect::<Vec<_>>();
+
+        let reroll_armed = self.pet_reroll_armed;
+        let pet_visible = self.settings.buddy_pet_visible;
+
+        self.sheet("buddy", "enter saves name - esc closes", cx)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(18.0))
+                    .items_start()
+                    .child(
+                        // Portrait, in the terminal font like the pet itself.
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .font_family(self.settings.font_family.clone())
+                            .text_size(px(12.0))
+                            .line_height(px(13.0))
+                            .text_color(rgb(color))
+                            .children(art.into_iter().map(|line| {
+                                div().whitespace_nowrap().child(SharedString::from(line))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .flex_grow()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(div().text_color(rgb(theme.ui_accent)).child("name >"))
+                                    .child(
+                                        div().w(px(180.0)).children(self.pet_name_field.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(color))
+                                    .child(SharedString::from(identity)),
+                            )
+                            .child(div().flex().flex_col().gap(px(2.0)).children(stat_rows))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .text_size(px(10.0))
+                                    .child(
+                                        div()
+                                            .text_color(rgb(theme.ui_text_muted))
+                                            .child(SharedString::from(pets)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("pet-reroll")
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(3.0))
+                                            .border_1()
+                                            .border_color(rgb(theme.ui_border))
+                                            .text_color(rgb(if reroll_armed {
+                                                theme.red
+                                            } else {
+                                                theme.ui_text_muted
+                                            }))
+                                            .hover(|style| style.bg(rgb(theme.ui_border)))
+                                            .child(if reroll_armed {
+                                                "replace this pet?"
+                                            } else {
+                                                "re-roll"
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|ws, _, _, cx| {
+                                                    if ws.pet_reroll_armed {
+                                                        ws.companion = Companion::hatch();
+                                                        ws.save_companion();
+                                                        ws.pet_reroll_armed = false;
+                                                        if let Some(field) = &ws.pet_name_field {
+                                                            let name =
+                                                                ws.companion.save.name.clone();
+                                                            field.update(cx, |field, field_cx| {
+                                                                field.set_text_selected(
+                                                                    &name, field_cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    } else {
+                                                        ws.pet_reroll_armed = true;
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("pet-visibility")
+                                            .cursor_pointer()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(3.0))
+                                            .border_1()
+                                            .border_color(rgb(theme.ui_border))
+                                            .text_color(rgb(theme.ui_text_muted))
+                                            .hover(|style| style.bg(rgb(theme.ui_border)))
+                                            .child(if pet_visible {
+                                                "hide pet"
+                                            } else {
+                                                "show pet"
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|ws, _, _, cx| {
+                                                    ws.settings.buddy_pet_visible =
+                                                        !ws.settings.buddy_pet_visible;
+                                                    let _ = ws.settings.save();
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Bottom sheet anchored above the bar: panels read as extensions of the
@@ -2110,7 +2568,26 @@ impl Render for Workspace {
                 ws.select_tab(8, cx);
                 ws.focus_active_pane(window, cx);
             }))
-            .on_mouse_move(cx.listener(|ws, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|ws, event: &MouseMoveEvent, window, cx| {
+                if let Some(pet_drag) = &mut ws.pet_drag {
+                    let (mx, my) = (f32::from(event.position.x), f32::from(event.position.y));
+                    if !pet_drag.moved {
+                        let (dx, dy) = (mx - pet_drag.down.0, my - pet_drag.down.1);
+                        if dx.abs() + dy.abs() > 3.0 {
+                            pet_drag.moved = true;
+                        }
+                    }
+                    if pet_drag.moved {
+                        let viewport = window.viewport_size();
+                        let x = (mx - pet_drag.offset.0)
+                            .clamp(0.0, (f32::from(viewport.width) - 110.0).max(0.0));
+                        let y = (my - pet_drag.offset.1)
+                            .clamp(34.0, (f32::from(viewport.height) - 100.0).max(34.0));
+                        ws.pet_pos = Some((x, y));
+                        cx.notify();
+                    }
+                    return;
+                }
                 let Some(drag) = &ws.drag else { return };
                 let key = format!("{}:{:?}", drag.tab_index, drag.path);
                 let Some((x, y, w, h)) = ws.split_bounds.lock().unwrap().get(&key).copied() else {
@@ -2132,6 +2609,18 @@ impl Render for Workspace {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|ws, _: &MouseUpEvent, _, cx| {
+                    if let Some(pet_drag) = ws.pet_drag.take() {
+                        if pet_drag.moved {
+                            ws.settings.buddy_pet_pos = ws.pet_pos;
+                            let _ = ws.settings.save();
+                        } else {
+                            // A plain click is a pet: bump the count, hop.
+                            ws.companion.save.pet_count += 1;
+                            ws.save_companion();
+                            ws.pet_hop = 2;
+                        }
+                        cx.notify();
+                    }
                     if ws.drag.take().is_some() {
                         cx.notify();
                     }
@@ -2154,6 +2643,7 @@ impl Render for Workspace {
                     .child(content),
             )
             .child(self.render_bar(cx))
+            .children(self.render_pet(window, cx))
             .children(self.render_overlay(window, cx))
     }
 }
