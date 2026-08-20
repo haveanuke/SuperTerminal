@@ -1520,7 +1520,6 @@ impl Workspace {
         let hop = if self.pet_hop > 0 { 5.0 } else { 0.0 };
         let art = self.companion.art_frame(self.pet_frame, self.pet_blink);
         let color = self.companion.rarity_color();
-        let bubble = self.pet_bubble.as_ref().map(|(text, _)| text.clone());
         Some(
             div()
                 .id("buddy-pet")
@@ -1555,33 +1554,6 @@ impl Workspace {
                         ws.open_pet_card(window, cx);
                     }),
                 )
-                .children(bubble.map(|text| {
-                    div()
-                        .id("buddy-bubble")
-                        .max_w(px(280.0))
-                        .mb(px(6.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .bg(rgb(theme.ui_surface))
-                        .border_1()
-                        .border_color(rgb(theme.ui_border))
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme.ui_text))
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|ws, _, _, cx| {
-                                cx.stop_propagation();
-                                // Click a note to copy it; the bubble closes.
-                                if let Some((text, _)) = ws.pet_bubble.take() {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                                }
-                                cx.notify();
-                            }),
-                        )
-                        .child(SharedString::from(text))
-                }))
                 .child(
                     div()
                         .flex()
@@ -1618,6 +1590,72 @@ impl Workspace {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The pet's speech bubble as its own absolute element, clamped to the
+    /// viewport: it tracks the pet's right edge but never crosses the left
+    /// margin, grows upward when there's headroom and flips below otherwise.
+    fn render_pet_bubble(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.settings.buddy_pet_visible {
+            return None;
+        }
+        let text = self.pet_bubble.as_ref().map(|(text, _)| text.clone())?;
+        const PET_W: f32 = 110.0;
+        const PET_H: f32 = 100.0;
+        let theme = self.theme;
+        let viewport = window.viewport_size();
+        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        let (x, y) = self
+            .pet_pos
+            .unwrap_or((vw - PET_W - 24.0, vh - PET_H - 60.0));
+        let x = x.clamp(0.0, (vw - PET_W).max(0.0));
+        let y = y.clamp(34.0, (vh - PET_H).max(34.0));
+        let right_edge = (x + PET_W).clamp(96.0f32.min(vw), (vw - 8.0).max(96.0f32.min(vw)));
+        let max_w = (right_edge - 8.0).clamp(80.0, 280.0);
+        let headroom = y - 40.0;
+        let above = headroom >= 100.0;
+        let bubble = div()
+            .id("buddy-bubble")
+            .absolute()
+            .right(px(vw - right_edge))
+            .max_w(px(max_w))
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .bg(rgb(theme.ui_surface))
+            .border_1()
+            .border_color(rgb(theme.ui_border))
+            .text_size(px(11.0))
+            .text_color(rgb(theme.ui_text))
+            .overflow_hidden()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, _, _, cx| {
+                    cx.stop_propagation();
+                    // Click a note to copy it; the bubble closes.
+                    if let Some((text, _)) = ws.pet_bubble.take() {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(SharedString::from(text));
+        Some(if above {
+            bubble
+                .bottom(px(vh - y + 6.0))
+                .max_h(px(headroom.max(40.0)))
+                .into_any_element()
+        } else {
+            bubble
+                .top(px(y + PET_H + 6.0))
+                .max_h(px((vh - y - PET_H - 46.0).max(40.0)))
+                .into_any_element()
+        })
     }
 
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2668,6 +2706,7 @@ impl Render for Workspace {
             )
             .child(self.render_bar(cx))
             .children(self.render_pet(window, cx))
+            .children(self.render_pet_bubble(window, cx))
             .children(self.render_overlay(window, cx))
     }
 }
