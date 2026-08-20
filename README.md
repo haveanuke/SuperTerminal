@@ -2,6 +2,10 @@
 
 A modern multi-terminal manager built with Tauri 2, Rust, React, and xterm.js.
 
+> **Looking for the fully native build?** The gpui + alacritty_terminal
+> rewrite (no webview) lives in [`native/`](native/README.md) and ships as
+> "SuperTerminal Native.app" — see that README for build and install steps.
+
 > **Migrating from the Electron build?** Saved terminal sessions carry over
 > automatically on first launch. Theme/font/buddy settings do not (the webview
 > storage is different) — re-pick them once in Settings.
