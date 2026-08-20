@@ -456,7 +456,7 @@ impl Workspace {
 
     fn start_tab_rename(&mut self, index: usize, cx: &mut Context<Self>) {
         let theme = self.theme;
-        let field = cx.new(|field_cx| TextField::new("tab name", theme, field_cx));
+        let field = cx.new(|field_cx| TextField::new("tab name", theme, field_cx).compact());
         cx.subscribe(
             &field,
             move |ws, _field, event: &TextFieldEvent, cx| match event {
@@ -1206,6 +1206,13 @@ impl Workspace {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |ws, event: &gpui::MouseDownEvent, window, cx| {
+                            if ws
+                                .rename_field
+                                .as_ref()
+                                .is_some_and(|(rename_index, _)| *rename_index == index)
+                            {
+                                return; // typing into the rename field
+                            }
                             if event.click_count >= 2 {
                                 ws.start_tab_rename(index, cx);
                             } else {
@@ -1779,6 +1786,10 @@ impl Render for Workspace {
             Some(tree) => self.render_tree(&tree, self.active_tab, Vec::new(), cx),
             None => div().size_full().into_any_element(),
         };
+
+        if let Some((_, field)) = &self.rename_field {
+            field.read(cx).focus(window);
+        }
 
         let background_layer = self.settings.background_image.as_ref().map(|path| {
             gpui::img(std::path::PathBuf::from(path))

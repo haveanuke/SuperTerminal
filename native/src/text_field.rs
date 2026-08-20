@@ -23,6 +23,8 @@ pub struct TextField {
     placeholder: SharedString,
     focus_handle: FocusHandle,
     theme: &'static Theme,
+    /// Slim single-line style for inline use (tab rename in the bar).
+    compact: bool,
 }
 
 impl TextField {
@@ -32,7 +34,13 @@ impl TextField {
             placeholder: placeholder.to_string().into(),
             focus_handle: cx.focus_handle(),
             theme,
+            compact: false,
         }
+    }
+
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
@@ -92,12 +100,14 @@ impl Render for TextField {
         } else {
             SharedString::from(self.value.clone())
         };
+        let (pad_x, pad_y) = if self.compact { (4.0, 0.0) } else { (8.0, 4.0) };
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .w_full()
-            .px(px(8.0))
-            .py(px(4.0))
+            .when(self.compact, |d| d.h(px(15.0)).text_size(px(10.0)))
+            .px(px(pad_x))
+            .py(px(pad_y))
             .rounded(px(4.0))
             .bg(rgb(theme.ui_background))
             .border_1()
