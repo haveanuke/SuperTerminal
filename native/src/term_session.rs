@@ -38,6 +38,49 @@ extern "C" {
 }
 const SIGKILL: c_int = 9;
 
+/// Standard xterm color for OSC 4/10/11 queries (0-15 classic, cube, gray).
+fn default_palette_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
+    use alacritty_terminal::vte::ansi::Rgb;
+    const BASE: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 49, 49),
+        (13, 188, 121),
+        (229, 229, 16),
+        (36, 114, 200),
+        (188, 63, 188),
+        (17, 168, 205),
+        (229, 229, 229),
+        (102, 102, 102),
+        (241, 76, 76),
+        (35, 209, 139),
+        (245, 245, 67),
+        (59, 142, 234),
+        (214, 112, 214),
+        (41, 184, 219),
+        (255, 255, 255),
+    ];
+    match index {
+        0..=15 => {
+            let (r, g, b) = BASE[index];
+            Rgb { r, g, b }
+        }
+        16..=231 => {
+            let i = index - 16;
+            let level = |c: usize| if c == 0 { 0u8 } else { (55 + 40 * c) as u8 };
+            Rgb {
+                r: level(i / 36),
+                g: level((i / 6) % 6),
+                b: level(i % 6),
+            }
+        }
+        232..=255 => {
+            let g = (8 + 10 * (index - 232)) as u8;
+            Rgb { r: g, g, b: g }
+        }
+        _ => Rgb { r: 0, g: 0, b: 0 },
+    }
+}
+
 /// Cell colors resolved against the theme by the renderer, not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellColor {
@@ -99,9 +142,13 @@ pub struct RenderableSnapshot {
     pub selection: Vec<(usize, usize)>,
     pub app_cursor_mode: bool,
     pub mouse_tracking: bool,
+    /// True while the alternate screen buffer is active (vim, htop, ...).
+    pub alt_screen: bool,
     pub focused_title: Option<String>,
     /// Exit code once the shell has terminated.
     pub exited: Option<i32>,
+    /// Text covered by the active selection (captured under the same lock).
+    pub selection_text: Option<String>,
 }
 
 /// Deferred UI -> terminal operations, applied at the next sync.
@@ -126,6 +173,8 @@ struct EventProxy {
     dirty: Arc<AtomicBool>,
     events: Arc<Mutex<Vec<SessionEvent>>>,
     writer: Arc<Mutex<Option<EventLoopSender>>>,
+    /// Kept current by resizes; answers TextAreaSizeRequest inline.
+    window_size: Arc<Mutex<WindowSize>>,
 }
 
 impl EventListener for EventProxy {
@@ -153,8 +202,24 @@ impl EventListener for EventProxy {
                     .unwrap()
                     .push(SessionEvent::Exited(status.code().unwrap_or(-1)));
             }
-            // Wakeup / damage / clipboard / color queries: redraw covers them
-            // in v1 (OSC 52 clipboard and color queries are v1.x).
+            AlacEvent::ColorRequest(index, format) => {
+                // Answer with the standard xterm palette value; themed color
+                // reporting is v1.x, but silence would hang querying programs.
+                let rgb = default_palette_color(index);
+                if let Some(sender) = self.writer.lock().unwrap().as_ref() {
+                    let _ = sender.send(Msg::Input(format(rgb).into_bytes().into()));
+                }
+                return;
+            }
+            AlacEvent::TextAreaSizeRequest(format) => {
+                let size = *self.window_size.lock().unwrap();
+                if let Some(sender) = self.writer.lock().unwrap().as_ref() {
+                    let _ = sender.send(Msg::Input(format(size).into_bytes().into()));
+                }
+                return;
+            }
+            // Wakeup / damage / clipboard: redraw covers them in v1 (OSC 52
+            // clipboard is v1.x).
             _ => {}
         }
         self.dirty.store(true, Ordering::Release);
@@ -177,6 +242,7 @@ pub struct TermSession {
     exited: Option<i32>,
     cols: usize,
     lines: usize,
+    shared_window_size: Arc<Mutex<WindowSize>>,
 }
 
 impl TermSession {
@@ -216,16 +282,27 @@ impl TermSession {
         let dirty = Arc::new(AtomicBool::new(false));
         let events = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::new(Mutex::new(None));
+        let shared_window_size = Arc::new(Mutex::new(WindowSize {
+            num_cols: cols as u16,
+            num_lines: lines as u16,
+            cell_width,
+            cell_height,
+        }));
         let proxy = EventProxy {
             dirty: Arc::clone(&dirty),
             events: Arc::clone(&events),
             writer: Arc::clone(&writer),
+            window_size: Arc::clone(&shared_window_size),
         };
 
         let size = TermSize::new(cols, lines);
         let term = Arc::new(FairMutex::new(Term::new(
             TermConfig {
                 scrolling_history: 10_000,
+                default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+                    shape: CursorShape::Beam,
+                    blinking: true,
+                },
                 ..Default::default()
             },
             &size,
@@ -238,11 +315,19 @@ impl TermSession {
             cell_width,
             cell_height,
         };
+        // Finder-launched apps get a sparse GUI environment; give shells the
+        // captured login-shell env (PATH etc.), with TERM pinned to a
+        // universally-known terminfo entry (we don't ship alacritty's).
+        let mut env: HashMap<String, String> = superterminal_core::shell_env::shell_env()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
         let options = tty::Options {
             shell,
             working_directory,
             drain_on_exit: true,
-            env: HashMap::new(),
+            env,
         };
         let pty = tty::new(&options, window_size, 0).map_err(|e| e.to_string())?;
         let shell_pid = pty.child().id() as i32;
@@ -268,6 +353,7 @@ impl TermSession {
             exited: None,
             cols,
             lines,
+            shared_window_size,
         })
     }
 
@@ -332,11 +418,6 @@ impl TermSession {
         drained
     }
 
-    /// The selected text, if any (locks the term briefly).
-    pub fn selection_text(&self) -> Option<String> {
-        self.term.lock().selection_to_string()
-    }
-
     /// Current working directory of the foreground process in this terminal
     /// (falls back to the shell process; best-effort).
     pub fn cwd(&self) -> Option<String> {
@@ -359,6 +440,7 @@ impl TermSession {
                     let (new_cols, new_lines) = (size.columns, size.screen_lines);
                     if new_cols != self.cols || new_lines != self.lines {
                         term.resize(size);
+                        *self.shared_window_size.lock().unwrap() = window;
                         let _ = self.sender.send(Msg::Resize(window));
                         self.cols = new_cols;
                         self.lines = new_lines;
@@ -411,6 +493,7 @@ impl TermSession {
         let mut selection_cells = Vec::new();
 
         {
+            let selection_text = term.selection_to_string();
             let content = term.renderable_content();
             let selection_range = content.selection;
             for indexed in content.display_iter {
@@ -462,8 +545,10 @@ impl TermSession {
                 selection: selection_cells,
                 app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
                 mouse_tracking: mode.intersects(TermMode::MOUSE_MODE),
+                alt_screen: mode.contains(TermMode::ALT_SCREEN),
                 focused_title: self.title.clone(),
                 exited: self.exited,
+                selection_text,
             }
         }
     }

@@ -42,6 +42,10 @@ pub struct TerminalPane {
     cell_width: Pixels,
     line_height: Pixels,
     selecting: bool,
+    blink_on: bool,
+    blink_tick: u32,
+    /// Held marked text during IME composition (not yet sent to the PTY).
+    marked_text: Option<String>,
     /// Pane origin in window coordinates (for mouse cell math), updated from
     /// the measuring canvas via `pending_bounds` on each pump tick.
     origin: (Pixels, Pixels),
@@ -83,11 +87,21 @@ impl TerminalPane {
                     .await;
                 let alive = pane.update(cx, |pane: &mut TerminalPane, cx| {
                     // Apply the bounds measured during the last paint: origin
-                    // for mouse math, size for the PTY grid.
+                    // for mouse math, size for the PTY grid. Notify so the
+                    // queued resize is applied by the next sync even when the
+                    // terminal is otherwise idle.
                     let measured = pane.pending_bounds.lock().unwrap().take();
                     if let Some((x, y, w, h)) = measured {
                         pane.origin = (x, y);
                         pane.resize_to(w, h);
+                        cx.notify();
+                    }
+                    // Cursor blink: ~530ms phase flip while focused.
+                    pane.blink_tick += 1;
+                    if pane.blink_tick >= 33 {
+                        pane.blink_tick = 0;
+                        pane.blink_on = !pane.blink_on;
+                        cx.notify();
                     }
                     if pane.session.as_ref().is_some_and(|s| s.take_dirty()) {
                         pane.process_events(cx);
@@ -114,8 +128,10 @@ impl TerminalPane {
             selection: Vec::new(),
             app_cursor_mode: false,
             mouse_tracking: false,
+            alt_screen: false,
             focused_title: None,
             exited: None,
+            selection_text: None,
         };
 
         Self {
@@ -129,6 +145,9 @@ impl TerminalPane {
             cell_width,
             line_height,
             selecting: false,
+            blink_on: true,
+            blink_tick: 0,
+            marked_text: None,
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -270,7 +289,7 @@ impl TerminalPane {
             || ks.key.starts_with('f') && ks.key.len() <= 3
         {
             if m.platform && ks.key == "c" {
-                if let Some(text) = self.session.as_ref().and_then(|s| s.selection_text()) {
+                if let Some(text) = self.snapshot.selection_text.clone() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                     return;
                 }
@@ -300,14 +319,8 @@ impl TerminalPane {
             }
         }
 
-        // Printable input: key_char carries the composed character (shift and
-        // option layers already applied by the platform).
-        if let Some(key_char) = &ks.key_char {
-            if !key_char.is_empty() {
-                self.write(key_char.as_bytes().to_vec());
-                self.scroll_to_bottom_on_input(cx);
-            }
-        }
+        // Printable input is delivered through the EntityInputHandler (IME
+        // path: dead keys, marked text, CJK); key_down handles only chords.
         let _ = window;
     }
 
@@ -353,6 +366,101 @@ struct Run {
     bold: bool,
     italic: bool,
     underline: bool,
+}
+
+/// IME-correct text input: composed text goes straight to the PTY; marked
+/// (in-composition) text is held and never sent until commit.
+impl gpui::EntityInputHandler for TerminalPane {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None // a terminal has no addressable backing text
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        Some(gpui::UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.marked_text
+            .as_ref()
+            .map(|text| 0..text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_text = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = None;
+        if !text.is_empty() {
+            self.write(text.as_bytes().to_vec());
+            self.scroll_to_bottom_on_input(cx);
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = Some(new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: gpui::Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        // Anchor the IME candidate window at the cursor cell.
+        let row = self.snapshot.cursor.row?;
+        let origin = gpui::point(
+            element_bounds.origin.x
+                + px(PADDING + self.snapshot.cursor.col as f32 * f32::from(self.cell_width)),
+            element_bounds.origin.y + px(PADDING + row as f32 * f32::from(self.line_height)),
+        );
+        Some(gpui::Bounds {
+            origin,
+            size: gpui::size(self.cell_width, self.line_height),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
@@ -473,8 +581,10 @@ impl Render for TerminalPane {
 
         // Cursor overlay (2px bar focused, hollow block unfocused; hidden when
         // the app hides it or it scrolled out of view).
+        let blink_visible = !focused || self.blink_on;
         let cursor_div = match (snapshot.cursor.style, snapshot.cursor.row) {
             (CursorStyle::Hidden, _) | (_, None) => None,
+            _ if !blink_visible => None,
             (style, Some(row)) => {
                 let left = px(PADDING + snapshot.cursor.col as f32 * f32::from(cell_w));
                 let top = px(PADDING + row as f32 * f32::from(line_h));
@@ -517,6 +627,10 @@ impl Render for TerminalPane {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.focus(window);
                     cx.emit(PaneEvent::Focused);
+                    let m = &event.modifiers;
+                    if m.platform || m.control || m.shift {
+                        return; // reserved-modifier clicks never reach the PTY
+                    }
                     // Cell math needs the pane's origin: derive from the event
                     // position within the hitbox — gpui reports window coords,
                     // and the pane's origin is tracked by the workspace via
@@ -573,6 +687,8 @@ impl Render for TerminalPane {
                 // during prepaint; applied on the next pump tick (no
                 // re-entrant entity updates from inside render).
                 let pending = std::sync::Arc::clone(&self.pending_bounds);
+                let entity = cx.entity();
+                let ime_focus = self.focus_handle.clone();
                 gpui::canvas(
                     move |bounds, _window, _cx| {
                         *pending.lock().unwrap() = Some((
@@ -581,8 +697,17 @@ impl Render for TerminalPane {
                             bounds.size.width,
                             bounds.size.height,
                         ));
+                        bounds
                     },
-                    |_, _, _, _| {},
+                    move |bounds, _, window, cx| {
+                        // Contract rev 2: printable text flows through the
+                        // platform IME pipeline, not key_down.
+                        window.handle_input(
+                            &ime_focus,
+                            gpui::ElementInputHandler::new(bounds, entity.clone()),
+                            cx,
+                        );
+                    },
                 )
                 .absolute()
                 .size_full()
@@ -636,7 +761,10 @@ impl TerminalPane {
         // Click-to-move guards (ported from the web app): prompt row only, at
         // bottom, no selection, no app mouse tracking, normal buffer implied
         // by mouse_tracking check + display_offset.
-        if !snapshot.mouse_tracking && snapshot.display_offset == 0 && snapshot.selection.is_empty()
+        if !snapshot.mouse_tracking
+            && !snapshot.alt_screen
+            && snapshot.display_offset == 0
+            && snapshot.selection.is_empty()
         {
             if let Some(cursor_row) = snapshot.cursor.row {
                 if let Some(bytes) = keys::click_to_move_bytes(

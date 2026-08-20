@@ -129,7 +129,7 @@ impl SessionManager {
         // Atomic write (tmp + rename): the Tauri and native apps share this
         // directory, so a reader must never observe a half-written file.
         let dest = self.file_for(name);
-        let tmp = dest.with_extension("json.tmp");
+        let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, pretty).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
         Ok(true)

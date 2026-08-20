@@ -76,8 +76,13 @@ fn main() {
             if let Some(workspace) = workspace_entity.clone() {
                 let handles = workspace.update(cx, |ws, ws_cx| ws.shutdown_all(ws_cx));
                 std::thread::spawn(move || {
+                    // ONE global deadline across every pane, not 3s each.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
                     for handle in handles {
-                        handle.join_with_deadline(Duration::from_secs(3));
+                        let remaining = deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .max(Duration::from_millis(50));
+                        handle.join_with_deadline(remaining);
                     }
                 });
             }

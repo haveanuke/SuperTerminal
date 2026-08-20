@@ -63,7 +63,7 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)
     }

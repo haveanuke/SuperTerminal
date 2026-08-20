@@ -175,6 +175,17 @@ impl Workspace {
         }
     }
 
+    /// Route keyboard focus to the currently-focused terminal's pane.
+    pub fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self
+            .focused_terminal
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+        {
+            pane.read(cx).focus(window);
+        }
+    }
+
     fn add_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         let terminal_id = self.fresh_id();
         self.spawn_pane(terminal_id.clone(), cwd, cx);
@@ -216,10 +227,13 @@ impl Workspace {
 
     fn close_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
         if let Some(pane) = self.panes.remove(terminal_id) {
-            let pending = Arc::clone(&self.pending_shutdowns);
             pane.update(cx, move |pane, _| {
                 if let Some(handle) = pane.shutdown() {
-                    pending.lock().unwrap().push(handle);
+                    // Reap immediately on a detached thread (bounded inside);
+                    // resources release now, not at app quit.
+                    std::thread::spawn(move || {
+                        handle.join_with_deadline(std::time::Duration::from_secs(3))
+                    });
                 }
             });
         }
@@ -286,6 +300,20 @@ impl Workspace {
         }
     }
 
+    fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(8.0, 32.0);
+        self.settings.font_size = size;
+        let _ = self.settings.save();
+        let theme = self.theme;
+        let family = self.settings.font_family.clone();
+        for pane in self.panes.values() {
+            pane.update(cx, |pane, pane_cx| {
+                pane.set_appearance(theme, &family, size, pane_cx)
+            });
+        }
+        cx.notify();
+    }
+
     fn refresh_sessions(&mut self) {
         self.session_names = self.session_manager.list();
         self.session_names.sort();
@@ -325,10 +353,11 @@ impl Workspace {
         let old_ids: Vec<String> = self.panes.keys().cloned().collect();
         for id in old_ids {
             if let Some(pane) = self.panes.remove(&id) {
-                let pending = Arc::clone(&self.pending_shutdowns);
                 pane.update(cx, move |pane, _| {
                     if let Some(handle) = pane.shutdown() {
-                        pending.lock().unwrap().push(handle);
+                        std::thread::spawn(move || {
+                            handle.join_with_deadline(std::time::Duration::from_secs(3))
+                        });
                     }
                 });
             }
@@ -687,8 +716,27 @@ impl Workspace {
                             )
                     })
                     .collect();
+                let font_size = self.settings.font_size;
                 Some(
                     self.modal_frame("Theme", cx)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(SharedString::from(format!("font size: {font_size:.0}")))
+                                .child(self.overlay_button(
+                                    "-",
+                                    |ws, cx| ws.set_font_size(ws.settings.font_size - 1.0, cx),
+                                    cx,
+                                ))
+                                .child(self.overlay_button(
+                                    "+",
+                                    |ws, cx| ws.set_font_size(ws.settings.font_size + 1.0, cx),
+                                    cx,
+                                )),
+                        )
                         .child(div().flex().flex_col().gap(px(2.0)).children(items))
                         .into_any_element(),
                 )
@@ -870,13 +918,21 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .bg(rgb(theme.ui_background))
-            .on_action(cx.listener(|ws, _: &NewTab, _, cx| ws.add_tab(None, cx)))
-            .on_action(cx.listener(|ws, _: &CloseFocused, _, cx| ws.close_focused(cx)))
-            .on_action(cx.listener(|ws, _: &SplitRight, _, cx| {
-                ws.split_focused(SplitDirection::Horizontal, cx)
+            .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
+                ws.add_tab(None, cx);
+                ws.focus_active_pane(window, cx);
             }))
-            .on_action(cx.listener(|ws, _: &SplitDown, _, cx| {
-                ws.split_focused(SplitDirection::Vertical, cx)
+            .on_action(cx.listener(|ws, _: &CloseFocused, window, cx| {
+                ws.close_focused(cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SplitRight, window, cx| {
+                ws.split_focused(SplitDirection::Horizontal, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SplitDown, window, cx| {
+                ws.split_focused(SplitDirection::Vertical, cx);
+                ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &ToggleThemePicker, _, cx| {
                 ws.overlay = if ws.overlay == Overlay::ThemePicker {
@@ -900,15 +956,42 @@ impl Render for Workspace {
                 ws.overlay = Overlay::Sessions;
                 cx.notify();
             }))
-            .on_action(cx.listener(|ws, _: &SelectTab1, _, cx| ws.select_tab(0, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab2, _, cx| ws.select_tab(1, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab3, _, cx| ws.select_tab(2, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab4, _, cx| ws.select_tab(3, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab5, _, cx| ws.select_tab(4, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab6, _, cx| ws.select_tab(5, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab7, _, cx| ws.select_tab(6, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab8, _, cx| ws.select_tab(7, cx)))
-            .on_action(cx.listener(|ws, _: &SelectTab9, _, cx| ws.select_tab(8, cx)))
+            .on_action(cx.listener(|ws, _: &SelectTab1, window, cx| {
+                ws.select_tab(0, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab2, window, cx| {
+                ws.select_tab(1, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab3, window, cx| {
+                ws.select_tab(2, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab4, window, cx| {
+                ws.select_tab(3, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab5, window, cx| {
+                ws.select_tab(4, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab6, window, cx| {
+                ws.select_tab(5, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab7, window, cx| {
+                ws.select_tab(6, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab8, window, cx| {
+                ws.select_tab(7, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &SelectTab9, window, cx| {
+                ws.select_tab(8, cx);
+                ws.focus_active_pane(window, cx);
+            }))
             .on_mouse_move(cx.listener(|ws, event: &MouseMoveEvent, _, cx| {
                 let Some(drag) = &ws.drag else { return };
                 let key = format!("{}:{:?}", drag.tab_index, drag.path);
