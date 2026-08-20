@@ -85,6 +85,8 @@ pub struct TerminalPane {
     /// Auto-run: (command, interval_secs, send_escape, escape_delay_secs).
     pub auto_run: Option<(String, u32, bool, u32)>,
     auto_run_tick: u32,
+    /// Last time PTY output arrived (drives the buddy quiet-detection).
+    pub last_activity: std::time::Instant,
     /// Pane origin in window coordinates (for mouse cell math), updated from
     /// the measuring canvas via `pending_bounds` on each pump tick.
     origin: (Pixels, Pixels),
@@ -164,6 +166,7 @@ impl TerminalPane {
                         cx.notify();
                     }
                     if pane.session.as_ref().is_some_and(|s| s.take_dirty()) {
+                        pane.last_activity = std::time::Instant::now();
                         pane.process_events(cx);
                         cx.notify();
                     }
@@ -218,6 +221,7 @@ impl TerminalPane {
             broadcast,
             auto_run: None,
             auto_run_tick: 0,
+            last_activity: std::time::Instant::now(),
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -304,6 +308,22 @@ impl TerminalPane {
             session.search_jump_next();
         }
         cx.notify();
+    }
+
+    /// Visible rows as plain text (buddy review context).
+    pub fn visible_text(&self) -> String {
+        self.snapshot
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn set_auto_run(&mut self, config: Option<(String, u32, bool, u32)>) {

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
@@ -94,6 +95,7 @@ pub struct Workspace {
     rename_field: Option<(usize, Entity<TextField>)>,
     auto_run_field: Option<Entity<TextField>>,
     search_field: Option<Entity<TextField>>,
+    buddy_field: Option<Entity<TextField>>,
     auto_run_interval: u32,
     auto_run_escape: bool,
     auto_run_escape_delay: u32,
@@ -107,6 +109,10 @@ pub struct Workspace {
     pending_shutdowns: Arc<Mutex<Vec<ShutdownHandle>>>,
     broadcast: Arc<BroadcastHub>,
     git_panel: Option<Entity<GitPanel>>,
+    /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
+    buddy_note: Option<String>,
+    buddy_busy: Arc<std::sync::atomic::AtomicBool>,
+    buddy_last_hash: u64,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -129,6 +135,7 @@ impl Workspace {
             rename_field: None,
             auto_run_field: None,
             search_field: None,
+            buddy_field: None,
             auto_run_interval: 5,
             auto_run_escape: false,
             auto_run_escape_delay: 2,
@@ -139,10 +146,109 @@ impl Workspace {
             pending_shutdowns: Arc::new(Mutex::new(Vec::new())),
             broadcast: Arc::new(BroadcastHub::default()),
             git_panel: None,
+            buddy_note: None,
+            buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            buddy_last_hash: 0,
             swap_source: None,
         };
         this.add_tab(None, cx);
+        cx.spawn(async move |ws, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            if ws
+                .update(cx, |ws: &mut Workspace, cx| ws.buddy_tick(cx))
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
         this
+    }
+
+    /// Buddy-as-reviewer: after a burst of terminal activity settles, send
+    /// the visible output plus the repo's working-tree diff to the configured
+    /// agent CLI and surface its one-line note in the bar.
+    fn buddy_tick(&mut self, cx: &mut Context<Self>) {
+        use std::hash::{Hash, Hasher};
+        if !self.settings.buddy_enabled
+            || self.settings.buddy_command.trim().is_empty()
+            || self.buddy_busy.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(pane) = self
+            .focused_terminal
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+        else {
+            return;
+        };
+        let pane_ref = pane.read(cx);
+        let quiet = pane_ref.last_activity.elapsed() >= Duration::from_secs(3);
+        if !quiet {
+            return;
+        }
+        let text = pane_ref.visible_text();
+        if text.trim().len() < 80 {
+            return;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let hash = hasher.finish();
+        if hash == self.buddy_last_hash {
+            return;
+        }
+        self.buddy_last_hash = hash;
+        let cwd = pane_ref.cwd();
+        let command = self.settings.buddy_command.clone();
+        let args = self.settings.buddy_args.clone();
+        let busy = Arc::clone(&self.buddy_busy);
+        busy.store(true, std::sync::atomic::Ordering::Relaxed);
+        cx.spawn(async move |ws, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    // Working-tree diff of the enclosing repo, capped.
+                    let diff = cwd
+                        .and_then(|cwd| {
+                            superterminal_core::git::process::run_git(
+                                Some(std::path::Path::new(&cwd)),
+                                &["diff", "--stat", "--patch", "--no-color"],
+                                false,
+                            )
+                            .ok()
+                        })
+                        .map(|out| {
+                            String::from_utf8_lossy(&out.stdout)
+                                .chars()
+                                .take(6000)
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    let tail: String = text.chars().rev().take(2000).collect::<String>()
+                        .chars().rev().collect();
+                    let prompt = format!(
+                        "You are a terse code reviewer embedded in a terminal. Given recent terminal output and the current working-tree git diff, reply with ONE short actionable observation (a bug, risk, or next step). No preamble.\n\nTERMINAL OUTPUT:\n{tail}\n\nWORKING DIFF:\n{diff}"
+                    );
+                    superterminal_core::buddy::run(superterminal_core::buddy::BuddyRequest {
+                        command,
+                        args,
+                        prompt,
+                        timeout_ms: Some(30_000),
+                    })
+                })
+                .await;
+            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                ws.buddy_busy
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if result.ok {
+                    ws.buddy_note = Some(result.text);
+                    cx.notify();
+                }
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
     }
 
     /// Collect shutdown handles for every live pane plus any pending ones.
@@ -610,7 +716,6 @@ impl Workspace {
                     .as_deref()
                     .is_some_and(|f| f == terminal_id);
                 let theme = self.theme;
-                let close_id = terminal_id.clone();
 
                 div()
                     .size_full()
@@ -622,68 +727,101 @@ impl Workspace {
                         theme.ui_border
                     }))
                     .child(pane.clone())
-                    .children(self.broadcast.is_enabled().then(|| {
-                        let member = self.broadcast.is_member(terminal_id);
-                        let toggle_id = terminal_id.clone();
+                    .child({
+                        // Per-terminal management cluster: always visible,
+                        // acts on THIS pane (no focus dance).
+                        let id_split_h = terminal_id.clone();
+                        let id_split_v = terminal_id.clone();
+                        let id_swap = terminal_id.clone();
+                        let id_timer = terminal_id.clone();
+                        let id_close = terminal_id.clone();
+                        let bc_on = self.broadcast.is_enabled();
+                        let bc_member = bc_on && self.broadcast.is_member(terminal_id);
+                        let id_bc = terminal_id.clone();
+                        let pane_btn = |label: &'static str| {
+                            div()
+                                .id(SharedString::from(format!("{label}-{terminal_id}")))
+                                .cursor_pointer()
+                                .px(px(4.0))
+                                .h(px(15.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(3.0))
+                                .text_size(px(9.0))
+                                .text_color(rgb(theme.ui_text_muted))
+                                .hover(|style| style.bg(rgb(theme.ui_border)))
+                                .child(SharedString::from(label))
+                        };
                         div()
-                            .id(SharedString::from(format!("bc-{terminal_id}")))
-                            .absolute()
-                            .top(px(2.0))
-                            .right(px(22.0))
-                            .px(px(4.0))
-                            .h(px(16.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(3.0))
-                            .cursor_pointer()
-                            .text_size(px(9.0))
-                            .bg(rgb(if member {
-                                theme.ui_accent
-                            } else {
-                                theme.ui_surface
-                            }))
-                            .text_color(rgb(if member {
-                                theme.ui_background
-                            } else {
-                                theme.ui_text_muted
-                            }))
-                            .child("bc")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |ws, _, _, cx| {
-                                    ws.broadcast.toggle_member(&toggle_id);
-                                    cx.notify();
-                                }),
-                            )
-                    }))
-                    .child(
-                        // Per-pane close: one click on any pane, focused or
-                        // not — no focus-then-close dance.
-                        div()
-                            .id(SharedString::from(format!("close-{terminal_id}")))
                             .absolute()
                             .top(px(2.0))
                             .right(px(2.0))
-                            .w(px(16.0))
-                            .h(px(16.0))
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .cursor_pointer()
-                            .text_size(px(10.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .opacity(0.55)
-                            .hover(|style| style.opacity(1.0).bg(rgb(theme.ui_border)))
-                            .child("x")
-                            .on_mouse_down(
+                            .gap(px(1.0))
+                            .px(px(2.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(theme.ui_surface))
+                            .opacity(0.75)
+                            .hover(|style| style.opacity(1.0))
+                            .children(bc_on.then(|| {
+                                pane_btn(if bc_member { "bc:on" } else { "bc:off" }).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |ws, _, _, cx| {
+                                        ws.broadcast.toggle_member(&id_bc);
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .child(pane_btn("split-h").on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {
-                                    ws.close_terminal(&close_id, cx);
+                                    ws.focused_terminal = Some(id_split_h.clone());
+                                    ws.split_focused(SplitDirection::Horizontal, cx);
                                     ws.focus_active_pane(window, cx);
                                 }),
-                            ),
-                    )
+                            ))
+                            .child(pane_btn("split-v").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    ws.focused_terminal = Some(id_split_v.clone());
+                                    ws.split_focused(SplitDirection::Vertical, cx);
+                                    ws.focus_active_pane(window, cx);
+                                }),
+                            ))
+                            .child(pane_btn("swap").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, _, cx| {
+                                    ws.swap_source =
+                                        if ws.swap_source.as_deref() == Some(id_swap.as_str()) {
+                                            None
+                                        } else {
+                                            Some(id_swap.clone())
+                                        };
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(pane_btn("timer").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, _, cx| {
+                                    ws.focused_terminal = Some(id_timer.clone());
+                                    ws.overlay = if ws.overlay == Overlay::AutoRun {
+                                        Overlay::None
+                                    } else {
+                                        Overlay::AutoRun
+                                    };
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(pane_btn("x").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    ws.close_terminal(&id_close, cx);
+                                    ws.focus_active_pane(window, cx);
+                                }),
+                            ))
+                    })
                     .into_any_element()
             }
             PaneNode::Split {
@@ -843,55 +981,6 @@ impl Workspace {
                                 .spawn();
                         })
                 }))
-                .child(self.overlay_button(
-                    "split-h",
-                    |ws, window, cx| {
-                        ws.split_focused(SplitDirection::Horizontal, cx);
-                        ws.focus_active_pane(window, cx);
-                    },
-                    cx,
-                ))
-                .child(self.overlay_button(
-                    "split-v",
-                    |ws, window, cx| {
-                        ws.split_focused(SplitDirection::Vertical, cx);
-                        ws.focus_active_pane(window, cx);
-                    },
-                    cx,
-                ))
-                .child(self.overlay_button(
-                    "close",
-                    |ws, window, cx| {
-                        ws.close_focused(cx);
-                        ws.focus_active_pane(window, cx);
-                    },
-                    cx,
-                ))
-                .child(self.overlay_button(
-                    "swap",
-                    |ws, _window, cx| {
-                        ws.swap_source = if ws.swap_source.is_some() {
-                            None
-                        } else {
-                            ws.focused_terminal.clone()
-                        };
-                        cx.notify();
-                    },
-                    cx,
-                ))
-                .child(self.overlay_button(
-                    "timer",
-                    |ws, window, cx| {
-                        ws.overlay = if ws.overlay == Overlay::AutoRun {
-                            Overlay::None
-                        } else {
-                            Overlay::AutoRun
-                        };
-                        let _ = window;
-                        cx.notify();
-                    },
-                    cx,
-                ))
                 .children(self.swap_source.is_some().then(|| {
                     div()
                         .text_size(px(10.0))
@@ -1015,6 +1104,69 @@ impl Workspace {
             }))
     }
 
+    fn render_buddy_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        if self.buddy_field.is_none() {
+            let theme_ref = self.theme;
+            let field = cx.new(|field_cx| {
+                TextField::new(
+                    "agent command, e.g. claude -p {prompt}",
+                    theme_ref,
+                    field_cx,
+                )
+            });
+            cx.subscribe(&field, |ws, _field, event: &TextFieldEvent, cx| {
+                if let TextFieldEvent::Submitted(line) = event {
+                    let mut parts = line.split_whitespace().map(String::from);
+                    if let Some(command) = parts.next() {
+                        ws.settings.buddy_command = command;
+                        let args: Vec<String> = parts.collect();
+                        ws.settings.buddy_args = if args.is_empty() {
+                            vec!["-p".to_string(), "{prompt}".to_string()]
+                        } else {
+                            args
+                        };
+                        ws.settings.buddy_enabled = true;
+                        let _ = ws.settings.save();
+                        cx.notify();
+                    }
+                }
+            })
+            .detach();
+            self.buddy_field = Some(field);
+        }
+        let enabled = self.settings.buddy_enabled;
+        let configured = !self.settings.buddy_command.trim().is_empty();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .child(div().w(px(72.0)).child("buddy"))
+            .child(self.overlay_button(
+                if enabled {
+                    "reviewer: on"
+                } else {
+                    "reviewer: off"
+                },
+                |ws, _window, cx| {
+                    ws.settings.buddy_enabled = !ws.settings.buddy_enabled;
+                    let _ = ws.settings.save();
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(div().flex_grow().child(self.buddy_field.clone().unwrap()))
+            .children(configured.then(|| {
+                div().text_size(px(10.0)).child(SharedString::from(format!(
+                    "using: {} {}",
+                    self.settings.buddy_command,
+                    self.settings.buddy_args.join(" ")
+                )))
+            }))
+    }
+
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut segments = Vec::new();
@@ -1087,6 +1239,17 @@ impl Workspace {
                 cx,
             ))
             .child(div().flex_grow())
+            .children(self.buddy_note.clone().map(|note| {
+                div()
+                    .id("buddy-note")
+                    .max_w(px(420.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(note))
+            }))
             .children(self.render_focused_controls(cx))
             .child({
                 let enabled = self.broadcast.is_enabled();
@@ -1258,6 +1421,7 @@ impl Workspace {
                         )
                         .child(self.render_font_family_row(window, cx))
                         .child(self.render_background_row(cx))
+                        .child(self.render_buddy_row(cx))
                         .into_any_element(),
                 )
             }

@@ -16,6 +16,10 @@ pub struct Settings {
     pub font_family: String,
     pub background_image: Option<String>,
     pub background_opacity: f32,
+    pub buddy_enabled: bool,
+    pub buddy_command: String,
+    /// `{prompt}` is substituted with the review prompt.
+    pub buddy_args: Vec<String>,
 }
 
 impl Default for Settings {
@@ -28,6 +32,9 @@ impl Default for Settings {
             font_family: "JetBrains Mono".to_string(),
             background_image: None,
             background_opacity: 0.3,
+            buddy_enabled: false,
+            buddy_command: String::new(),
+            buddy_args: vec!["-p".to_string(), "{prompt}".to_string()],
         }
     }
 }
@@ -110,6 +117,9 @@ mod tests {
             font_family: "Menlo".into(),
             background_image: Some("/tmp/bg.png".into()),
             background_opacity: 0.5,
+            buddy_enabled: true,
+            buddy_command: "claude".into(),
+            buddy_args: vec!["-p".into(), "{prompt}".into()],
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
