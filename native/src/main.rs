@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    px, size, App, Application, Bounds, Focusable, KeyBinding, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    px, size, App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
 };
 
 use workspace::{
@@ -63,7 +62,7 @@ fn main() {
                 },
                 |window, cx| {
                     let workspace = cx.new(Workspace::new);
-                    workspace.read(cx).focus_handle(cx).focus(window);
+                    workspace.update(cx, |ws, ws_cx| ws.focus_active_pane(window, ws_cx));
                     workspace
                 },
             )
@@ -79,9 +78,10 @@ fn main() {
                     // ONE global deadline across every pane, not 3s each.
                     let deadline = std::time::Instant::now() + Duration::from_secs(3);
                     for handle in handles {
-                        let remaining = deadline
-                            .saturating_duration_since(std::time::Instant::now())
-                            .max(Duration::from_millis(50));
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        // Past-deadline handles still get the SIGKILL+join
+                        // fast path inside join_with_deadline(0).
                         handle.join_with_deadline(remaining);
                     }
                 });

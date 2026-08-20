@@ -509,7 +509,7 @@ impl Workspace {
     fn overlay_button(
         &self,
         label: &'static str,
-        on_click: impl Fn(&mut Workspace, &mut Context<Workspace>) + 'static,
+        on_click: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
@@ -522,7 +522,7 @@ impl Workspace {
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |ws, _, _, cx| on_click(ws, cx)),
+                cx.listener(move |ws, _, window, cx| on_click(ws, window, cx)),
             )
     }
 
@@ -581,15 +581,22 @@ impl Workspace {
                 }))
                 .child(self.overlay_button(
                     "split-h",
-                    |ws, cx| ws.split_focused(SplitDirection::Horizontal, cx),
+                    |ws, _window, cx| ws.split_focused(SplitDirection::Horizontal, cx),
                     cx,
                 ))
                 .child(self.overlay_button(
                     "split-v",
-                    |ws, cx| ws.split_focused(SplitDirection::Vertical, cx),
+                    |ws, _window, cx| ws.split_focused(SplitDirection::Vertical, cx),
                     cx,
                 ))
-                .child(self.overlay_button("close", |ws, cx| ws.close_focused(cx), cx)),
+                .child(self.overlay_button(
+                    "close",
+                    |ws, window, cx| {
+                        ws.close_focused(cx);
+                        ws.focus_active_pane(window, cx);
+                    },
+                    cx,
+                )),
         )
     }
 
@@ -618,7 +625,10 @@ impl Workspace {
                     .child(SharedString::from(format!("{}:{}", index + 1, tab.label)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |ws, _, _, cx| ws.select_tab(index, cx)),
+                        cx.listener(move |ws, _, window, cx| {
+                            ws.select_tab(index, cx);
+                            ws.focus_active_pane(window, cx);
+                        }),
                     ),
             );
         }
@@ -636,12 +646,19 @@ impl Workspace {
             .border_color(rgb(theme.ui_border))
             .text_size(px(11.0))
             .children(segments)
-            .child(self.overlay_button("+", |ws, cx| ws.add_tab(None, cx), cx))
+            .child(self.overlay_button(
+                "+",
+                |ws, window, cx| {
+                    ws.add_tab(None, cx);
+                    ws.focus_active_pane(window, cx);
+                },
+                cx,
+            ))
             .child(div().flex_grow())
             .children(self.render_focused_controls(cx))
             .child(self.overlay_button(
                 "sessions",
-                |ws, cx| {
+                |ws, _window, cx| {
                     ws.refresh_sessions();
                     ws.overlay = if ws.overlay == Overlay::Sessions {
                         Overlay::None
@@ -654,7 +671,7 @@ impl Workspace {
             ))
             .child(self.overlay_button(
                 "theme",
-                |ws, cx| {
+                |ws, _window, cx| {
                     ws.overlay = if ws.overlay == Overlay::ThemePicker {
                         Overlay::None
                     } else {
@@ -728,12 +745,16 @@ impl Workspace {
                                 .child(SharedString::from(format!("font size: {font_size:.0}")))
                                 .child(self.overlay_button(
                                     "-",
-                                    |ws, cx| ws.set_font_size(ws.settings.font_size - 1.0, cx),
+                                    |ws, _window, cx| {
+                                        ws.set_font_size(ws.settings.font_size - 1.0, cx)
+                                    },
                                     cx,
                                 ))
                                 .child(self.overlay_button(
                                     "+",
-                                    |ws, cx| ws.set_font_size(ws.settings.font_size + 1.0, cx),
+                                    |ws, _window, cx| {
+                                        ws.set_font_size(ws.settings.font_size + 1.0, cx)
+                                    },
                                     cx,
                                 )),
                         )
