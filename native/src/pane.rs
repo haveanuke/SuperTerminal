@@ -243,6 +243,11 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// True once the shell process has exited (dead pane).
+    pub fn is_exited(&self) -> bool {
+        self.snapshot.exited.is_some()
+    }
+
     pub fn title(&self) -> String {
         self.snapshot
             .focused_title

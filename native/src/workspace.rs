@@ -63,6 +63,7 @@ type BoxedChipHandler = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Wor
 /// Which view the left sidebar shows; the rail tabs between them.
 #[derive(Clone, Copy, PartialEq)]
 enum SidebarView {
+    Projects,
     Git,
     Files,
 }
@@ -295,6 +296,11 @@ impl Workspace {
         // visibility. The panels dedupe unchanged paths, so this is cheap.
         if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
             self.push_git_cwd(cx);
+            // The projects view's activity dots decay with time alone, so
+            // repaint on the poll while it's open.
+            if self.sidebar_view == SidebarView::Projects {
+                cx.notify();
+            }
         }
         if !self.settings.buddy_pet_visible {
             return;
@@ -904,6 +910,7 @@ impl Workspace {
         };
         let active_view: Option<gpui::AnyElement> = if self.sidebar_open {
             match self.sidebar_view {
+                SidebarView::Projects => Some(self.render_projects_view(cx)),
                 SidebarView::Git => self.git_panel.clone().map(|panel| panel.into_any_element()),
                 SidebarView::Files => self
                     .files_panel
@@ -921,7 +928,7 @@ impl Workspace {
                 .flex_row()
                 .child(
                     div()
-                        .w(px(34.0))
+                        .w(px(46.0))
                         .h_full()
                         .flex_none()
                         .bg(rgb(theme.ui_surface))
@@ -932,6 +939,13 @@ impl Workspace {
                         .items_center()
                         .pt(px(6.0))
                         .gap(px(4.0))
+                        .child(rail_item(
+                            self,
+                            "rail-projects",
+                            "projects",
+                            SidebarView::Projects,
+                            cx,
+                        ))
                         .child(rail_item(self, "rail-git", "git", SidebarView::Git, cx))
                         .child(rail_item(
                             self,
@@ -945,10 +959,198 @@ impl Workspace {
         )
     }
 
+    /// Orca-style projects view: every tab is a project, with quick status
+    /// of the terminals inside it. Click a project to switch tabs; click a
+    /// terminal to jump straight to it.
+    fn render_projects_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            let active_tab = tab_index == self.active_tab;
+            let terminal_ids = collect_terminal_ids(&tab.pane);
+            let count = terminal_ids.len();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("project-{}", tab.id)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .when(active_tab, |d| d.bg(rgb(theme.ui_surface)))
+                    .hover(|style| style.bg(rgb(theme.ui_surface)))
+                    .child(
+                        div()
+                            .text_color(rgb(if active_tab {
+                                theme.ui_accent
+                            } else {
+                                theme.ui_text
+                            }))
+                            .child(SharedString::from(tab.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(format!(
+                                "{count} terminal{}",
+                                if count == 1 { "" } else { "s" }
+                            ))),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, window, cx| {
+                            ws.select_tab(tab_index, cx);
+                            ws.focus_active_pane(window, cx);
+                        }),
+                    )
+                    .into_any_element(),
+            );
+            for terminal_id in terminal_ids {
+                let Some(pane) = self.panes.get(&terminal_id) else {
+                    continue;
+                };
+                let pane_ref = pane.read(cx);
+                let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
+                let exited = pane_ref.is_exited();
+                let active_recently =
+                    pane_ref.last_activity.elapsed() < std::time::Duration::from_secs(3);
+                let title = pane_ref.title();
+                let cwd: SharedString = pane_ref
+                    .cwd()
+                    .map(|cwd| cwd.replace(&home, "~"))
+                    .unwrap_or_default()
+                    .into();
+                // Quick status dot: red = exited, green = output within the
+                // last 3s, muted = idle.
+                let dot_color = if exited {
+                    theme.red
+                } else if active_recently {
+                    theme.green
+                } else {
+                    theme.ui_border
+                };
+                let jump_id = terminal_id.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("project-term-{terminal_id}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .h(px(20.0))
+                        .pl(px(20.0))
+                        .pr(px(8.0))
+                        .cursor_pointer()
+                        .when(focused, |d| d.bg(rgb(theme.ui_surface)))
+                        .hover(|style| style.bg(rgb(theme.ui_surface)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(px(3.0))
+                                .bg(rgb(dot_color)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(px(120.0))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(10.0))
+                                .text_color(rgb(if focused {
+                                    theme.ui_accent
+                                } else {
+                                    theme.ui_text
+                                }))
+                                .child(SharedString::from(if exited {
+                                    "exited".to_string()
+                                } else {
+                                    title
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_grow()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(9.0))
+                                .text_color(rgb(theme.ui_text_muted))
+                                .child(cwd),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _, window, cx| {
+                                ws.focus_terminal_in_tab(tab_index, &jump_id, window, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .w(px(280.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme.ui_background))
+            .border_r_1()
+            .border_color(rgb(theme.ui_border))
+            .text_size(px(11.0))
+            .text_color(rgb(theme.ui_text))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(rgb(theme.ui_border))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child("PROJECTS"),
+            )
+            .child(
+                div()
+                    .id("projects-scroll")
+                    .flex_grow()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .py(px(2.0))
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// Jump to a specific terminal: select its tab and focus its pane.
+    fn focus_terminal_in_tab(
+        &mut self,
+        tab_index: usize,
+        terminal_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = tab_index;
+        self.focused_terminal = Some(terminal_id.to_string());
+        self.push_git_cwd(cx);
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
     fn open_sidebar(&mut self, view: SidebarView, cx: &mut Context<Self>) {
         self.sidebar_open = true;
         self.sidebar_view = view;
         match view {
+            SidebarView::Projects => {}
             SidebarView::Git => {
                 if self.git_panel.is_none() {
                     let theme = self.theme;
