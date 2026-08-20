@@ -1616,8 +1616,16 @@ impl Workspace {
         let y = y.clamp(34.0, (vh - PET_H).max(34.0));
         let right_edge = (x + PET_W).clamp(96.0f32.min(vw), (vw - 8.0).max(96.0f32.min(vw)));
         let max_w = (right_edge - 8.0).clamp(80.0, 280.0);
-        let headroom = y - 40.0;
-        let above = headroom >= 100.0;
+        // Pick the roomier side and never claim more height than it really
+        // has — a floor here would overlay the titlebar or the bottom bar in
+        // small windows. Skip the bubble entirely when neither side fits.
+        let headroom = (y - 40.0).max(0.0);
+        let below_room = (vh - y - PET_H - 46.0).max(0.0);
+        let above = headroom >= 100.0 || headroom >= below_room;
+        let space = if above { headroom } else { below_room };
+        if space < 16.0 {
+            return None;
+        }
         let bubble = div()
             .id("buddy-bubble")
             .absolute()
@@ -1648,12 +1656,12 @@ impl Workspace {
         Some(if above {
             bubble
                 .bottom(px(vh - y + 6.0))
-                .max_h(px(headroom.max(40.0)))
+                .max_h(px(space))
                 .into_any_element()
         } else {
             bubble
                 .top(px(y + PET_H + 6.0))
-                .max_h(px((vh - y - PET_H - 46.0).max(40.0)))
+                .max_h(px(space))
                 .into_any_element()
         })
     }
