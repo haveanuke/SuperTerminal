@@ -47,7 +47,16 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-codesign --force --deep --sign - "$APP"
+# A stable identity keeps macOS permission grants (TCC) across rebuilds —
+# ad-hoc signatures make every build look like a different app, so the
+# system re-prompts for folder access after each install.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "SuperTerminal Dev"; then
+    SIGN_ID="SuperTerminal Dev"
+else
+    SIGN_ID="-"
+fi
+codesign --force --deep --sign "$SIGN_ID" "$APP"
+echo "Signed with: $SIGN_ID"
 
 SIZE=$(du -sh "$APP" | cut -f1)
 echo "Bundled: $APP ($SIZE)"

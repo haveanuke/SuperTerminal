@@ -68,7 +68,7 @@ sessions/theme, and the focused terminal's title.
 Cmd+T new project, Cmd+N new window in the current project, Cmd+W close
 pane, Cmd+Shift+W close project, Cmd+1..9 switch
 tab, Cmd+D / Cmd+Shift+D split right/down, Cmd+O sessions, Cmd+S save
-session, Cmd+, theme picker, Cmd+F search scrollback, Cmd+Shift+G git
+session, Cmd+, settings, Cmd+F search scrollback, Cmd+Shift+G git
 sidebar. Terminal line editing: the same Cmd/Alt chords as the Tauri app;
 plain click or Option+Click moves the cursor on the prompt row; Cmd+Click
 opens URLs.

@@ -29,6 +29,11 @@ pub struct Settings {
     pub audio_cues: bool,
     /// Speak buddy review notes aloud (macOS `say`).
     pub buddy_tts: bool,
+    /// TTS voice name (None = system default), rate in words/min, and an
+    /// approximate pitch multiplier (mapped onto say's pbas command).
+    pub buddy_tts_voice: Option<String>,
+    pub buddy_tts_rate: u32,
+    pub buddy_tts_pitch: f32,
     /// Imported custom themes, in the old app's export JSON format.
     pub custom_themes: Vec<serde_json::Value>,
 }
@@ -51,6 +56,9 @@ impl Default for Settings {
             buddy_pet_pos: None,
             audio_cues: true,
             buddy_tts: false,
+            buddy_tts_voice: None,
+            buddy_tts_rate: 175,
+            buddy_tts_pitch: 1.0,
             custom_themes: Vec::new(),
         }
     }
@@ -147,6 +155,9 @@ mod tests {
             buddy_pet_pos: Some((120.0, 240.0)),
             audio_cues: false,
             buddy_tts: true,
+            buddy_tts_voice: Some("Samantha".into()),
+            buddy_tts_rate: 200,
+            buddy_tts_pitch: 1.2,
             custom_themes: Vec::new(),
         };
         s.save_to(&path).unwrap();

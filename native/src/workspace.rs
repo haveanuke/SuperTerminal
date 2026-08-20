@@ -38,7 +38,7 @@ gpui::actions!(
         CloseTab,
         SplitRight,
         SplitDown,
-        ToggleThemePicker,
+        ToggleSettingsSheet,
         ToggleSessions,
         SaveSessionAs,
         ToggleSearch,
@@ -81,7 +81,7 @@ pub fn sessions_dir() -> PathBuf {
 #[derive(Clone, Copy, PartialEq)]
 enum Overlay {
     None,
-    ThemePicker,
+    SettingsSheet,
     Sessions,
     AutoRun,
     Search,
@@ -168,6 +168,9 @@ pub struct Workspace {
     tts_child: Option<std::process::Child>,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
+    /// Installed `say` voices, loaded lazily for the alerts row.
+    tts_voices: Option<Vec<String>>,
+    tts_voices_loading: bool,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -255,6 +258,8 @@ impl Workspace {
             cue_track: HashMap::new(),
             tts_child: None,
             audio_children: Vec::new(),
+            tts_voices: None,
+            tts_voices_loading: false,
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -381,16 +386,91 @@ impl Workspace {
     }
 
     /// Speak a buddy note via macOS `say`, replacing any current speech.
+    /// Voice and rate are native flags; pitch approximates the old app's
+    /// multiplier through say's `[[pbas]]` embedded command (default base
+    /// ~47).
     fn speak_note(&mut self, text: &str) {
         if let Some(mut child) = self.tts_child.take() {
             let _ = child.kill();
             let _ = child.wait(); // reap
         }
         let capped: String = text.chars().take(400).collect();
-        self.tts_child = std::process::Command::new("/usr/bin/say")
-            .arg(capped)
-            .spawn()
-            .ok();
+        let mut command = std::process::Command::new("/usr/bin/say");
+        if let Some(voice) = &self.settings.buddy_tts_voice {
+            command.arg("-v").arg(voice);
+        }
+        command
+            .arg("-r")
+            .arg(self.settings.buddy_tts_rate.to_string());
+        let pitch = self.settings.buddy_tts_pitch;
+        let spoken = if (pitch - 1.0).abs() > 0.01 {
+            let pbas = (47.0 * pitch).clamp(20.0, 90.0);
+            format!("[[pbas {pbas:.0}]] {capped}")
+        } else {
+            capped
+        };
+        self.tts_child = command.arg(spoken).spawn().ok();
+    }
+
+    /// Load the installed voice list once (background, `say -v ?`).
+    fn load_tts_voices(&mut self, cx: &mut Context<Self>) {
+        if self.tts_voices.is_some() || self.tts_voices_loading {
+            return;
+        }
+        self.tts_voices_loading = true;
+        cx.spawn(async move |ws, cx| {
+            let voices = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("/usr/bin/say")
+                        .args(["-v", "?"])
+                        .output()
+                        .ok()
+                        .map(|out| {
+                            String::from_utf8_lossy(&out.stdout)
+                                .lines()
+                                .filter_map(|line| {
+                                    line.split("  ").next().map(|name| name.trim().to_string())
+                                })
+                                .filter(|name| !name.is_empty())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                ws.tts_voices = Some(voices);
+                ws.tts_voices_loading = false;
+                cx.notify();
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    /// Step the configured voice forward/backward through the installed
+    /// list ("system" default sits before the first entry).
+    fn step_tts_voice(&mut self, delta: i64) {
+        let Some(voices) = &self.tts_voices else {
+            return;
+        };
+        if voices.is_empty() {
+            return;
+        }
+        let current = self
+            .settings
+            .buddy_tts_voice
+            .as_ref()
+            .and_then(|v| voices.iter().position(|name| name == v))
+            .map(|i| i as i64)
+            .unwrap_or(-1); // -1 = system default
+        let next = (current + delta).clamp(-1, voices.len() as i64 - 1);
+        self.settings.buddy_tts_voice = if next < 0 {
+            None
+        } else {
+            Some(voices[next as usize].clone())
+        };
+        let _ = self.settings.save();
     }
 
     /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
@@ -1026,7 +1106,7 @@ impl Workspace {
         if self.overlay == Overlay::PetCard && self.pet_card_from_theme {
             self.pet_card_from_theme = false;
             self.pet_reroll_armed = false;
-            self.overlay = Overlay::ThemePicker;
+            self.overlay = Overlay::SettingsSheet;
             window.focus(&self.focus_handle);
             cx.notify();
             return;
@@ -2498,60 +2578,127 @@ impl Workspace {
 
     fn render_alerts_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        if self.settings.buddy_tts {
+            self.load_tts_voices(cx);
+        }
+        let voice_label = self
+            .settings
+            .buddy_tts_voice
+            .clone()
+            .unwrap_or_else(|| "system voice".to_string());
+        let rate = self.settings.buddy_tts_rate;
+        let pitch = self.settings.buddy_tts_pitch;
+        let voice_line = self.settings.buddy_tts.then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().w(px(72.0)))
+                .child(self.stepper(
+                    "tts-voice",
+                    voice_label,
+                    |ws, _window, _cx| ws.step_tts_voice(-1),
+                    |ws, _window, _cx| ws.step_tts_voice(1),
+                    cx,
+                ))
+                .child(self.stepper(
+                    "tts-rate",
+                    format!("{rate} wpm"),
+                    |ws, _window, _cx| {
+                        ws.settings.buddy_tts_rate =
+                            ws.settings.buddy_tts_rate.saturating_sub(10).max(80);
+                        let _ = ws.settings.save();
+                    },
+                    |ws, _window, _cx| {
+                        ws.settings.buddy_tts_rate = (ws.settings.buddy_tts_rate + 10).min(300);
+                        let _ = ws.settings.save();
+                    },
+                    cx,
+                ))
+                .child(self.stepper(
+                    "tts-pitch",
+                    format!("pitch {pitch:.1}"),
+                    |ws, _window, _cx| {
+                        ws.settings.buddy_tts_pitch = (ws.settings.buddy_tts_pitch - 0.1).max(0.5);
+                        let _ = ws.settings.save();
+                    },
+                    |ws, _window, _cx| {
+                        ws.settings.buddy_tts_pitch = (ws.settings.buddy_tts_pitch + 0.1).min(2.0);
+                        let _ = ws.settings.save();
+                    },
+                    cx,
+                ))
+                .child(self.chip_button(
+                    "preview",
+                    false,
+                    |ws, _window, _cx| {
+                        ws.speak_note("Hello! This is your buddy's voice.");
+                    },
+                    cx,
+                ))
+        });
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
+            .flex_col()
+            .gap(px(5.0))
             .text_color(rgb(theme.ui_text_muted))
-            .child(div().w(px(72.0)).child("alerts"))
-            .child(self.chip_button(
-                if self.settings.audio_cues {
-                    "cues: on"
-                } else {
-                    "cues: off"
-                },
-                self.settings.audio_cues,
-                |ws, _window, cx| {
-                    ws.settings.audio_cues = !ws.settings.audio_cues;
-                    let _ = ws.settings.save();
-                    if ws.settings.audio_cues {
-                        // Resnapshot so transitions that happened while
-                        // disabled don't chime retroactively.
-                        ws.cue_track.clear();
-                        if let Some(child) = play_sound("Glass") {
-                            ws.audio_children.push(child);
-                        }
-                    }
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(self.chip_button(
-                if self.settings.buddy_tts {
-                    "buddy voice: on"
-                } else {
-                    "buddy voice: off"
-                },
-                self.settings.buddy_tts,
-                |ws, _window, cx| {
-                    ws.settings.buddy_tts = !ws.settings.buddy_tts;
-                    let _ = ws.settings.save();
-                    if ws.settings.buddy_tts {
-                        ws.speak_note("buddy voice on");
-                    } else if let Some(mut child) = ws.tts_child.take() {
-                        let _ = child.kill();
-                        let _ = child.wait(); // reap
-                    }
-                    cx.notify();
-                },
-                cx,
-            ))
             .child(
                 div()
-                    .text_size(px(10.0))
-                    .child("terminal done: Glass - awaiting input: Ping"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("alerts"))
+                    .child(self.chip_button(
+                        if self.settings.audio_cues {
+                            "cues: on"
+                        } else {
+                            "cues: off"
+                        },
+                        self.settings.audio_cues,
+                        |ws, _window, cx| {
+                            ws.settings.audio_cues = !ws.settings.audio_cues;
+                            let _ = ws.settings.save();
+                            if ws.settings.audio_cues {
+                                // Resnapshot so transitions that happened
+                                // while disabled don't chime retroactively.
+                                ws.cue_track.clear();
+                                if let Some(child) = play_sound("Glass") {
+                                    ws.audio_children.push(child);
+                                }
+                            }
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        if self.settings.buddy_tts {
+                            "buddy voice: on"
+                        } else {
+                            "buddy voice: off"
+                        },
+                        self.settings.buddy_tts,
+                        |ws, _window, cx| {
+                            ws.settings.buddy_tts = !ws.settings.buddy_tts;
+                            let _ = ws.settings.save();
+                            if ws.settings.buddy_tts {
+                                ws.speak_note("buddy voice on");
+                            } else if let Some(mut child) = ws.tts_child.take() {
+                                let _ = child.kill();
+                                let _ = child.wait(); // reap
+                            }
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .child("terminal done: Glass - awaiting input: Ping"),
+                    ),
             )
+            .children(voice_line)
     }
 
     /// Configure and enable the reviewer with a preset agent command.
@@ -2595,7 +2742,7 @@ impl Workspace {
             field.read(cx).focus(window);
         }
         self.pet_reroll_armed = false;
-        self.pet_card_from_theme = self.overlay == Overlay::ThemePicker;
+        self.pet_card_from_theme = self.overlay == Overlay::SettingsSheet;
         self.overlay = Overlay::PetCard;
         // Keep the name field focused past the root's click-to-focus.
         window.prevent_default();
@@ -2852,14 +2999,14 @@ impl Workspace {
                 cx,
             ))
             .child(self.overlay_button(
-                "theme",
+                "settings",
                 |ws, window, cx| {
                     ws.leave_search_highlights(cx);
-                    ws.overlay = if ws.overlay == Overlay::ThemePicker {
+                    ws.overlay = if ws.overlay == Overlay::SettingsSheet {
                         Overlay::None
                     } else {
                         window.focus(&ws.focus_handle);
-                        Overlay::ThemePicker
+                        Overlay::SettingsSheet
                     };
                     cx.notify();
                 },
@@ -2875,7 +3022,7 @@ impl Workspace {
         let theme = self.theme;
         match self.overlay {
             Overlay::None => None,
-            Overlay::ThemePicker => {
+            Overlay::SettingsSheet => {
                 let current = self.settings.theme.clone();
                 let chips: Vec<_> = themes::all_themes()
                     .into_iter()
@@ -2936,7 +3083,7 @@ impl Workspace {
                     .collect();
                 let font_size = self.settings.font_size;
                 Some(
-                    self.sheet("theme", "click to apply - esc closes", cx)
+                    self.sheet("settings", "click to apply - esc closes", cx)
                         .child(
                             div()
                                 .flex()
@@ -3630,13 +3777,13 @@ impl Render for Workspace {
                 ws.split_focused(SplitDirection::Vertical, cx);
                 ws.focus_active_pane(window, cx);
             }))
-            .on_action(cx.listener(|ws, _: &ToggleThemePicker, window, cx| {
+            .on_action(cx.listener(|ws, _: &ToggleSettingsSheet, window, cx| {
                 ws.leave_search_highlights(cx);
-                ws.overlay = if ws.overlay == Overlay::ThemePicker {
+                ws.overlay = if ws.overlay == Overlay::SettingsSheet {
                     Overlay::None
                 } else {
                     window.focus(&ws.focus_handle);
-                    Overlay::ThemePicker
+                    Overlay::SettingsSheet
                 };
                 cx.notify();
             }))
