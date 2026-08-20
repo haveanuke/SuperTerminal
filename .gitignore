@@ -10,3 +10,4 @@ release/
 *.exe
 .env
 .env.*
+.claude/
