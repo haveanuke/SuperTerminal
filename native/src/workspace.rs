@@ -134,6 +134,9 @@ pub struct Workspace {
     files_panel: Option<Entity<crate::files_panel::FilesPanel>>,
     sidebar_open: bool,
     sidebar_view: SidebarView,
+    /// cwd per terminal for the projects view, refreshed on the sidebar
+    /// poll — rendering must never do per-pane process queries itself.
+    sidebar_cwd_cache: HashMap<String, String>,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -215,6 +218,7 @@ impl Workspace {
             files_panel: None,
             sidebar_open: false,
             sidebar_view: SidebarView::Git,
+            sidebar_cwd_cache: HashMap::new(),
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -296,9 +300,20 @@ impl Workspace {
         // visibility. The panels dedupe unchanged paths, so this is cheap.
         if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
             self.push_git_cwd(cx);
-            // The projects view's activity dots decay with time alone, so
-            // repaint on the poll while it's open.
+            // The projects view's activity dots decay with time alone and
+            // its cwd column comes from this cache — refresh both on the
+            // poll while it's open, never during render.
             if self.sidebar_view == SidebarView::Projects {
+                let home = std::env::var("HOME").unwrap_or_default();
+                self.sidebar_cwd_cache = self
+                    .panes
+                    .iter()
+                    .filter_map(|(id, pane)| {
+                        pane.read(cx)
+                            .cwd()
+                            .map(|cwd| (id.clone(), cwd.replace(&home, "~")))
+                    })
+                    .collect();
                 cx.notify();
             }
         }
@@ -964,12 +979,12 @@ impl Workspace {
     /// terminal to jump straight to it.
     fn render_projects_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
-        let home = std::env::var("HOME").unwrap_or_default();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             let active_tab = tab_index == self.active_tab;
             let terminal_ids = collect_terminal_ids(&tab.pane);
             let count = terminal_ids.len();
+            let project_tab_id = tab.id.clone();
             rows.push(
                 div()
                     .id(SharedString::from(format!("project-{}", tab.id)))
@@ -1003,8 +1018,13 @@ impl Workspace {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |ws, _, window, cx| {
-                            ws.select_tab(tab_index, cx);
-                            ws.focus_active_pane(window, cx);
+                            // Resolve the STABLE tab id at click time — a
+                            // captured index goes stale if tabs close.
+                            if let Some(index) = ws.tabs.iter().position(|t| t.id == project_tab_id)
+                            {
+                                ws.select_tab(index, cx);
+                                ws.focus_active_pane(window, cx);
+                            }
                         }),
                     )
                     .into_any_element(),
@@ -1015,20 +1035,19 @@ impl Workspace {
                 };
                 let pane_ref = pane.read(cx);
                 let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
-                let exited = pane_ref.is_exited();
                 let active_recently =
                     pane_ref.last_activity.elapsed() < std::time::Duration::from_secs(3);
                 let title = pane_ref.title();
-                let cwd: SharedString = pane_ref
-                    .cwd()
-                    .map(|cwd| cwd.replace(&home, "~"))
+                let cwd: SharedString = self
+                    .sidebar_cwd_cache
+                    .get(&terminal_id)
+                    .cloned()
                     .unwrap_or_default()
                     .into();
-                // Quick status dot: red = exited, green = output within the
-                // last 3s, muted = idle.
-                let dot_color = if exited {
-                    theme.red
-                } else if active_recently {
+                // Quick status dot: green = output within the last 3s,
+                // muted = idle. (Exited panes close themselves, so there is
+                // no dead state to show.)
+                let dot_color = if active_recently {
                     theme.green
                 } else {
                     theme.ui_border
@@ -1068,11 +1087,7 @@ impl Workspace {
                                 } else {
                                     theme.ui_text
                                 }))
-                                .child(SharedString::from(if exited {
-                                    "exited".to_string()
-                                } else {
-                                    title
-                                })),
+                                .child(SharedString::from(title)),
                         )
                         .child(
                             div()
@@ -1087,7 +1102,7 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |ws, _, window, cx| {
-                                ws.focus_terminal_in_tab(tab_index, &jump_id, window, cx);
+                                ws.focus_terminal_by_id(&jump_id, window, cx);
                             }),
                         )
                         .into_any_element(),
@@ -1128,17 +1143,21 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Jump to a specific terminal: select its tab and focus its pane.
-    fn focus_terminal_in_tab(
+    /// Jump to a specific terminal: resolve its OWNING tab at call time
+    /// (captured indices go stale), select it, focus the pane.
+    fn focus_terminal_by_id(
         &mut self,
-        tab_index: usize,
         terminal_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if tab_index >= self.tabs.len() {
+        let Some(tab_index) = self
+            .tabs
+            .iter()
+            .position(|tab| collect_terminal_ids(&tab.pane).contains(&terminal_id.to_string()))
+        else {
             return;
-        }
+        };
         self.active_tab = tab_index;
         self.focused_terminal = Some(terminal_id.to_string());
         self.push_git_cwd(cx);
