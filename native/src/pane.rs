@@ -344,16 +344,20 @@ impl TerminalPane {
     }
 
     fn measure_cell(&mut self, window: &mut Window, cx: &mut App) {
-        // Pick the first INSTALLED family from the fallback chain, then
-        // measure by shaping through the same pipeline that renders rows —
-        // measuring a different font than the one that draws is exactly how
-        // the cursor drifts ahead of the text.
+        // Pick the first INSTALLED family from the fallback chain that is
+        // actually MONOSPACE, then measure by shaping through the same
+        // pipeline that renders rows — measuring a different font than the
+        // one that draws (or letting a proportional font in at all) is
+        // exactly how the cursor drifts away from the text.
         if self.resolved_family.is_none() {
             let available = window.text_system().all_font_names();
             let preferred = self.font_family.to_string();
             let resolved = [preferred.as_str(), "Menlo", "Monaco"]
                 .into_iter()
-                .find(|candidate| available.iter().any(|name| name == candidate))
+                .find(|candidate| {
+                    available.iter().any(|name| name == candidate)
+                        && Self::family_is_monospace(candidate, self.font_size, window)
+                })
                 .unwrap_or("Menlo")
                 .to_string();
             self.resolved_family = Some(resolved.into());
@@ -379,6 +383,31 @@ impl TerminalPane {
         }
         self.line_height = px((self.font_size * 1.4).round());
         let _ = cx;
+    }
+
+    /// True when wide and narrow probe strings shape to (nearly) the same
+    /// width — the property terminal grid math depends on.
+    pub fn family_is_monospace(family: &str, font_size: f32, window: &mut Window) -> bool {
+        let shape = |text: &'static str| -> f32 {
+            let text: SharedString = text.into();
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: gpui::font(family.to_string()),
+                color: gpui::Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text, px(font_size), &[run], None)
+                    .width,
+            )
+        };
+        let wide = shape("MMMMMMMMMM");
+        let narrow = shape("iiiiiiiiii");
+        wide > 0.0 && ((wide - narrow).abs() / wide) < 0.02
     }
 
     fn grid_size_for(&self, bounds_w: Pixels, bounds_h: Pixels) -> (usize, usize) {

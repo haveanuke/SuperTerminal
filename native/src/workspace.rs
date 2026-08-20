@@ -1422,6 +1422,8 @@ impl Workspace {
             .all_font_names()
             .into_iter()
             .filter(|name| MONO_HINTS.iter().any(|hint| name.contains(hint)))
+            // Name hints admit traps like "Fira Sans"; verify by measuring.
+            .filter(|name| TerminalPane::family_is_monospace(name, self.settings.font_size, window))
             .collect();
         families.sort();
         families.dedup();
@@ -1692,6 +1694,8 @@ impl Workspace {
         self.pet_reroll_armed = false;
         self.pet_card_from_theme = self.overlay == Overlay::ThemePicker;
         self.overlay = Overlay::PetCard;
+        // Keep the name field focused past the root's click-to-focus.
+        window.prevent_default();
         cx.notify();
     }
 
@@ -1937,6 +1941,11 @@ impl Workspace {
                             }
                             if event.click_count >= 2 {
                                 ws.start_tab_rename(index, window, cx);
+                                // The workspace root tracks focus and would
+                                // re-focus itself at the end of dispatch,
+                                // stealing focus from the rename field —
+                                // gpui suppresses that via prevent_default.
+                                window.prevent_default();
                             } else {
                                 ws.select_tab(index, cx);
                                 ws.focus_active_pane(window, cx);
