@@ -45,6 +45,62 @@ pub struct GraphData {
 const FIELD_SEP: char = '\u{1f}';
 pub const MAX_LIMIT: u32 = 1000;
 
+/// One file touched by a commit: a status letter (M/A/D/R/C/T) plus the
+/// display path ("old -> new" for renames/copies).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFileChange {
+    pub status: String,
+    pub path: String,
+}
+
+/// Files changed by `hash`, from `git show --name-status`.
+pub fn run_commit_files(
+    state: &GitState,
+    repo_id: &str,
+    hash: &str,
+) -> Result<Vec<CommitFileChange>, String> {
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.is_empty() {
+        return Err("invalid commit hash".to_string());
+    }
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
+    let out = run_git(
+        Some(&entry.root),
+        &["show", "--name-status", "--format=", "-z", hash],
+        false,
+    )?;
+    Ok(parse_name_status(&out.stdout))
+}
+
+/// Parse `-z` name-status output: STATUS NUL PATH NUL, with renames/copies
+/// carrying two paths (old NUL new).
+pub fn parse_name_status(bytes: &[u8]) -> Vec<CommitFileChange> {
+    let mut changes = Vec::new();
+    let mut fields = bytes
+        .split(|&b| b == 0)
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .filter(|field| !field.is_empty());
+    while let Some(status_field) = fields.next() {
+        let status_letter = status_field.chars().next().unwrap_or('?');
+        let Some(first_path) = fields.next() else {
+            break;
+        };
+        let path = if matches!(status_letter, 'R' | 'C') {
+            match fields.next() {
+                Some(new_path) => format!("{first_path} -> {new_path}"),
+                None => first_path,
+            }
+        } else {
+            first_path
+        };
+        changes.push(CommitFileChange {
+            status: status_letter.to_string(),
+            path,
+        });
+    }
+    changes
+}
+
 /// Records are NUL-separated; six fields split on \x1f with the subject LAST
 /// and parsed with a bounded split, so a subject containing \x1f survives.
 pub fn parse_log(bytes: &[u8]) -> Vec<CommitNode> {
@@ -215,6 +271,31 @@ pub fn run_graph(state: &GitState, repo_id: &str, limit: u32) -> Result<GraphDat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_status_parses_plain_and_renames() {
+        let raw = b"M\0src/main.rs\0A\0new.txt\0R100\0old.rs\0new.rs\0D\0gone.md\0";
+        let changes = parse_name_status(raw);
+        assert_eq!(changes.len(), 4);
+        assert_eq!(changes[0].status, "M");
+        assert_eq!(changes[0].path, "src/main.rs");
+        assert_eq!(changes[2].status, "R");
+        assert_eq!(changes[2].path, "old.rs -> new.rs");
+        assert_eq!(changes[3].status, "D");
+    }
+
+    #[test]
+    fn name_status_survives_truncated_input() {
+        assert_eq!(parse_name_status(b"M\0").len(), 0);
+        assert_eq!(parse_name_status(b"").len(), 0);
+    }
+
+    #[test]
+    fn commit_files_rejects_non_hex_hashes() {
+        let state = GitState::default();
+        assert!(run_commit_files(&state, "x", "HEAD; rm -rf /").is_err());
+        assert!(run_commit_files(&state, "x", "").is_err());
+    }
 
     fn c(hash: &str, parents: &[&str]) -> CommitNode {
         CommitNode {

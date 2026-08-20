@@ -12,7 +12,7 @@ use gpui::prelude::*;
 use gpui::{div, px, rgb, Context, Entity, EventEmitter, MouseButton, SharedString, Window};
 
 use superterminal_core::git::actions::{ActionKind, ActionResult};
-use superterminal_core::git::graph::GraphData;
+use superterminal_core::git::graph::{CommitFileChange, GraphData};
 use superterminal_core::git::status::{StatusEntry, StatusReport};
 use superterminal_core::git::{self, GitState, RepoInfo};
 
@@ -51,6 +51,10 @@ pub struct GitPanel {
     /// Two-click discard confirm: path armed by the first click. Discarding
     /// an untracked entry deletes it permanently, so nothing runs unarmed.
     pending_discard: Option<String>,
+    /// Commit expanded in the history view, and its fetched files.
+    expanded_commit: Option<String>,
+    expanded_files: Option<Vec<CommitFileChange>>,
+    files_seq: u64,
 }
 
 pub struct PanelClosed;
@@ -102,6 +106,9 @@ impl GitPanel {
             generation: 0,
             graph_seq: 0,
             pending_discard: None,
+            expanded_commit: None,
+            expanded_files: None,
+            files_seq: 0,
         }
     }
 
@@ -138,6 +145,8 @@ impl GitPanel {
                     panel.report = None;
                     panel.graph = None;
                     panel.pending_discard = None;
+                    panel.expanded_commit = None;
+                    panel.expanded_files = None;
                     panel.refresh_status(cx);
                     panel.refresh_graph(cx);
                 }
@@ -316,17 +325,63 @@ impl GitPanel {
         .detach();
     }
 
-    fn button(&self, label: &'static str, op: GitOp, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Expand a commit to show its changed files (VS Code's history view);
+    /// clicking the expanded commit again collapses it.
+    fn toggle_commit(&mut self, hash: String, cx: &mut Context<Self>) {
+        if self.expanded_commit.as_ref() == Some(&hash) {
+            self.expanded_commit = None;
+            self.expanded_files = None;
+            cx.notify();
+            return;
+        }
+        self.expanded_commit = Some(hash.clone());
+        self.expanded_files = None;
+        self.files_seq += 1;
+        let seq = self.files_seq;
+        let generation = self.generation;
+        let state = Arc::clone(&self.state);
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |panel, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    superterminal_core::git::graph::run_commit_files(&state, &repo.repo_id, &hash)
+                })
+                .await;
+            let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
+                if panel.generation != generation || panel.files_seq != seq {
+                    return;
+                }
+                if let Ok(files) = result {
+                    panel.expanded_files = Some(files);
+                    cx.notify();
+                }
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    /// Bordered chip for header actions (fetch/pull/push/publish, bulk ops).
+    fn chip(&self, label: &'static str, op: GitOp, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let disabled = self.busy;
         div()
-            .id(SharedString::from(format!("git-{label}")))
+            .id(SharedString::from(format!("git-chip-{label}")))
             .cursor_pointer()
-            .px(px(5.0))
-            .rounded(px(3.0))
-            .text_color(rgb(theme.ui_text_muted))
+            .px(px(6.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(rgb(theme.ui_border))
+            .bg(rgb(theme.ui_surface))
+            .text_size(px(10.0))
+            .text_color(rgb(theme.ui_text))
             .opacity(if disabled { 0.4 } else { 1.0 })
-            .hover(|style| style.bg(rgb(theme.ui_border)))
+            .hover(|style| style.border_color(rgb(theme.ui_accent)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -338,10 +393,44 @@ impl GitPanel {
             )
     }
 
-    /// Discard is destructive (untracked entries are deleted outright, via
-    /// `git clean`), so it arms on the first click and only runs on the
-    /// second. Any other panel action disarms it.
-    fn discard_button(
+    /// Small square row action ("+" stage, "-" unstage), VS Code style.
+    fn glyph_button(
+        &self,
+        id: String,
+        glyph: &'static str,
+        op: GitOp,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id(SharedString::from(id))
+            .cursor_pointer()
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .hover(|style| {
+                style
+                    .bg(rgb(theme.ui_border))
+                    .text_color(rgb(theme.ui_text))
+            })
+            .child(SharedString::from(glyph))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _, _, cx| {
+                    if !panel.busy {
+                        panel.run(op.clone(), cx);
+                    }
+                }),
+            )
+    }
+
+    /// Discard with a two-click confirm; `path` may be the `"*"` sentinel
+    /// for "discard all changes" (resolved to explicit paths on confirm).
+    fn discard_control(
         &self,
         path: String,
         untracked: bool,
@@ -350,24 +439,28 @@ impl GitPanel {
         let theme = self.theme;
         let armed = self.pending_discard.as_deref() == Some(path.as_str());
         let label = if !armed {
-            "discard"
+            "\u{21a9}"
         } else if untracked {
-            "delete file?"
+            "delete?"
         } else {
             "sure?"
         };
         div()
             .id(SharedString::from(format!("git-discard-{path}")))
             .cursor_pointer()
-            .px(px(5.0))
+            .h(px(16.0))
+            .px(px(if armed { 4.0 } else { 0.0 }))
+            .min_w(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded(px(3.0))
             .text_color(rgb(if armed {
                 theme.red
             } else {
                 theme.ui_text_muted
             }))
-            .opacity(if self.busy { 0.4 } else { 1.0 })
-            .hover(|style| style.bg(rgb(theme.ui_border)))
+            .hover(|style| style.bg(rgb(theme.ui_border)).text_color(rgb(theme.red)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -376,7 +469,24 @@ impl GitPanel {
                         return;
                     }
                     if panel.pending_discard.as_deref() == Some(path.as_str()) {
-                        panel.run(GitOp::Discard(vec![path.clone()]), cx);
+                        let paths = if path == "*" {
+                            panel
+                                .report
+                                .iter()
+                                .flat_map(|r| r.entries.iter())
+                                .filter(|e| {
+                                    e.actionable
+                                        && e.kind != "unmerged"
+                                        && (e.kind == "untracked" || e.worktree_status != ".")
+                                })
+                                .map(|e| e.path.clone())
+                                .collect()
+                        } else {
+                            vec![path.clone()]
+                        };
+                        if !paths.is_empty() {
+                            panel.run(GitOp::Discard(paths), cx);
+                        }
                     } else {
                         panel.pending_discard = Some(path.clone());
                         cx.notify();
@@ -385,6 +495,22 @@ impl GitPanel {
             )
     }
 
+    fn status_color(&self, letter: &str, conflict: bool) -> u32 {
+        let theme = self.theme;
+        if conflict {
+            return theme.red;
+        }
+        match letter {
+            "M" | "T" => theme.yellow,
+            "A" | "U" | "?" => theme.green,
+            "D" => theme.red,
+            "R" | "C" => theme.blue,
+            _ => theme.ui_text_muted,
+        }
+    }
+
+    /// A file row, VS Code style: colored basename, muted directory, then
+    /// actions and the status letter on the right.
     fn entry_row(
         &self,
         entry: &StatusEntry,
@@ -392,6 +518,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
+        let conflict = entry.kind == "unmerged";
         let letter = if staged {
             entry.index_status.clone()
         } else if entry.kind == "untracked" {
@@ -399,37 +526,41 @@ impl GitPanel {
         } else {
             entry.worktree_status.clone()
         };
-        let color = match letter.as_str() {
-            "M" => theme.yellow,
-            "A" => theme.green,
-            "D" => theme.red,
-            "U" => theme.magenta,
-            "R" | "C" => theme.blue,
-            _ => theme.ui_text_muted,
-        };
+        let color = self.status_color(&letter, conflict);
         let display = match &entry.orig_path {
             Some(orig) => format!("{orig} -> {}", entry.path),
             None => entry.path.clone(),
         };
+        // basename + parent dir, unless it's a rename arrow display.
+        let (name, dir) = if display.contains(" -> ") {
+            (display.clone(), String::new())
+        } else {
+            match display.rsplit_once('/') {
+                Some((dir, name)) => (name.to_string(), dir.to_string()),
+                None => (display.clone(), String::new()),
+            }
+        };
         let path = entry.path.clone();
         let actionable = entry.actionable;
-        let conflict = entry.kind == "unmerged";
         div()
+            .id(SharedString::from(format!("git-entry-{}", entry.path)))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(6.0))
-            .py(px(1.0))
-            .rounded(px(3.0))
-            .opacity(if actionable { 1.0 } else { 0.5 })
+            .h(px(22.0))
+            .px(px(8.0))
+            .opacity(if actionable { 1.0 } else { 0.6 })
             .hover(|style| style.bg(rgb(theme.ui_surface)))
             .child(
                 div()
-                    .w(px(12.0))
                     .flex_none()
+                    .max_w(px(150.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(rgb(color))
-                    .child(SharedString::from(letter)),
+                    .child(SharedString::from(name)),
             )
             .child(
                 div()
@@ -437,25 +568,50 @@ impl GitPanel {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .child(SharedString::from(display)),
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(dir)),
             )
             .children(actionable.then(|| {
                 if conflict {
-                    self.button("resolve", GitOp::Stage(vec![path.clone()]), cx)
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(self.chip("resolve", GitOp::Stage(vec![path.clone()]), cx))
                         .into_any_element()
                 } else if staged {
-                    self.button("unstage", GitOp::Unstage(vec![path.clone()]), cx)
-                        .into_any_element()
+                    self.glyph_button(
+                        format!("git-unstage-{path}"),
+                        "-",
+                        GitOp::Unstage(vec![path.clone()]),
+                        cx,
+                    )
+                    .into_any_element()
                 } else {
                     div()
                         .flex()
                         .flex_row()
+                        .items_center()
                         .gap(px(2.0))
-                        .child(self.discard_button(path.clone(), entry.kind == "untracked", cx))
-                        .child(self.button("stage", GitOp::Stage(vec![path]), cx))
+                        .child(self.discard_control(path.clone(), entry.kind == "untracked", cx))
+                        .child(self.glyph_button(
+                            format!("git-stage-{path}"),
+                            "+",
+                            GitOp::Stage(vec![path]),
+                            cx,
+                        ))
                         .into_any_element()
                 }
             }))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(12.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(color))
+                    .child(SharedString::from(letter)),
+            )
     }
 
     fn section(
@@ -463,7 +619,7 @@ impl GitPanel {
         title: &'static str,
         entries: Vec<StatusEntry>,
         staged: bool,
-        bulk: Option<(&'static str, GitOp)>,
+        header_actions: Vec<gpui::AnyElement>,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         if entries.is_empty() {
@@ -475,19 +631,23 @@ impl GitPanel {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(1.0))
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .px(px(6.0))
-                        .pt(px(6.0))
-                        .text_size(px(10.0))
+                        .gap(px(6.0))
+                        .px(px(8.0))
+                        .pt(px(8.0))
+                        .pb(px(2.0))
+                        .text_size(px(9.0))
                         .text_color(rgb(theme.ui_text_muted))
-                        .child(SharedString::from(format!("{title} ({count})")))
+                        .child(SharedString::from(format!(
+                            "{} ({count})",
+                            title.to_uppercase()
+                        )))
                         .child(div().flex_grow())
-                        .children(bulk.map(|(label, op)| self.button(label, op, cx))),
+                        .children(header_actions),
                 )
                 .children(
                     entries
@@ -497,7 +657,75 @@ impl GitPanel {
         )
     }
 
-    fn render_graph(&self) -> impl IntoElement {
+    /// Rows of files for the expanded commit, indented under it.
+    fn commit_file_rows(&self) -> impl IntoElement {
+        let theme = self.theme;
+        let rows: Vec<_> = match &self.expanded_files {
+            None => vec![div()
+                .pl(px(24.0))
+                .h(px(18.0))
+                .text_size(px(10.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("loading...")
+                .into_any_element()],
+            Some(files) if files.is_empty() => vec![div()
+                .pl(px(24.0))
+                .h(px(18.0))
+                .text_size(px(10.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("no files")
+                .into_any_element()],
+            Some(files) => files
+                .iter()
+                .take(80)
+                .map(|file| {
+                    let color = self.status_color(&file.status, false);
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .pl(px(24.0))
+                        .pr(px(8.0))
+                        .h(px(18.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(10.0))
+                                .text_size(px(10.0))
+                                .text_color(rgb(color))
+                                .child(SharedString::from(file.status.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_grow()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_size(px(10.0))
+                                .text_color(rgb(theme.ui_text))
+                                .child(SharedString::from(file.path.clone())),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme.ui_surface))
+            .children(rows)
+    }
+
+    /// One contiguous run of commit rows with the branch lines painted
+    /// behind them (edges between adjacent rows only, so uniform row height
+    /// holds within a segment).
+    fn graph_segment(
+        &self,
+        rows: &[superterminal_core::git::graph::GraphRow],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        const ROW_H: f32 = 18.0;
         let theme = self.theme;
         let lane_colors = [
             theme.ui_accent,
@@ -508,28 +736,85 @@ impl GitPanel {
             theme.blue,
             theme.red,
         ];
-        let rows: Vec<_> = self
-            .graph
+        let lane_x = |lane: usize| 8.0 + (lane.min(7) as f32) * 8.0;
+        let gutter = px(8.0 + 8.0 * 8.0 + 6.0);
+
+        // Geometry for the paint pass: (row index, lane, edges).
+        type PaintRow = (usize, usize, Vec<(usize, usize)>);
+        let paint_rows: Vec<PaintRow> = rows
             .iter()
-            .flat_map(|graph| graph.rows.iter())
-            .take(120)
+            .enumerate()
+            .map(|(index, row)| {
+                (
+                    index,
+                    row.lane,
+                    row.edges
+                        .iter()
+                        .map(|edge| (edge.from_lane, edge.to_lane))
+                        .collect(),
+                )
+            })
+            .collect();
+        let edge_colors: Vec<u32> = lane_colors.to_vec();
+        let last = paint_rows.len().saturating_sub(1);
+
+        let lines = gpui::canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let ox = f32::from(bounds.origin.x);
+                let oy = f32::from(bounds.origin.y);
+                for (index, _, edges) in &paint_rows {
+                    if *index >= last {
+                        continue; // edges connect to the NEXT row inside this segment
+                    }
+                    let y_top = oy + (*index as f32) * ROW_H + ROW_H / 2.0;
+                    for (from, to) in edges {
+                        let mut builder = gpui::PathBuilder::stroke(px(1.5));
+                        builder.move_to(gpui::point(px(ox + lane_x(*from)), px(y_top)));
+                        builder.line_to(gpui::point(px(ox + lane_x(*to)), px(y_top + ROW_H)));
+                        if let Ok(path) = builder.build() {
+                            let color = edge_colors[from.min(&7) % edge_colors.len()];
+                            window.paint_path(path, rgb(color));
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        let expanded = self.expanded_commit.clone();
+        let row_divs: Vec<_> = rows
+            .iter()
             .map(|row| {
                 let color = lane_colors[row.lane % lane_colors.len()];
-                let indent = px(4.0 + row.lane as f32 * 8.0);
+                let hash = row.hash.clone();
+                let selected = expanded.as_deref() == Some(row.hash.as_str());
                 div()
+                    .id(SharedString::from(format!("commit-{}", row.hash)))
+                    .relative()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .px(px(6.0))
-                    .h(px(18.0))
+                    .h(px(ROW_H))
+                    .pl(gutter)
+                    .pr(px(8.0))
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(rgb(theme.ui_surface)))
+                    .hover(|style| style.bg(rgb(theme.ui_surface)))
                     .child(
                         div()
-                            .ml(indent)
+                            .absolute()
+                            .left(px(lane_x(row.lane) - 3.5))
+                            .top(px(ROW_H / 2.0 - 3.5))
                             .w(px(7.0))
                             .h(px(7.0))
-                            .flex_none()
                             .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(theme.ui_background))
                             .bg(rgb(color)),
                     )
                     .child(
@@ -539,6 +824,11 @@ impl GitPanel {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_size(px(10.0))
+                            .text_color(rgb(if selected {
+                                theme.ui_text
+                            } else {
+                                theme.ui_text_muted
+                            }))
                             .child(SharedString::from(row.subject.clone())),
                     )
                     .child(
@@ -550,8 +840,56 @@ impl GitPanel {
                                 row.author.split(' ').next().unwrap_or("").to_string(),
                             )),
                     )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |panel, _, _, cx| {
+                            panel.toggle_commit(hash.clone(), cx);
+                        }),
+                    )
             })
             .collect();
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .child(lines)
+            .children(row_divs)
+            .into_any_element()
+    }
+
+    /// The commit history with painted branch lines; the expanded commit's
+    /// files are spliced in between two graph segments.
+    fn render_graph(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let rows: Vec<superterminal_core::git::graph::GraphRow> = self
+            .graph
+            .iter()
+            .flat_map(|graph| graph.rows.iter())
+            .take(120)
+            .cloned()
+            .collect();
+        let split_at = self
+            .expanded_commit
+            .as_ref()
+            .and_then(|hash| rows.iter().position(|row| &row.hash == hash));
+
+        let mut children: Vec<gpui::AnyElement> = Vec::new();
+        match split_at {
+            Some(index) => {
+                children.push(self.graph_segment(&rows[..=index], cx));
+                children.push(self.commit_file_rows().into_any_element());
+                if index + 1 < rows.len() {
+                    children.push(self.graph_segment(&rows[index + 1..], cx));
+                }
+            }
+            None => {
+                if !rows.is_empty() {
+                    children.push(self.graph_segment(&rows, cx));
+                }
+            }
+        }
+
         div()
             .flex_grow()
             .overflow_hidden()
@@ -559,7 +897,16 @@ impl GitPanel {
             .border_color(rgb(theme.ui_border))
             .flex()
             .flex_col()
-            .children(rows)
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pt(px(6.0))
+                    .pb(px(2.0))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child("COMMITS"),
+            )
+            .children(children)
     }
 }
 
@@ -622,60 +969,105 @@ impl Render for GitPanel {
             .cloned()
             .collect();
 
+        let commit_ready =
+            !self.commit_field.read(cx).value.trim().is_empty() && !self.busy && !staged.is_empty();
+
         base
-            // header
+            // header: repo, branch, sync counters, network actions
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
+                    .flex_col()
+                    .gap(px(4.0))
                     .px(px(8.0))
                     .py(px(6.0))
                     .border_b_1()
                     .border_color(rgb(theme.ui_border))
                     .child(
                         div()
-                            .text_color(rgb(theme.ui_accent))
-                            .child(SharedString::from(repo.display_name.clone())),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_color(rgb(theme.ui_accent))
+                                    .child(SharedString::from(repo.display_name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child(branch_label),
+                            )
+                            .child(div().flex_grow())
+                            .children((ahead > 0 || behind > 0).then(|| {
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child(SharedString::from(format!(
+                                        "\u{2193}{behind} \u{2191}{ahead}"
+                                    )))
+                            })),
                     )
                     .child(
                         div()
-                            .text_color(rgb(theme.ui_text_muted))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(branch_label),
-                    )
-                    .child(div().flex_grow())
-                    .children((ahead > 0 || behind > 0).then(|| {
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child(SharedString::from(format!("+{ahead} -{behind}")))
-                    }))
-                    .child(self.button("pull", GitOp::Pull, cx))
-                    .child(self.button(
-                        "push",
-                        GitOp::Push {
-                            set_upstream: false,
-                        },
-                        cx,
-                    ))
-                    .child(self.button("publish", GitOp::Push { set_upstream: true }, cx))
-                    .child(self.button("fetch", GitOp::Fetch, cx)),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(self.chip("fetch", GitOp::Fetch, cx))
+                            .child(self.chip("pull", GitOp::Pull, cx))
+                            .child(self.chip(
+                                "push",
+                                GitOp::Push {
+                                    set_upstream: false,
+                                },
+                                cx,
+                            ))
+                            .child(self.chip("publish", GitOp::Push { set_upstream: true }, cx)),
+                    ),
             )
-            // commit line
+            // commit box: message field + full-width commit button
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
+                    .flex_col()
+                    .gap(px(4.0))
                     .px(px(8.0))
                     .py(px(6.0))
-                    .child(div().text_color(rgb(theme.ui_accent)).child("commit >"))
-                    .child(div().flex_grow().child(self.commit_field.clone())),
+                    .child(self.commit_field.clone())
+                    .child(
+                        div()
+                            .id("git-commit-btn")
+                            .cursor_pointer()
+                            .h(px(22.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .bg(rgb(theme.ui_accent))
+                            .text_color(rgb(theme.ui_background))
+                            .opacity(if commit_ready { 1.0 } else { 0.4 })
+                            .hover(|style| style.opacity(0.85))
+                            .child("Commit")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|panel, _, _, cx| {
+                                    if panel.busy {
+                                        return;
+                                    }
+                                    let message =
+                                        panel.commit_field.read(cx).value.trim().to_string();
+                                    if !message.is_empty() {
+                                        panel.run(GitOp::Commit(message), cx);
+                                    }
+                                }),
+                            ),
+                    ),
             )
             .children(self.error.clone().map(|error| {
                 div()
@@ -685,21 +1077,22 @@ impl Render for GitPanel {
                     .text_color(rgb(theme.red))
                     .child(SharedString::from(error))
             }))
-            .children(self.section("merge conflicts", conflicts, false, None, cx))
-            .children(self.section(
-                "staged",
-                staged,
-                true,
-                Some(("unstage all", GitOp::UnstageAll)),
-                cx,
-            ))
-            .children(self.section(
-                "changes",
-                changes,
-                false,
-                Some(("stage all", GitOp::StageAll)),
-                cx,
-            ))
-            .child(self.render_graph())
+            .children(self.section("merge changes", conflicts, false, Vec::new(), cx))
+            .children({
+                let actions = vec![self
+                    .chip("unstage all", GitOp::UnstageAll, cx)
+                    .into_any_element()];
+                self.section("staged changes", staged, true, actions, cx)
+            })
+            .children({
+                let actions = vec![
+                    self.discard_control("*".to_string(), false, cx)
+                        .into_any_element(),
+                    self.chip("stage all", GitOp::StageAll, cx)
+                        .into_any_element(),
+                ];
+                self.section("changes", changes, false, actions, cx)
+            })
+            .child(self.render_graph(cx))
     }
 }
