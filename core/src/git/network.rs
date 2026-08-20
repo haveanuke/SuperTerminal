@@ -1,5 +1,3 @@
-use tauri::State;
-
 use super::actions::ActionResult;
 use super::process::run_git;
 use super::{run_status, GitState};
@@ -18,20 +16,19 @@ fn network_action(
     })
 }
 
-#[tauri::command]
-pub fn git_push(
-    repo_id: String,
+pub fn run_push(
+    state: &GitState,
+    repo_id: &str,
     set_upstream: bool,
-    state: State<'_, GitState>,
 ) -> Result<ActionResult, String> {
-    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
     if set_upstream {
         let branch = {
             let _guard = entry.action_lock.lock().unwrap();
             let report = run_status(&entry.root)?;
             report.branch.ok_or("no branch to publish (detached HEAD)")?
         };
-        return network_action(&state, &repo_id, &["push", "-u", "origin", &branch]);
+        return network_action(state, repo_id, &["push", "-u", "origin", &branch]);
     }
     // Distinguish "no upstream" so the renderer can offer to publish.
     {
@@ -41,12 +38,11 @@ pub fn git_push(
             return Err("no upstream".to_string());
         }
     }
-    network_action(&state, &repo_id, &["push"])
+    network_action(state, repo_id, &["push"])
 }
 
-#[tauri::command]
-pub fn git_pull(repo_id: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    network_action(&state, &repo_id, &["pull", "--ff-only"]).map_err(|e| {
+pub fn run_pull(state: &GitState, repo_id: &str) -> Result<ActionResult, String> {
+    network_action(state, repo_id, &["pull", "--ff-only"]).map_err(|e| {
         let lower = e.to_lowercase();
         if lower.contains("fast-forward") || lower.contains("diverg") || lower.contains("not possible") {
             format!("branches have diverged — pull cannot fast-forward; resolve in the terminal (merge or rebase). [{e}]")
@@ -56,9 +52,8 @@ pub fn git_pull(repo_id: String, state: State<'_, GitState>) -> Result<ActionRes
     })
 }
 
-#[tauri::command]
-pub fn git_fetch(repo_id: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    network_action(&state, &repo_id, &["fetch", "--prune"])
+pub fn run_fetch(state: &GitState, repo_id: &str) -> Result<ActionResult, String> {
+    network_action(state, repo_id, &["fetch", "--prune"])
 }
 
 #[cfg(test)]

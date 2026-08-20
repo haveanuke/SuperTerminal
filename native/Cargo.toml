@@ -1,27 +1,21 @@
-# SPIKE crate: proves gpui + alacritty_terminal can drive a native macOS terminal.
-# Standalone on purpose -- NOT part of any workspace (see [workspace] table below).
 [package]
-name = "superterminal-native-spike"
+name = "superterminal-native"
 version = "0.1.0"
 edition = "2021"
+description = "SuperTerminal Native: gpui + alacritty_terminal, no webview"
 publish = false
 
-# Empty workspace table keeps cargo from walking up and adopting a parent
-# workspace; this crate owns its own Cargo.lock.
-[workspace]
-
 [dependencies]
-# Zed's UI framework. Pinned to the latest version published on crates.io at
-# the time of the spike (2026-08-19). The "runtime_shaders" feature makes gpui
-# compile its Metal shaders at runtime instead of at build time -- required on
-# machines with only Command Line Tools installed (no full Xcode, so no
-# `xcrun metal` compiler).
+# Zed's UI framework, pinned to the crates.io release proven by the spike
+# (2026-08-19). The "runtime_shaders" feature makes gpui compile its Metal
+# shaders at runtime instead of at build time -- required on machines with
+# only Command Line Tools installed (no full Xcode, so no `xcrun metal`).
 gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
 
-# Alacritty's terminal emulation core (VTE parser, grid, PTY handling).
-# Pinned to the latest version published on crates.io at the time of the spike.
+# Alacritty's terminal emulation core (VTE parser, grid, PTY handling),
+# pinned to the spike-proven release.
 alacritty_terminal = "=0.26.0"
 
-[profile.dev]
-# gpui is heavy; a little optimization keeps redraws smooth even in dev builds.
-opt-level = 1
+serde = { workspace = true }
+serde_json = { workspace = true }
+superterminal-core = { path = "../core" }

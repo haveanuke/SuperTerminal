@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tauri::State;
+
 
 use super::process::run_git;
 use super::GitState;
@@ -169,9 +169,8 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
     GraphData { rows, lane_count }
 }
 
-#[tauri::command]
-pub fn git_graph(repo_id: String, limit: u32, state: State<'_, GitState>) -> Result<GraphData, String> {
-    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+pub fn run_graph(state: &GitState, repo_id: &str, limit: u32) -> Result<GraphData, String> {
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
     let limit = limit.clamp(1, MAX_LIMIT).to_string();
     let out = run_git(
         Some(&entry.root),

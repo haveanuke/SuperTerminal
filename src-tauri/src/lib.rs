@@ -1,9 +1,6 @@
 pub mod bg;
-pub mod buddy;
-pub mod git;
+pub mod commands;
 pub mod pty;
-pub mod session;
-pub mod shell_env;
 
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 
@@ -29,36 +26,36 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(pty::PtyManager::default())
-        .manage(git::GitState::default())
+        .manage(superterminal_core::git::GitState::default())
         .invoke_handler(tauri::generate_handler![
-            git::git_resolve_repo,
-            git::git_status,
-            git::actions::git_stage,
-            git::actions::git_stage_all,
-            git::actions::git_unstage,
-            git::actions::git_unstage_all,
-            git::actions::git_discard,
-            git::actions::git_commit,
-            git::network::git_push,
-            git::network::git_pull,
-            git::network::git_fetch,
-            git::graph::git_graph,
+            commands::git_resolve_repo,
+            commands::git_status,
+            commands::git_stage,
+            commands::git_stage_all,
+            commands::git_unstage,
+            commands::git_unstage_all,
+            commands::git_discard,
+            commands::git_commit,
+            commands::git_push,
+            commands::git_pull,
+            commands::git_fetch,
+            commands::git_graph,
             pty::pty_create,
             pty::pty_write,
             pty::pty_write_broadcast,
             pty::pty_resize,
             pty::pty_dispose,
             pty::pty_cwd,
-            session::session_save,
-            session::session_load,
-            session::session_list,
-            session::session_delete,
-            buddy::buddy_react,
+            commands::session_save,
+            commands::session_load,
+            commands::session_list,
+            commands::session_delete,
+            commands::buddy_react,
             bg::store_background_image
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let sessions = session::SessionManager::new(data_dir.join("sessions"));
+            let sessions = superterminal_core::session::SessionManager::new(data_dir.join("sessions"));
             #[cfg(target_os = "macos")]
             if let Ok(home) = app.path().home_dir() {
                 // Electron's userData was `super-terminal` (package.json name);

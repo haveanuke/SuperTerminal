@@ -169,11 +169,6 @@ pub fn run(req: BuddyRequest) -> BuddyResult {
     }
 }
 
-#[tauri::command]
-pub fn buddy_react(req: BuddyRequest) -> BuddyResult {
-    run(req)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

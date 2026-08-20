@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -82,11 +82,6 @@ impl GitState {
     }
 }
 
-#[tauri::command]
-pub fn git_resolve_repo(cwd: String, state: State<'_, GitState>) -> Option<RepoInfo> {
-    state.resolve(&cwd)
-}
-
 /// Fresh status for a repo. Skipped (Err "busy") while an action holds the
 /// repo or another status refresh is running — the store drops "busy" silently.
 pub fn run_status(root: &Path) -> Result<status::StatusReport, String> {
@@ -98,12 +93,10 @@ pub fn run_status(root: &Path) -> Result<status::StatusReport, String> {
     Ok(status::parse_status(&out.stdout))
 }
 
-#[tauri::command]
-pub fn git_status(
-    repo_id: String,
-    state: State<'_, GitState>,
-) -> Result<status::StatusReport, String> {
-    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+/// Guarded status: refuses ("busy") while an action holds the repo lock or
+/// another status refresh is in flight.
+pub fn status_guarded(state: &GitState, repo_id: &str) -> Result<status::StatusReport, String> {
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
     // Hold the action lock for the whole status run (a dropped try_lock guard
     // would let an action start mid-status — TOCTOU).
     let Ok(_guard) = entry.action_lock.try_lock() else {

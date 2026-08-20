@@ -23,6 +23,10 @@
 //!   * Key input flows main thread -> `Notifier` (mpsc + poller wakeup) ->
 //!     PTY writer on the reader thread.
 
+mod keys;
+mod layout;
+mod themes;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

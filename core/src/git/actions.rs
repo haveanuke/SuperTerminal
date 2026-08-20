@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::path::Path;
-use tauri::State;
+
 
 use super::process::run_git;
 use super::status::{StatusEntry, StatusReport};
@@ -193,39 +193,14 @@ pub fn run_action(
     })
 }
 
-#[tauri::command]
-pub fn git_stage(repo_id: String, paths: Vec<String>, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    run_action(&state, &repo_id, Some(paths), ActionKind::Stage)
-}
-
-#[tauri::command]
-pub fn git_stage_all(repo_id: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    run_action(&state, &repo_id, None, ActionKind::Stage)
-}
-
-#[tauri::command]
-pub fn git_unstage(repo_id: String, paths: Vec<String>, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    run_action(&state, &repo_id, Some(paths), ActionKind::Unstage)
-}
-
-#[tauri::command]
-pub fn git_unstage_all(repo_id: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    run_action(&state, &repo_id, None, ActionKind::Unstage)
-}
-
-#[tauri::command]
-pub fn git_discard(repo_id: String, paths: Vec<String>, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    run_action(&state, &repo_id, Some(paths), ActionKind::Discard)
-}
-
-#[tauri::command]
-pub fn git_commit(repo_id: String, message: String, state: State<'_, GitState>) -> Result<ActionResult, String> {
-    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+/// Commit the staged changes with `message` (multi-line allowed).
+pub fn run_commit(state: &GitState, repo_id: &str, message: &str) -> Result<ActionResult, String> {
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
     let _guard = entry.action_lock.lock().unwrap();
     if message.trim().is_empty() {
         return Err("empty commit message".to_string());
     }
-    run_git(Some(&entry.root), &["commit", "-m", &message], false)?;
+    run_git(Some(&entry.root), &["commit", "-m", message], false)?;
     Ok(ActionResult { report: run_status(&entry.root)?, skipped: 0 })
 }
 
