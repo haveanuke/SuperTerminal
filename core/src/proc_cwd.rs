@@ -92,7 +92,10 @@ mod tests {
             .spawn()
             .unwrap();
         let cwd = pid_cwd(child.id() as i32).expect("child cwd");
-        assert!(cwd.starts_with("/private/tmp") || cwd.starts_with("/tmp"), "{cwd}");
+        assert!(
+            cwd.starts_with("/private/tmp") || cwd.starts_with("/tmp"),
+            "{cwd}"
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         // The pid may be briefly queryable post-reap on some systems, so only

@@ -200,7 +200,10 @@ mod tests {
 
     #[test]
     fn detached_head() {
-        let r = parse_status(&z(&["# branch.oid 1234567890abcdef", "# branch.head (detached)"]));
+        let r = parse_status(&z(&[
+            "# branch.oid 1234567890abcdef",
+            "# branch.head (detached)",
+        ]));
         assert_eq!(r.branch, None);
         assert_eq!(r.detached.as_deref(), Some("12345678"));
     }
@@ -214,9 +217,7 @@ mod tests {
 
     #[test]
     fn ordinary_staged_and_unstaged_same_file() {
-        let r = parse_status(&z(&[
-            "1 MM N... 100644 100644 100644 aaaa bbbb a.txt",
-        ]));
+        let r = parse_status(&z(&["1 MM N... 100644 100644 100644 aaaa bbbb a.txt"]));
         let e = &r.entries[0];
         assert_eq!(e.kind, "ordinary");
         assert_eq!(e.index_status, "M");
@@ -277,9 +278,7 @@ mod tests {
 
     #[test]
     fn submodule_flag() {
-        let r = parse_status(&z(&[
-            "1 .M SCMU 160000 160000 160000 aaaa bbbb sub/module",
-        ]));
+        let r = parse_status(&z(&["1 .M SCMU 160000 160000 160000 aaaa bbbb sub/module"]));
         assert!(r.entries[0].submodule);
     }
 

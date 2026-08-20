@@ -36,9 +36,7 @@ fn validate_pane(v: &Value) -> bool {
             }
             match map.get("sizes") {
                 None => true,
-                Some(Value::Array(sizes)) if sizes.len() == 2 => {
-                    sizes.iter().all(Value::is_number)
-                }
+                Some(Value::Array(sizes)) if sizes.len() == 2 => sizes.iter().all(Value::is_number),
                 Some(_) => false,
             }
         }
@@ -236,7 +234,10 @@ mod tests {
         assert!(loaded["savedAt"].is_string());
         // sanity: the hand-rolled RFC3339 stamp looks like a date
         let stamp = loaded["savedAt"].as_str().unwrap();
-        assert!(stamp.len() == 20 && stamp.ends_with('Z') && &stamp[4..5] == "-", "{stamp}");
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && &stamp[4..5] == "-",
+            "{stamp}"
+        );
     }
 
     #[test]

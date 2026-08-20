@@ -55,7 +55,8 @@ pub fn run() {
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            let sessions = superterminal_core::session::SessionManager::new(data_dir.join("sessions"));
+            let sessions =
+                superterminal_core::session::SessionManager::new(data_dir.join("sessions"));
             #[cfg(target_os = "macos")]
             if let Ok(home) = app.path().home_dir() {
                 // Electron's userData was `super-terminal` (package.json name);

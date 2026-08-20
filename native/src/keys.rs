@@ -18,6 +18,9 @@ pub struct KeyInput<'a> {
     pub cmd: bool,
     pub alt: bool,
     pub ctrl: bool,
+    /// Present for completeness; current bindings don't branch on shift
+    /// (shifted printables arrive pre-composed via key_char).
+    #[allow(dead_code)]
     pub shift: bool,
 }
 

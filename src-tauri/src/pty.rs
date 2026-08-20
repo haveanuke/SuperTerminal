@@ -45,7 +45,10 @@ pub struct PtyManager {
 #[cfg(test)]
 impl PtyManager {
     fn slot_is_creating(&self, id: &str) -> bool {
-        matches!(self.slots.lock().unwrap().get(id), Some(PtySlot::Creating(_)))
+        matches!(
+            self.slots.lock().unwrap().get(id),
+            Some(PtySlot::Creating(_))
+        )
     }
 
     fn live_pid(&self, id: &str) -> Option<u32> {
@@ -98,7 +101,12 @@ impl PtyManager {
 
         let spawned = (|| -> Result<PtyRecord, String> {
             let pair = native_pty_system()
-                .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .map_err(|e| e.to_string())?;
             let mut cmd = CommandBuilder::new(shell);
             cmd.env_clear();

@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoInfo {
@@ -87,7 +86,13 @@ impl GitState {
 pub fn run_status(root: &Path) -> Result<status::StatusReport, String> {
     let out = process::run_git(
         Some(root),
-        &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+        ],
         false,
     )?;
     Ok(status::parse_status(&out.stdout))
@@ -179,7 +184,11 @@ mod tests {
         let dir = tmp_repo();
         // tracked files
         write(&dir, "modified.txt", "one");
-        write(&dir, "renamed-old.txt", "keep this content stable for rename detection");
+        write(
+            &dir,
+            "renamed-old.txt",
+            "keep this content stable for rename detection",
+        );
         write(&dir, "conflict.txt", "base");
         run_git(Some(&dir), &["add", "-A"], false).unwrap();
         run_git(Some(&dir), &["commit", "-m", "base"], false).unwrap();
@@ -195,12 +204,23 @@ mod tests {
 
         // staged rename + worktree modification + untracked
         std::fs::rename(dir.join("renamed-old.txt"), dir.join("renamed new.txt")).unwrap();
-        run_git(Some(&dir), &["add", "renamed-old.txt", "renamed new.txt"], false).unwrap();
+        run_git(
+            Some(&dir),
+            &["add", "renamed-old.txt", "renamed new.txt"],
+            false,
+        )
+        .unwrap();
         write(&dir, "modified.txt", "two");
         write(&dir, "untracked dir/inner.txt", "new");
 
         let report = run_status(&dir).unwrap();
-        let find = |k: &str| report.entries.iter().filter(|e| e.kind == k).collect::<Vec<_>>();
+        let find = |k: &str| {
+            report
+                .entries
+                .iter()
+                .filter(|e| e.kind == k)
+                .collect::<Vec<_>>()
+        };
 
         let unmerged = find("unmerged");
         assert_eq!(unmerged.len(), 1, "entries: {:?}", report.entries);
@@ -214,8 +234,12 @@ mod tests {
         assert_eq!(renames[0].orig_path.as_deref(), Some("renamed-old.txt"));
         assert_eq!(renames[0].index_status, "R");
 
-        assert!(find("ordinary").iter().any(|e| e.path == "modified.txt" && e.worktree_status == "M"));
-        assert!(find("untracked").iter().any(|e| e.path == "untracked dir/inner.txt"));
+        assert!(find("ordinary")
+            .iter()
+            .any(|e| e.path == "modified.txt" && e.worktree_status == "M"));
+        assert!(find("untracked")
+            .iter()
+            .any(|e| e.path == "untracked dir/inner.txt"));
         assert_eq!(report.branch.as_deref(), Some("main"));
     }
 
@@ -234,12 +258,24 @@ mod tests {
         write(&dir, "h.txt", "main");
         run_git(Some(&dir), &["add", "-A"], false).unwrap();
         run_git(Some(&dir), &["commit", "-m", "mainline"], false).unwrap();
-        run_git(Some(&dir), &["merge", "--no-ff", "feature", "-m", "merge feat"], false).unwrap();
+        run_git(
+            Some(&dir),
+            &["merge", "--no-ff", "feature", "-m", "merge feat"],
+            false,
+        )
+        .unwrap();
 
         let out = run_git(
             Some(&dir),
-            &["log", "--all", "--topo-order", "-z",
-              "--format=%H\u{1f}%P\u{1f}%D\u{1f}%an\u{1f}%at\u{1f}%s", "-n", "50"],
+            &[
+                "log",
+                "--all",
+                "--topo-order",
+                "-z",
+                "--format=%H\u{1f}%P\u{1f}%D\u{1f}%an\u{1f}%at\u{1f}%s",
+                "-n",
+                "50",
+            ],
             false,
         )
         .unwrap();
@@ -247,7 +283,11 @@ mod tests {
         assert_eq!(g.rows.len(), 5);
         assert_eq!(g.lane_count, 2);
         assert_eq!(g.rows[0].subject, "merge feat");
-        assert!(g.rows[0].edges.len() >= 2, "merge row branches: {:?}", g.rows[0].edges);
+        assert!(
+            g.rows[0].edges.len() >= 2,
+            "merge row branches: {:?}",
+            g.rows[0].edges
+        );
         assert!(g.rows[0].refs_display.contains("main"));
     }
 
@@ -258,7 +298,9 @@ mod tests {
         let a = state.resolve(dir.to_str().unwrap()).expect("repo");
         let sub = dir.join("subdir");
         std::fs::create_dir_all(&sub).unwrap();
-        let b = state.resolve(sub.to_str().unwrap()).expect("repo from subdir");
+        let b = state
+            .resolve(sub.to_str().unwrap())
+            .expect("repo from subdir");
         assert_eq!(a.repo_id, b.repo_id);
         assert_eq!(a.root, b.root);
         assert!(state.entry(&a.repo_id).is_some());

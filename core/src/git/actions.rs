@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::path::Path;
 
-
 use super::process::run_git;
 use super::status::{StatusEntry, StatusReport};
 use super::{run_status, GitState};
@@ -36,12 +35,19 @@ fn relevant(entry: &StatusEntry, kind: ActionKind) -> bool {
         ActionKind::Stage => {
             entry.kind == "untracked" || entry.kind == "unmerged" || entry.worktree_status != "."
         }
-        ActionKind::Unstage => entry.kind != "untracked" && entry.kind != "unmerged" && entry.index_status != ".",
+        ActionKind::Unstage => {
+            entry.kind != "untracked" && entry.kind != "unmerged" && entry.index_status != "."
+        }
         ActionKind::Discard => entry.kind == "untracked" || entry.worktree_status != ".",
     }
 }
 
-fn expand_entry(entry: &StatusEntry, kind: ActionKind, plan: &mut ActionPlan, unborn: bool) -> Result<(), String> {
+fn expand_entry(
+    entry: &StatusEntry,
+    kind: ActionKind,
+    plan: &mut ActionPlan,
+    unborn: bool,
+) -> Result<(), String> {
     match kind {
         ActionKind::Stage => {
             // Worktree rename: both paths, or half the rename stays unstaged.
@@ -55,7 +61,11 @@ fn expand_entry(entry: &StatusEntry, kind: ActionKind, plan: &mut ActionPlan, un
             plan.add_paths.push(entry.path.clone());
         }
         ActionKind::Unstage => {
-            let target = if unborn { &mut plan.rm_cached } else { &mut plan.restore_staged };
+            let target = if unborn {
+                &mut plan.rm_cached
+            } else {
+                &mut plan.restore_staged
+            };
             if entry.kind == "rename_copy" && entry.index_status == "R" {
                 if let Some(orig) = &entry.orig_path {
                     target.push(orig.clone());
@@ -201,7 +211,10 @@ pub fn run_commit(state: &GitState, repo_id: &str, message: &str) -> Result<Acti
         return Err("empty commit message".to_string());
     }
     run_git(Some(&entry.root), &["commit", "-m", message], false)?;
-    Ok(ActionResult { report: run_status(&entry.root)?, skipped: 0 })
+    Ok(ActionResult {
+        report: run_status(&entry.root)?,
+        skipped: 0,
+    })
 }
 
 #[cfg(test)]
@@ -249,7 +262,11 @@ mod tests {
         let r = run_action(&state, &id, Some(vec!["f.txt".into()]), ActionKind::Unstage).unwrap();
         let e = entry_by_path(&r.report, "f.txt").unwrap();
         assert_eq!(e.kind, "untracked", "index empty again");
-        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "v2", "worktree untouched");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "v2",
+            "worktree untouched"
+        );
     }
 
     #[test]
@@ -261,7 +278,11 @@ mod tests {
         write(&dir, "y.txt", "y");
         run_action(&state, &id, None, ActionKind::Stage).unwrap();
         let r = run_action(&state, &id, None, ActionKind::Unstage).unwrap();
-        assert!(r.report.entries.iter().all(|e| e.index_status == "." || e.kind == "untracked"));
+        assert!(r
+            .report
+            .entries
+            .iter()
+            .all(|e| e.index_status == "." || e.kind == "untracked"));
 
         // unborn: rm --cached path
         let dir2 = tmp_repo_unborn();
@@ -276,7 +297,11 @@ mod tests {
     fn rename_stage_and_unstage_expand_to_both_paths() {
         let dir = tmp_repo();
         let (state, id) = state_for(&dir);
-        write(&dir, "old.txt", "stable content long enough for rename detection");
+        write(
+            &dir,
+            "old.txt",
+            "stable content long enough for rename detection",
+        );
         run_action(&state, &id, None, ActionKind::Stage).unwrap();
         git_commit_inner(&state, &id, "base");
         std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
@@ -286,7 +311,13 @@ mod tests {
         assert_eq!(staged.index_status, "R");
         assert_eq!(staged.orig_path.as_deref(), Some("old.txt"));
         // unstage the staged rename via its visible path (expands both sides)
-        let r = run_action(&state, &id, Some(vec!["new.txt".into()]), ActionKind::Unstage).unwrap();
+        let r = run_action(
+            &state,
+            &id,
+            Some(vec!["new.txt".into()]),
+            ActionKind::Unstage,
+        )
+        .unwrap();
         let e = entry_by_path(&r.report, "old.txt").expect("old back as deleted-or-restored");
         assert_ne!(e.index_status, "R");
     }
@@ -301,8 +332,15 @@ mod tests {
         write(&dir, "tracked.txt", "dirty");
         write(&dir, "junk dir/deep/file.txt", "junk");
         let r = run_action(&state, &id, None, ActionKind::Discard).unwrap();
-        assert!(r.report.entries.is_empty(), "clean tree: {:?}", r.report.entries);
-        assert_eq!(std::fs::read_to_string(dir.join("tracked.txt")).unwrap(), "committed");
+        assert!(
+            r.report.entries.is_empty(),
+            "clean tree: {:?}",
+            r.report.entries
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("tracked.txt")).unwrap(),
+            "committed"
+        );
         assert!(!dir.join("junk dir").exists());
     }
 
@@ -310,7 +348,11 @@ mod tests {
     fn worktree_rename_discard_restores_src_cleans_dest() {
         let dir = tmp_repo();
         let (state, id) = state_for(&dir);
-        write(&dir, "src.txt", "stable content long enough for rename detection");
+        write(
+            &dir,
+            "src.txt",
+            "stable content long enough for rename detection",
+        );
         run_action(&state, &id, None, ActionKind::Stage).unwrap();
         git_commit_inner(&state, &id, "base");
         std::fs::rename(dir.join("src.txt"), dir.join("dest.txt")).unwrap();
@@ -328,7 +370,13 @@ mod tests {
     fn discard_rejects_conflicted_and_stale_paths() {
         let dir = tmp_repo();
         let (state, id) = state_for(&dir);
-        let err = run_action(&state, &id, Some(vec!["nope.txt".into()]), ActionKind::Discard).unwrap_err();
+        let err = run_action(
+            &state,
+            &id,
+            Some(vec!["nope.txt".into()]),
+            ActionKind::Discard,
+        )
+        .unwrap_err();
         assert_eq!(err, "state changed, refresh");
     }
 
@@ -338,11 +386,35 @@ mod tests {
         let (state, id) = state_for(&dir);
         write(&dir, ":weird.txt", "colon");
         write(&dir, "normal.txt", "normal");
-        let r = run_action(&state, &id, Some(vec![":weird.txt".into()]), ActionKind::Stage).unwrap();
-        assert_eq!(entry_by_path(&r.report, ":weird.txt").unwrap().index_status, "A");
-        assert_eq!(entry_by_path(&r.report, "normal.txt").unwrap().kind, "untracked");
-        let r = run_action(&state, &id, Some(vec![":weird.txt".into()]), ActionKind::Unstage).unwrap();
-        let r2 = run_action(&state, &id, Some(vec![":weird.txt".into()]), ActionKind::Discard).unwrap();
+        let r = run_action(
+            &state,
+            &id,
+            Some(vec![":weird.txt".into()]),
+            ActionKind::Stage,
+        )
+        .unwrap();
+        assert_eq!(
+            entry_by_path(&r.report, ":weird.txt").unwrap().index_status,
+            "A"
+        );
+        assert_eq!(
+            entry_by_path(&r.report, "normal.txt").unwrap().kind,
+            "untracked"
+        );
+        let r = run_action(
+            &state,
+            &id,
+            Some(vec![":weird.txt".into()]),
+            ActionKind::Unstage,
+        )
+        .unwrap();
+        let r2 = run_action(
+            &state,
+            &id,
+            Some(vec![":weird.txt".into()]),
+            ActionKind::Discard,
+        )
+        .unwrap();
         let _ = r;
         assert!(entry_by_path(&r2.report, ":weird.txt").is_none());
         assert!(dir.join("normal.txt").exists(), "unrelated file untouched");
@@ -355,7 +427,12 @@ mod tests {
         write(&dir, "m.txt", "m");
         run_action(&state, &id, None, ActionKind::Stage).unwrap();
         let entry = state.entry(&id).unwrap();
-        run_git(Some(&entry.root), &["commit", "-m", "subject line\n\nbody line"], false).unwrap();
+        run_git(
+            Some(&entry.root),
+            &["commit", "-m", "subject line\n\nbody line"],
+            false,
+        )
+        .unwrap();
         let log = run_git(Some(&entry.root), &["log", "-1", "--format=%B"], false).unwrap();
         let body = String::from_utf8_lossy(&log.stdout);
         assert!(body.contains("subject line") && body.contains("body line"));
@@ -365,10 +442,18 @@ mod tests {
     fn expansion_rules_pure() {
         // copy stage/unstage/discard use destination only
         let copy = StatusEntry {
-            kind: "rename_copy".into(), index_status: ".".into(), worktree_status: "C".into(),
-            path: "copy.txt".into(), orig_path: Some("src.txt".into()), submodule: false, actionable: true,
+            kind: "rename_copy".into(),
+            index_status: ".".into(),
+            worktree_status: "C".into(),
+            path: "copy.txt".into(),
+            orig_path: Some("src.txt".into()),
+            submodule: false,
+            actionable: true,
         };
-        let report = StatusReport { entries: vec![copy], ..Default::default() };
+        let report = StatusReport {
+            entries: vec![copy],
+            ..Default::default()
+        };
         let plan = expand_for_action(&report, None, ActionKind::Stage).unwrap();
         assert_eq!(plan.add_paths, vec!["copy.txt"]);
         let plan = expand_for_action(&report, None, ActionKind::Discard).unwrap();
@@ -377,22 +462,43 @@ mod tests {
 
         // staged rename + unrelated worktree mod: discard treats worktree side as ordinary
         let staged_rename_with_mod = StatusEntry {
-            kind: "rename_copy".into(), index_status: "R".into(), worktree_status: "M".into(),
-            path: "new.txt".into(), orig_path: Some("old.txt".into()), submodule: false, actionable: true,
+            kind: "rename_copy".into(),
+            index_status: "R".into(),
+            worktree_status: "M".into(),
+            path: "new.txt".into(),
+            orig_path: Some("old.txt".into()),
+            submodule: false,
+            actionable: true,
         };
-        let report = StatusReport { entries: vec![staged_rename_with_mod], ..Default::default() };
+        let report = StatusReport {
+            entries: vec![staged_rename_with_mod],
+            ..Default::default()
+        };
         let plan = expand_for_action(&report, None, ActionKind::Discard).unwrap();
         assert_eq!(plan.restore_worktree, vec!["new.txt"]);
         assert!(plan.clean_paths.is_empty(), "not a worktree rename");
 
         // non-actionable explicit -> reject; bulk -> skipped
         let bad = StatusEntry {
-            kind: "ordinary".into(), index_status: ".".into(), worktree_status: "M".into(),
-            path: "bad\u{fffd}.txt".into(), orig_path: None, submodule: false, actionable: false,
+            kind: "ordinary".into(),
+            index_status: ".".into(),
+            worktree_status: "M".into(),
+            path: "bad\u{fffd}.txt".into(),
+            orig_path: None,
+            submodule: false,
+            actionable: false,
         };
-        let report = StatusReport { entries: vec![bad], ..Default::default() };
+        let report = StatusReport {
+            entries: vec![bad],
+            ..Default::default()
+        };
         assert_eq!(
-            expand_for_action(&report, Some(&["bad\u{fffd}.txt".to_string()]), ActionKind::Stage).unwrap_err(),
+            expand_for_action(
+                &report,
+                Some(&["bad\u{fffd}.txt".to_string()]),
+                ActionKind::Stage
+            )
+            .unwrap_err(),
             "state changed, refresh"
         );
         let plan = expand_for_action(&report, None, ActionKind::Stage).unwrap();
@@ -401,14 +507,34 @@ mod tests {
 
         // submodule: stage/unstage allowed (gitlink), discard rejected explicitly / skipped in bulk
         let sub = StatusEntry {
-            kind: "ordinary".into(), index_status: ".".into(), worktree_status: "M".into(),
-            path: "sub".into(), orig_path: None, submodule: true, actionable: true,
+            kind: "ordinary".into(),
+            index_status: ".".into(),
+            worktree_status: "M".into(),
+            path: "sub".into(),
+            orig_path: None,
+            submodule: true,
+            actionable: true,
         };
-        let report = StatusReport { entries: vec![sub], ..Default::default() };
-        assert_eq!(expand_for_action(&report, None, ActionKind::Stage).unwrap().add_paths, vec!["sub"]);
-        assert!(expand_for_action(&report, Some(&["sub".to_string()]), ActionKind::Discard)
-            .unwrap_err()
-            .contains("submodule"));
-        assert_eq!(expand_for_action(&report, None, ActionKind::Discard).unwrap().skipped, 1);
+        let report = StatusReport {
+            entries: vec![sub],
+            ..Default::default()
+        };
+        assert_eq!(
+            expand_for_action(&report, None, ActionKind::Stage)
+                .unwrap()
+                .add_paths,
+            vec!["sub"]
+        );
+        assert!(
+            expand_for_action(&report, Some(&["sub".to_string()]), ActionKind::Discard)
+                .unwrap_err()
+                .contains("submodule")
+        );
+        assert_eq!(
+            expand_for_action(&report, None, ActionKind::Discard)
+                .unwrap()
+                .skipped,
+            1
+        );
     }
 }

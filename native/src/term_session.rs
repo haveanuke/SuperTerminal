@@ -34,6 +34,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor}
 extern "C" {
     fn tcgetpgrp(fd: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn dup2(from: c_int, to: c_int) -> c_int;
 }
 const SIGKILL: c_int = 9;
 
@@ -146,8 +147,11 @@ impl EventListener for EventProxy {
             AlacEvent::Bell => {
                 self.events.lock().unwrap().push(SessionEvent::Bell);
             }
-            AlacEvent::ChildExit(code) => {
-                self.events.lock().unwrap().push(SessionEvent::Exited(code));
+            AlacEvent::ChildExit(status) => {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(SessionEvent::Exited(status.code().unwrap_or(-1)));
             }
             // Wakeup / damage / clipboard / color queries: redraw covers them
             // in v1 (OSC 52 clipboard and color queries are v1.x).
@@ -171,18 +175,43 @@ pub struct TermSession {
     master_fd: c_int,
     title: Option<String>,
     exited: Option<i32>,
-    size: TermSize,
+    cols: usize,
+    lines: usize,
 }
 
 impl TermSession {
-    /// Spawn a login shell on a fresh PTY. MUST be called on the main thread
-    /// (contract rev 2 §4: signal-mask correctness without sigmask juggling).
+    /// Spawn the user's shell on a fresh PTY. MUST be called on the main
+    /// thread (contract rev 2 §4: signal-mask correctness without sigmask
+    /// juggling).
     pub fn spawn(
         cols: usize,
         lines: usize,
         cell_width: u16,
         cell_height: u16,
         working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        // $SHELL explicitly (not the /usr/bin/login route): login can block in
+        // headless contexts, and $SHELL matches the previous app's behavior.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .map(|sh| tty::Shell::new(sh, Vec::new()));
+        Self::spawn_with_shell(
+            cols,
+            lines,
+            cell_width,
+            cell_height,
+            working_directory,
+            shell,
+        )
+    }
+
+    fn spawn_with_shell(
+        cols: usize,
+        lines: usize,
+        cell_width: u16,
+        cell_height: u16,
+        working_directory: Option<PathBuf>,
+        shell: Option<tty::Shell>,
     ) -> Result<Self, String> {
         let dirty = Arc::new(AtomicBool::new(false));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -210,7 +239,7 @@ impl TermSession {
             cell_height,
         };
         let options = tty::Options {
-            shell: None, // login shell via /usr/bin/login on macOS
+            shell,
             working_directory,
             drain_on_exit: true,
             env: HashMap::new(),
@@ -237,7 +266,8 @@ impl TermSession {
             master_fd,
             title: None,
             exited: None,
-            size,
+            cols,
+            lines,
         })
     }
 
@@ -326,11 +356,12 @@ impl TermSession {
         for op in self.deferred.drain(..) {
             match op {
                 TermOp::Resize { size, window } => {
-                    if size.columns != self.size.columns || size.screen_lines != self.size.screen_lines
-                    {
+                    let (new_cols, new_lines) = (size.columns, size.screen_lines);
+                    if new_cols != self.cols || new_lines != self.lines {
                         term.resize(size);
                         let _ = self.sender.send(Msg::Resize(window));
-                        self.size = size;
+                        self.cols = new_cols;
+                        self.lines = new_lines;
                     }
                 }
                 TermOp::Scroll(delta) => term.scroll_display(Scroll::Delta(delta)),
@@ -357,27 +388,26 @@ impl TermSession {
         let display_offset = term.grid().display_offset();
         let mode = *term.mode();
 
-        let mut rows =
+        let mut rows = vec![
             vec![
-                vec![
-                    SnapshotCell {
-                        ch: ' ',
-                        style: CellStyle {
-                            fg: CellColor::Default,
-                            bg: CellColor::Default,
-                            bold: false,
-                            italic: false,
-                            dim: false,
-                            underline: false,
-                            inverse: false,
-                            hidden: false,
-                        },
-                        wide_spacer: false,
-                    };
-                    cols
-                ];
-                lines
+                SnapshotCell {
+                    ch: ' ',
+                    style: CellStyle {
+                        fg: CellColor::Default,
+                        bg: CellColor::Default,
+                        bold: false,
+                        italic: false,
+                        dim: false,
+                        underline: false,
+                        inverse: false,
+                        hidden: false,
+                    },
+                    wide_spacer: false,
+                };
+                cols
             ];
+            lines
+        ];
         let mut selection_cells = Vec::new();
 
         {
@@ -445,6 +475,7 @@ impl TermSession {
         ShutdownHandle {
             io_thread: self.io_thread.take(),
             shell_pid: self.shell_pid,
+            master_fd: self.master_fd,
         }
     }
 }
@@ -452,23 +483,45 @@ impl TermSession {
 pub struct ShutdownHandle {
     io_thread: Option<JoinHandle<(EventLoop<tty::Pty, EventProxy>, IoState)>>,
     shell_pid: i32,
+    master_fd: c_int,
 }
 
 impl ShutdownHandle {
-    /// Join with a deadline; escalate to SIGKILL on the shell's process group
-    /// if the IO thread doesn't wind down in time. Call OFF the UI thread.
+    /// Join with a deadline. The shell is ALWAYS SIGKILLed before the final
+    /// join: dropping alacritty's `EventLoop` runs `Pty::drop`, which SIGHUPs
+    /// the child and then waits unboundedly — and shells can ignore SIGHUP.
+    /// SIGKILL cannot be ignored, so the drop-side wait is guaranteed to
+    /// return. Call OFF the UI thread.
     pub fn join_with_deadline(self, deadline: Duration) {
         let Some(handle) = self.io_thread else { return };
         let start = Instant::now();
-        while !handle.is_finished() {
-            if start.elapsed() >= deadline {
-                unsafe {
-                    let _ = kill(-self.shell_pid, SIGKILL);
-                    let _ = kill(self.shell_pid, SIGKILL);
-                }
-                break;
-            }
+        while !handle.is_finished() && start.elapsed() < deadline {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        // SIGKILL the shell (its group first, if it leads one), then release
+        // the PTY master by dup2'ing /dev/null over it. A session leader
+        // SIGKILLed on a PTY wedges in exit (observed state `Es`) until the
+        // master side is released, and alacritty's Pty::drop waits for the
+        // child BEFORE dropping the master — so joining would deadlock.
+        // dup2 repoints the descriptor without closing it, so Pty keeps sole
+        // ownership of the fd number and its eventual close() is the only
+        // one (no double-close / IO-safety violation). The IO thread has
+        // already stopped (or blown its deadline), so nothing else reads it.
+        if let Ok(devnull) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+        {
+            unsafe {
+                let _ = kill(-self.shell_pid, SIGKILL);
+                let _ = kill(self.shell_pid, SIGKILL);
+                let _ = dup2(std::os::fd::AsRawFd::as_raw_fd(&devnull), self.master_fd);
+            }
+        } else {
+            unsafe {
+                let _ = kill(-self.shell_pid, SIGKILL);
+                let _ = kill(self.shell_pid, SIGKILL);
+            }
         }
         let _ = handle.join();
     }
@@ -527,6 +580,24 @@ fn convert_color(color: AnsiColor) -> CellColor {
 mod tests {
     use super::*;
 
+    /// PTY spawn/teardown uses process-global signal handling (signal-hook
+    /// SIGCHLD registration inside alacritty's tty layer); concurrent
+    /// registration/unregistration across test threads can deadlock teardown.
+    /// Serialize every PTY test.
+    static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_session(cols: usize, lines: usize, cwd: Option<PathBuf>) -> TermSession {
+        TermSession::spawn_with_shell(
+            cols,
+            lines,
+            8,
+            16,
+            cwd,
+            Some(tty::Shell::new("/bin/sh".to_string(), Vec::new())),
+        )
+        .expect("spawn")
+    }
+
     fn wait_for<F: Fn(&RenderableSnapshot) -> bool>(
         session: &mut TermSession,
         predicate: F,
@@ -552,17 +623,28 @@ mod tests {
 
     #[test]
     fn round_trip_output_lands_in_snapshot() {
-        let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("spawn");
+        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = test_session(80, 24, None);
         session.write(b"printf 'NATIVE_%s\\n' OK\r".to_vec());
         let snapshot = wait_for(&mut session, |s| grid_contains(s, "NATIVE_OK"), 15);
-        assert!(grid_contains(&snapshot, "NATIVE_OK"), "grid:\n{}", (0..snapshot.lines).map(|r| row_text(&snapshot, r)).collect::<Vec<_>>().join("\n"));
+        assert!(
+            grid_contains(&snapshot, "NATIVE_OK"),
+            "grid:\n{}",
+            (0..snapshot.lines)
+                .map(|r| row_text(&snapshot, r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         assert!(snapshot.cursor.row.is_some());
-        session.shutdown().join_with_deadline(Duration::from_secs(3));
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
     }
 
     #[test]
     fn exit_surfaces_event_and_snapshot_flag() {
-        let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("spawn");
+        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = test_session(80, 24, None);
         session.write(b"exit 7\r".to_vec());
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut exited = None;
@@ -578,31 +660,42 @@ mod tests {
         // may be normalized; the event itself is the contract.
         assert!(exited.is_some(), "no exit event within deadline");
         assert!(session.sync_and_snapshot().exited.is_some());
-        session.shutdown().join_with_deadline(Duration::from_secs(3));
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
     }
 
     #[test]
     fn resize_applies_on_sync() {
-        let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("spawn");
+        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = test_session(80, 24, None);
         session.queue_resize(100, 30, 8, 16);
         let snapshot = session.sync_and_snapshot();
         assert_eq!(snapshot.cols, 100);
         assert_eq!(snapshot.lines, 30);
-        session.shutdown().join_with_deadline(Duration::from_secs(3));
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
     }
 
     #[test]
     fn cwd_reports_working_directory() {
-        let mut session =
-            TermSession::spawn(80, 24, 8, 16, Some(PathBuf::from("/private/tmp"))).expect("spawn");
+        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = test_session(80, 24, Some(PathBuf::from("/private/tmp")));
         // Wait for the shell to actually start before asking for its cwd.
-        let _ = wait_for(&mut session, |s| grid_contains(s, "$") || grid_contains(s, "%"), 10);
+        let _ = wait_for(
+            &mut session,
+            |s| grid_contains(s, "$") || grid_contains(s, "%"),
+            10,
+        );
         let cwd = session.cwd();
         assert!(
             cwd.as_deref()
                 .is_some_and(|c| c.starts_with("/private/tmp") || c.starts_with("/tmp")),
             "cwd: {cwd:?}"
         );
-        session.shutdown().join_with_deadline(Duration::from_secs(3));
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
     }
 }

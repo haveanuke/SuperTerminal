@@ -9,13 +9,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Numeric terminal handle, monotonically assigned by the caller.
-///
-/// Note: the pane tree itself keeps terminal ids as `String` (uuid-style) for
-/// session-file compatibility; callers that use numeric handles map them to
-/// strings at the boundary.
-pub type TerminalId = u64;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitDirection {
@@ -135,6 +128,7 @@ pub fn remove_terminal(pane: &PaneNode, terminal_id: &str) -> Option<PaneNode> {
 ///
 /// If only one of the two ids is present, that node is relabeled with the
 /// other id (matching the TS store's behavior).
+#[allow(dead_code)] // pane-swap UI is v1.x; logic + tests kept for parity
 pub fn swap_terminals(pane: &PaneNode, a: &str, b: &str) -> PaneNode {
     match pane {
         PaneNode::Terminal { terminal_id } => {

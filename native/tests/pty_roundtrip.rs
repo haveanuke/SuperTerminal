@@ -56,9 +56,11 @@ fn pty_roundtrip_lands_in_grid() {
     )));
 
     // /bin/sh for determinism (user shells may have exotic prompts/plugins).
-    let mut options = tty::Options::default();
-    options.shell = Some(tty::Shell::new("/bin/sh".into(), Vec::new()));
-    options.env.insert("TERM".into(), "dumb".into());
+    let options = tty::Options {
+        shell: Some(tty::Shell::new("/bin/sh".into(), Vec::new())),
+        env: std::collections::HashMap::from([("TERM".to_string(), "dumb".to_string())]),
+        ..Default::default()
+    };
 
     let window_size = WindowSize {
         num_lines: LINES as u16,
