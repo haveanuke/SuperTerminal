@@ -152,9 +152,13 @@ pub struct Workspace {
     /// The pet card remembers when it was opened from the theme sheet so
     /// closing it steps BACK there instead of dropping every sheet.
     pet_card_from_theme: bool,
-    /// Blur-commit for the tab rename arms only after the field's first
-    /// rendered frame — protects against a focus race on creation.
+    /// Blur-commit for the tab rename arms only once the field has been
+    /// OBSERVED focused — protects against a focus race on creation without
+    /// ever stealing focus back from the user.
     rename_blur_armed: bool,
+    /// Renders survived while waiting for that first observed focus; the
+    /// rename dismisses quietly if focus never arrives.
+    rename_grace: u8,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -215,6 +219,7 @@ impl Workspace {
             pet_save_at: None,
             pet_card_from_theme: false,
             rename_blur_armed: false,
+            rename_grace: 0,
             swap_source: None,
         };
         // First launch (or a healed save): persist the hatched identity so
@@ -667,6 +672,7 @@ impl Workspace {
         field.read(cx).focus(window);
         self.rename_field = Some((index, field));
         self.rename_blur_armed = false;
+        self.rename_grace = 0;
         cx.notify();
     }
 
@@ -803,6 +809,17 @@ impl Workspace {
             cx.notify();
             return;
         }
+        self.leave_search_highlights(cx);
+        self.overlay = Overlay::None;
+        self.pet_reroll_armed = false;
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Clear search highlights whenever the Search sheet is being left —
+    /// including sideways switches to another sheet that skip
+    /// `close_overlay`.
+    fn leave_search_highlights(&mut self, cx: &mut Context<Self>) {
         if self.overlay == Overlay::Search {
             if let Some(pane) = self
                 .focused_terminal
@@ -812,10 +829,6 @@ impl Workspace {
                 pane.update(cx, |pane, pane_cx| pane.set_search(None, pane_cx));
             }
         }
-        self.overlay = Overlay::None;
-        self.pet_reroll_armed = false;
-        self.focus_active_pane(window, cx);
-        cx.notify();
     }
 
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1114,6 +1127,7 @@ impl Workspace {
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, _, cx| {
                                     ws.focused_terminal = Some(id_timer.clone());
+                                    ws.leave_search_highlights(cx);
                                     ws.overlay = if ws.overlay == Overlay::AutoRun {
                                         Overlay::None
                                     } else {
@@ -2007,6 +2021,7 @@ impl Workspace {
                 "sessions",
                 |ws, _window, cx| {
                     ws.refresh_sessions();
+                    ws.leave_search_highlights(cx);
                     ws.overlay = if ws.overlay == Overlay::Sessions {
                         Overlay::None
                     } else {
@@ -2019,6 +2034,7 @@ impl Workspace {
             .child(self.overlay_button(
                 "theme",
                 |ws, window, cx| {
+                    ws.leave_search_highlights(cx);
                     ws.overlay = if ws.overlay == Overlay::ThemePicker {
                         Overlay::None
                     } else {
@@ -2719,13 +2735,12 @@ impl Render for Workspace {
         // app's blur behavior) — never re-steal focus from whatever the
         // user clicked.
         if let Some((index, field)) = self.rename_field.clone() {
-            if !self.rename_blur_armed {
-                // First frame after creation: (re)assert focus, then arm the
-                // blur check — a same-frame focus race must not instantly
-                // commit and dismiss an editor the user never saw.
-                field.read(cx).focus(window);
+            let focused = field.read(cx).is_focused(window);
+            if focused {
+                // Focus observed at least once: the blur check is armed.
                 self.rename_blur_armed = true;
-            } else if !field.read(cx).is_focused(window) {
+            } else if self.rename_blur_armed {
+                // Observed focus was lost: commit (old app's blur behavior).
                 let name = field.read(cx).value.trim().to_string();
                 if !name.is_empty() {
                     if let Some(tab) = self.tabs.get_mut(index) {
@@ -2733,6 +2748,13 @@ impl Render for Workspace {
                     }
                 }
                 self.rename_field = None;
+            } else {
+                // Focus never arrived (something stole it at creation): wait
+                // a few renders, then dismiss quietly — never steal it back.
+                self.rename_grace = self.rename_grace.saturating_add(1);
+                if self.rename_grace >= 8 {
+                    self.rename_field = None;
+                }
             }
         }
 
@@ -2780,6 +2802,7 @@ impl Render for Workspace {
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &ToggleThemePicker, window, cx| {
+                ws.leave_search_highlights(cx);
                 ws.overlay = if ws.overlay == Overlay::ThemePicker {
                     Overlay::None
                 } else {
@@ -2790,6 +2813,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &ToggleSessions, _, cx| {
                 ws.refresh_sessions();
+                ws.leave_search_highlights(cx);
                 ws.overlay = if ws.overlay == Overlay::Sessions {
                     Overlay::None
                 } else {
@@ -2806,6 +2830,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &SaveSessionAs, _, cx| {
                 ws.refresh_sessions();
+                ws.leave_search_highlights(cx);
                 ws.overlay = Overlay::Sessions;
                 cx.notify();
             }))
