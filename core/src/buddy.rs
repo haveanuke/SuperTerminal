@@ -32,7 +32,11 @@ pub struct BuddyResult {
 
 impl BuddyResult {
     fn fail(error: &str) -> Self {
-        Self { ok: false, text: String::new(), error: Some(error.to_string()) }
+        Self {
+            ok: false,
+            text: String::new(),
+            error: Some(error.to_string()),
+        }
     }
 }
 
@@ -162,16 +166,15 @@ pub fn run(req: BuddyRequest) -> BuddyResult {
     let code = status.code().unwrap_or(-1);
     let text = clean_output(&stdout);
     if code == 0 && !text.is_empty() {
-        BuddyResult { ok: true, text, error: None }
+        BuddyResult {
+            ok: true,
+            text,
+            error: None,
+        }
     } else {
         let stderr_head: String = strip_ansi(&stderr).chars().take(200).collect();
         BuddyResult::fail(&format!("exit {code}: {stderr_head}"))
     }
-}
-
-#[tauri::command]
-pub fn buddy_react(req: BuddyRequest) -> BuddyResult {
-    run(req)
 }
 
 #[cfg(test)]

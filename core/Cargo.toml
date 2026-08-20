@@ -1,0 +1,9 @@
+[package]
+name = "superterminal-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared backend logic for SuperTerminal (sessions, shell env, cwd lookup, git engine, buddy runner)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

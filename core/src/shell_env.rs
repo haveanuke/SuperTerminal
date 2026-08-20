@@ -77,12 +77,12 @@ pub fn shell_env() -> &'static HashMap<String, String> {
 /// Login-shell PATH, captured once, with a static fallback chain.
 pub fn shell_path() -> &'static str {
     static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| {
-        match run_login_shell("echo -n \"$PATH\"", Duration::from_secs(3)) {
+    PATH.get_or_init(
+        || match run_login_shell("echo -n \"$PATH\"", Duration::from_secs(3)) {
             Some(out) if !out.trim().is_empty() => out.trim().to_string(),
             _ => fallback_path(),
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]

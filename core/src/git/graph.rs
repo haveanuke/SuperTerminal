@@ -1,5 +1,4 @@
 use serde::Serialize;
-use tauri::State;
 
 use super::process::run_git;
 use super::GitState;
@@ -80,7 +79,10 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
 
     for commit in commits {
         // 1. This commit's lane: leftmost expecting it, else first free, else append.
-        let lane = match active.iter().position(|s| s.as_deref() == Some(&commit.hash)) {
+        let lane = match active
+            .iter()
+            .position(|s| s.as_deref() == Some(&commit.hash))
+        {
             Some(j) => j,
             None => match active.iter().position(|s| s.is_none()) {
                 Some(j) => {
@@ -97,9 +99,13 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
         let mut edges: Vec<Edge> = Vec::new();
 
         // 2. Fold any OTHER lane expecting this same hash into `lane` on this row.
+        #[allow(clippy::needless_range_loop)] // active[j] is mutated mid-scan
         for j in 0..active.len() {
             if j != lane && active[j].as_deref() == Some(&commit.hash) {
-                edges.push(Edge { from_lane: j, to_lane: lane });
+                edges.push(Edge {
+                    from_lane: j,
+                    to_lane: lane,
+                });
                 active[j] = None;
             }
         }
@@ -107,7 +113,10 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
         // 3. Continuation edges for every other occupied lane.
         for (j, slot) in active.iter().enumerate() {
             if j != lane && slot.is_some() {
-                edges.push(Edge { from_lane: j, to_lane: j });
+                edges.push(Edge {
+                    from_lane: j,
+                    to_lane: j,
+                });
             }
         }
 
@@ -127,15 +136,27 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
                     // First parent already expected elsewhere: fold into it NOW
                     // (this is what merges a feature branch into its base on the
                     // feature commit's own row).
-                    edges.push(Edge { from_lane: lane, to_lane: k });
+                    edges.push(Edge {
+                        from_lane: lane,
+                        to_lane: k,
+                    });
                     active[lane] = None;
                 } else {
                     active[lane] = Some(p0.clone());
-                    edges.push(Edge { from_lane: lane, to_lane: lane });
+                    edges.push(Edge {
+                        from_lane: lane,
+                        to_lane: lane,
+                    });
                 }
                 for pi in parents {
-                    if let Some(k) = active.iter().position(|s| s.as_deref() == Some(pi.as_str())) {
-                        edges.push(Edge { from_lane: lane, to_lane: k });
+                    if let Some(k) = active
+                        .iter()
+                        .position(|s| s.as_deref() == Some(pi.as_str()))
+                    {
+                        edges.push(Edge {
+                            from_lane: lane,
+                            to_lane: k,
+                        });
                     } else {
                         let k = match active.iter().position(|s| s.is_none()) {
                             Some(k) => {
@@ -147,7 +168,10 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
                                 active.len() - 1
                             }
                         };
-                        edges.push(Edge { from_lane: lane, to_lane: k });
+                        edges.push(Edge {
+                            from_lane: lane,
+                            to_lane: k,
+                        });
                     }
                 }
             }
@@ -169,9 +193,8 @@ pub fn layout(commits: &[CommitNode]) -> GraphData {
     GraphData { rows, lane_count }
 }
 
-#[tauri::command]
-pub fn git_graph(repo_id: String, limit: u32, state: State<'_, GitState>) -> Result<GraphData, String> {
-    let entry = state.entry(&repo_id).ok_or("unknown repo")?;
+pub fn run_graph(state: &GitState, repo_id: &str, limit: u32) -> Result<GraphData, String> {
+    let entry = state.entry(repo_id).ok_or("unknown repo")?;
     let limit = limit.clamp(1, MAX_LIMIT).to_string();
     let out = run_git(
         Some(&entry.root),
@@ -220,9 +243,12 @@ mod tests {
         assert_eq!(g.rows[0].lane, 0);
         assert_eq!(g.rows[1].lane, 1); // f on its own lane
         assert_eq!(g.rows[2].lane, 0); // a back on lane 0
-        // f's line folds into lane 0 on f's own row:
+                                       // f's line folds into lane 0 on f's own row:
         assert!(
-            g.rows[1].edges.iter().any(|e| e.from_lane == 1 && e.to_lane == 0),
+            g.rows[1]
+                .edges
+                .iter()
+                .any(|e| e.from_lane == 1 && e.to_lane == 0),
             "{:?}",
             g.rows[1].edges
         );
@@ -231,7 +257,12 @@ mod tests {
 
     #[test]
     fn octopus_merge_opens_a_lane_per_extra_parent() {
-        let g = layout(&[c("m", &["a", "b", "d"]), c("a", &[]), c("b", &[]), c("d", &[])]);
+        let g = layout(&[
+            c("m", &["a", "b", "d"]),
+            c("a", &[]),
+            c("b", &[]),
+            c("d", &[]),
+        ]);
         assert_eq!(g.lane_count, 3);
         // m's row carries an edge to each parent lane
         assert_eq!(g.rows[0].edges.len(), 3);
@@ -258,9 +289,7 @@ mod tests {
 
     #[test]
     fn parse_log_bounded_split_preserves_odd_subjects() {
-        let raw = format!(
-            "h1\u{1f}p1 p2\u{1f}HEAD -> main, tag: v1, weird,ref\u{1f}Alice\u{1f}1700000000\u{1f}subject with \u{1f} and, commas\0h2\u{1f}\u{1f}\u{1f}Bob\u{1f}1700000001\u{1f}root commit\0"
-        );
+        let raw = "h1\u{1f}p1 p2\u{1f}HEAD -> main, tag: v1, weird,ref\u{1f}Alice\u{1f}1700000000\u{1f}subject with \u{1f} and, commas\0h2\u{1f}\u{1f}\u{1f}Bob\u{1f}1700000001\u{1f}root commit\0".to_string();
         let nodes = parse_log(raw.as_bytes());
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].parents, vec!["p1", "p2"]);

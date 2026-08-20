@@ -5,54 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::State;
 
-use crate::shell_env;
-
-/// Current working directory of a process via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
-/// Direct syscall — libproc-the-crate stubs this out on macOS, and the C struct
-/// layout (vnode_info 152 bytes + MAXPATHLEN 1024, twice = 2352) is stable ABI.
-#[cfg(target_os = "macos")]
-mod proc_cwd {
-    use std::os::raw::{c_int, c_void};
-
-    const PROC_PIDVNODEPATHINFO: c_int = 9;
-
-    #[repr(C)]
-    struct VnodeInfoPath {
-        _vi: [u8; 152],
-        vip_path: [u8; 1024],
-    }
-
-    #[repr(C)]
-    struct ProcVnodePathInfo {
-        pvi_cdir: VnodeInfoPath,
-        pvi_rdir: VnodeInfoPath,
-    }
-
-    extern "C" {
-        fn proc_pidinfo(
-            pid: c_int,
-            flavor: c_int,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: c_int,
-        ) -> c_int;
-    }
-
-    pub fn pid_cwd(pid: i32) -> Option<String> {
-        let mut info = std::mem::MaybeUninit::<ProcVnodePathInfo>::uninit();
-        let size = std::mem::size_of::<ProcVnodePathInfo>() as c_int;
-        let ret = unsafe {
-            proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr() as *mut c_void, size)
-        };
-        if ret <= 0 {
-            return None;
-        }
-        let info = unsafe { info.assume_init() };
-        let path = &info.pvi_cdir.vip_path;
-        let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-        std::str::from_utf8(&path[..len]).ok().map(String::from)
-    }
-}
+use superterminal_core::shell_env;
 
 /// Reservation-based slot: `Creating` blocks duplicate creates without holding
 /// the map lock across the (slow) spawn. Every reservation carries a unique
@@ -92,7 +45,10 @@ pub struct PtyManager {
 #[cfg(test)]
 impl PtyManager {
     fn slot_is_creating(&self, id: &str) -> bool {
-        matches!(self.slots.lock().unwrap().get(id), Some(PtySlot::Creating(_)))
+        matches!(
+            self.slots.lock().unwrap().get(id),
+            Some(PtySlot::Creating(_))
+        )
     }
 
     fn live_pid(&self, id: &str) -> Option<u32> {
@@ -145,7 +101,12 @@ impl PtyManager {
 
         let spawned = (|| -> Result<PtyRecord, String> {
             let pair = native_pty_system()
-                .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .map_err(|e| e.to_string())?;
             let mut cmd = CommandBuilder::new(shell);
             cmd.env_clear();
@@ -340,15 +301,7 @@ impl PtyManager {
                 _ => None,
             }
         }?;
-        #[cfg(target_os = "macos")]
-        {
-            proc_cwd::pid_cwd(pid as i32)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = pid;
-            None
-        }
+        superterminal_core::proc_cwd::pid_cwd(pid as i32)
     }
 }
 

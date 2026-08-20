@@ -1,6 +1,5 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tauri::State;
 
 const DANGEROUS_KEYS: [&str; 3] = ["__proto__", "constructor", "prototype"];
 
@@ -37,9 +36,7 @@ fn validate_pane(v: &Value) -> bool {
             }
             match map.get("sizes") {
                 None => true,
-                Some(Value::Array(sizes)) if sizes.len() == 2 => {
-                    sizes.iter().all(Value::is_number)
-                }
+                Some(Value::Array(sizes)) if sizes.len() == 2 => sizes.iter().all(Value::is_number),
                 Some(_) => false,
             }
         }
@@ -129,7 +126,12 @@ impl SessionManager {
             "savedAt": now_rfc3339(),
         });
         let pretty = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-        std::fs::write(self.file_for(name), pretty).map_err(|e| e.to_string())?;
+        // Atomic write (tmp + rename): the Tauri and native apps share this
+        // directory, so a reader must never observe a half-written file.
+        let dest = self.file_for(name);
+        let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, pretty).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
         Ok(true)
     }
 
@@ -196,33 +198,6 @@ impl SessionManager {
     }
 }
 
-#[tauri::command]
-pub fn session_save(
-    name: String,
-    layout: Value,
-    state: State<'_, SessionManager>,
-) -> Result<bool, String> {
-    state.save(&name, &layout)
-}
-
-#[tauri::command]
-pub fn session_load(
-    name: String,
-    state: State<'_, SessionManager>,
-) -> Result<Option<Value>, String> {
-    state.load(&name)
-}
-
-#[tauri::command]
-pub fn session_list(state: State<'_, SessionManager>) -> Vec<String> {
-    state.list()
-}
-
-#[tauri::command]
-pub fn session_delete(name: String, state: State<'_, SessionManager>) -> bool {
-    state.delete(&name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +234,10 @@ mod tests {
         assert!(loaded["savedAt"].is_string());
         // sanity: the hand-rolled RFC3339 stamp looks like a date
         let stamp = loaded["savedAt"].as_str().unwrap();
-        assert!(stamp.len() == 20 && stamp.ends_with('Z') && &stamp[4..5] == "-", "{stamp}");
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && &stamp[4..5] == "-",
+            "{stamp}"
+        );
     }
 
     #[test]

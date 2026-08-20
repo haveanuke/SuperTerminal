@@ -43,3 +43,22 @@ Window-close / app-quit hook (exact 0.2.2 API verified in Task 0: `on_window_clo
 ## Element trait (gap 7)
 
 `terminal/element.rs` implements gpui 0.2.2 `Element` (exact associated types/method signatures verified against docs.rs/gpui/0.2.2 and the pinned zed rev's `terminal_element.rs` in Task 0 and recorded in the plan before coding).
+
+---
+
+# Rev 2 — Codex review resolutions (BINDING; override rev 1 where they conflict)
+
+1. **One threading interface** (replaces rev-1 `resize()`/`snapshot()`): `Terminal` exposes `write(bytes)`, `queue_resize(TermSize, WindowSize)`, `queue_scroll(delta)`, `set_selection(Option<Selection>)` — all deferred ops — and `sync_and_snapshot() -> RenderableSnapshot`, called once per frame: drains deferred ops, takes the FairMutex once, applies ops, snapshots (cells, cursor, display offset, selection), releases. No other method touches the lock from the UI thread.
+2. **Producer-side wake coalescing:** `EventProxy` holds `dirty: Arc<AtomicBool>`; on `Wakeup` it sends a channel message only on false→true transition; the pump stores `false` before syncing. Bounded queue under output floods (spike-proven dirty-flag pattern + channel wake). Non-Wakeup events (Title, Bell, ChildExit, PtyWrite, ColorRequest, TextAreaSizeRequest) always send; PtyWrite/ColorRequest/TextAreaSizeRequest answered inline on the PTY thread via Notifier (spike-proven).
+3. **Shutdown:** on quit: send `Msg::Shutdown` to ALL terminals first; join IO threads on ONE background thread with a 3s deadline; on expiry SIGKILL the shell process group and detach. Never join on the UI thread; `on_app_quit`'s 100ms budget only triggers this sequence.
+4. **Signal mask:** PTY construction happens on the foreground (main) thread always — codified; no sigmask juggling (spike-proven).
+5. **Core inventory (final):** core = `session` (SessionManager + validation + NEW atomic write via tmp+rename), `shell_env`, `proc_cwd`, `git/` (all logic), `buddy` (logic). src-tauri keeps: pty.rs (portable-pty impl), bg.rs, and thin `#[tauri::command]` wrappers for session/git/buddy. Native v1 consumes session/shell_env/proc_cwd only; git/buddy consumption is v1.x.
+6. **Session sharing between the two apps:** atomic writes (tmp+rename) in core; last-writer-wins; no locking (explicit v1 decision).
+7. **Session UI + reconstruction (v1):** tmux bar gains a sessions overlay (list, save-as-name, load). Load: fresh terminal entity per layout leaf (new uuid, default cwd), preserving tree shape/`sizes`/labels/`activeTabId`. Serializable schema stays the DTO (`layout.rs` PaneNode with String ids); the runtime tree maps DTO ids -> entities in `workspace.rs` (two representations, one conversion — no Entity in the DTO).
+8. **Cwd features concretely:** shell pid = `tcgetpgrp(master_fd)` at query time (foreground process), fall back to spawned child pid; cwd = `proc_cwd(pid)`; overlay refreshes on hover-show + 5s while visible; split inheritance queries at split time; Finder reveal = `/usr/bin/open -R <path>` via std Command. Pid invalid after ChildExit.
+9. **Fonts:** explicit fallback chain ["JetBrains Mono", "Menlo", "Monaco"] via gpui FontFallbacks (Menlo guaranteed on macOS); nothing bundled in v1; nerd-glyph fidelity is fallback-dependent (acceptance reworded accordingly).
+10. **IME-correct input:** printable text flows through gpui's `EntityInputHandler` (`replace_text_in_range` -> PTY write; marked-text ranges held, not sent); `key_down` handles ONLY chords/controls (returns unhandled for printables). Dead-key/CJK verified by manual smoke; pure translation logic unit-tested.
+11. **Rendering:** full repaint per frame in v1 (no damage tracking); DIM = scale fg RGB by 2/3 (never alpha); styled-run batching per row.
+12. **Packaging:** `native/bundle.sh` hand-builds `SuperTerminal Native.app` (Contents/MacOS binary + Info.plist + existing icon.icns) + ad-hoc `codesign`; no bundler dependency. Size target: release `.app` ≤ 20 MB uncompressed.
+13. **Acceptance rewrites:** "single process" -> "one native UI host process plus PTY children; zero WebKit/WebView helper processes". "No emoji" scoped to application chrome (terminal cell content renders whatever programs emit, incl. wide glyphs/emoji via font fallback).
+14. Spike is DONE (passed); all conditional-spike language in spec/brief is void. Brief statements that native consumes git/buddy refer to v1.x, not v1.

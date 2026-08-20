@@ -47,7 +47,11 @@ pub fn run_git(repo: Option<&Path>, args: &[&str], network: bool) -> Result<GitO
         full.push(&repo_str);
     }
     full.extend_from_slice(args);
-    let timeout = if network { NETWORK_TIMEOUT } else { LOCAL_TIMEOUT };
+    let timeout = if network {
+        NETWORK_TIMEOUT
+    } else {
+        LOCAL_TIMEOUT
+    };
     run_command_with_timeout_and_cap("git", &full, timeout, STDOUT_CAP)
 }
 
@@ -222,7 +226,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "timeout after 300ms");
-        assert!(start.elapsed() < Duration::from_secs(10), "must not wait for sleep");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "must not wait for sleep"
+        );
     }
 
     #[test]
@@ -236,6 +243,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "output too large");
-        assert!(start.elapsed() < Duration::from_secs(8), "cap must trip quickly");
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "cap must trip quickly"
+        );
     }
 }
