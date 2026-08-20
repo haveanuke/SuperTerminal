@@ -78,6 +78,8 @@ pub struct GitPanel {
 struct DiffSlot {
     token: u64,
     lines: Option<Vec<DiffLine>>,
+    /// Coalescing flag: while a request runs, polls don't spawn another.
+    in_flight: bool,
 }
 
 pub struct PanelClosed;
@@ -236,7 +238,7 @@ impl GitPanel {
                         let open_keys: Vec<(String, bool)> = panel
                             .file_diffs
                             .iter()
-                            .filter(|(_, slot)| slot.lines.is_some())
+                            .filter(|(_, slot)| slot.lines.is_some() && !slot.in_flight)
                             .map(|(key, _)| key.clone())
                             .collect();
                         let untracked_of = |path: &str| {
@@ -473,6 +475,9 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         let key = (path.clone(), staged);
+        if self.file_diffs.get(&key).is_some_and(|slot| slot.in_flight) {
+            return;
+        }
         self.diff_seq += 1;
         let token = self.diff_seq;
         let previous = self
@@ -485,13 +490,14 @@ impl GitPanel {
                 token,
                 // Keep showing the previous lines during a reload.
                 lines: previous,
+                in_flight: true,
             },
         );
         let state = Arc::clone(&self.state);
-        let generation = self.generation;
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        let repo_id = repo.repo_id.clone();
         cx.notify();
         cx.spawn(async move |panel, cx| {
             let request_path = path.clone();
@@ -515,13 +521,16 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation {
+                // Repo IDENTITY is the invariant (a same-repo cwd change
+                // bumps `generation` but must not strand this result).
+                if panel.repo.as_ref().map(|r| r.repo_id.as_str()) != Some(repo_id.as_str()) {
                     return;
                 }
                 if let Some(slot) = panel.file_diffs.get_mut(&key) {
                     if slot.token != token {
                         return;
                     }
+                    slot.in_flight = false;
                     match result {
                         Ok(lines) => slot.lines = Some(lines),
                         Err(err) => {

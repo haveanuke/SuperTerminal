@@ -289,21 +289,21 @@ impl Workspace {
             self.pet_bubble = None;
             cx.notify();
         }
+        self.pet_tick_count = self.pet_tick_count.wrapping_add(1);
+        // Keep the sidebar following the focused terminal's cwd (a `cd`
+        // changes it without any focus event) — INDEPENDENT of pet
+        // visibility. The panels dedupe unchanged paths, so this is cheap.
+        if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
+            self.push_git_cwd(cx);
+        }
         if !self.settings.buddy_pet_visible {
             return;
         }
-        self.pet_tick_count = self.pet_tick_count.wrapping_add(1);
         if self.pet_hop > 0 {
             self.pet_hop -= 1;
             cx.notify();
         }
         if self.pet_tick_count.is_multiple_of(3) {
-            // Piggyback: keep the sidebar following the focused terminal's
-            // cwd (a `cd` changes it without any focus event). The panels
-            // dedupe unchanged paths, so this is cheap.
-            if self.sidebar_open {
-                self.push_git_cwd(cx);
-            }
             self.pet_frame = (self.pet_frame + 1) % 3;
             // ~1-in-5 frames blink for one tick (300ms), like the old app.
             self.pet_blink = crate::buddy_pet::hash_string(&self.pet_tick_count.to_string(), 7)

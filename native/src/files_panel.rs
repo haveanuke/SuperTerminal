@@ -44,6 +44,8 @@ pub struct FilesPanel {
     next_token: u64,
     /// Inline previews open under file rows: path -> lines once loaded.
     previews: HashMap<PathBuf, Option<Vec<String>>>,
+    /// Newest preview request per path (same pattern as `load_tokens`).
+    preview_tokens: HashMap<PathBuf, u64>,
 }
 
 /// Byte/line caps for inline previews.
@@ -122,6 +124,7 @@ impl FilesPanel {
             load_tokens: HashMap::new(),
             next_token: 0,
             previews: HashMap::new(),
+            preview_tokens: HashMap::new(),
         }
     }
 
@@ -143,6 +146,7 @@ impl FilesPanel {
         self.expanded.clear();
         self.load_tokens.clear();
         self.previews.clear();
+        self.preview_tokens.clear();
         self.root_gen += 1;
         self.load_dir(cwd, cx);
     }
@@ -187,10 +191,14 @@ impl FilesPanel {
     /// Toggle the inline preview under a file row.
     fn toggle_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.previews.remove(&path).is_some() {
+            self.preview_tokens.remove(&path);
             cx.notify();
             return;
         }
         self.previews.insert(path.clone(), None);
+        self.next_token += 1;
+        let token = self.next_token;
+        self.preview_tokens.insert(path.clone(), token);
         let root_gen = self.root_gen;
         cx.notify();
         cx.spawn(async move |panel, cx| {
@@ -200,7 +208,9 @@ impl FilesPanel {
                 .spawn(async move { read_preview(&read_path) })
                 .await;
             let _ = panel.update(cx, |panel: &mut FilesPanel, cx| {
-                if panel.root_gen == root_gen {
+                // Same discipline as directory loads: newest token per path,
+                // same tree generation — a close/reopen races cleanly.
+                if panel.root_gen == root_gen && panel.preview_tokens.get(&path) == Some(&token) {
                     if let Some(slot) = panel.previews.get_mut(&path) {
                         *slot = Some(lines);
                         cx.notify();
