@@ -478,6 +478,14 @@ impl Workspace {
             },
         )
         .detach();
+        let current = self
+            .tabs
+            .get(index)
+            .map(|tab| tab.label.clone())
+            .unwrap_or_default();
+        field.update(cx, |field, field_cx| {
+            field.set_text_selected(&current, field_cx)
+        });
         field.read(cx).focus(window);
         self.rename_field = Some((index, field));
         cx.notify();

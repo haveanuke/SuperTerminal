@@ -1,13 +1,13 @@
-//! Minimal single-line text input for overlay forms (session names).
+//! Single-line text input for overlay forms and inline renames.
 //!
-//! Deliberately simple: character insertion via `key_char`, backspace,
-//! submit/cancel callbacks. Full IME-grade editing is not required for the
-//! short ASCII-ish names this collects.
+//! A real little editor: caret movement, shift-selection, select-all,
+//! clipboard copy/cut/paste, home/end. Indices are char-based throughout;
+//! conversion to byte offsets happens only at slice boundaries.
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, SharedString,
-    Window,
+    div, px, rgb, App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
+    SharedString, Window,
 };
 
 use crate::themes::Theme;
@@ -20,6 +20,10 @@ pub enum TextFieldEvent {
 
 pub struct TextField {
     pub value: String,
+    /// Caret position in chars.
+    caret: usize,
+    /// Selection anchor in chars; selection = anchor..caret (either order).
+    anchor: Option<usize>,
     placeholder: SharedString,
     focus_handle: FocusHandle,
     theme: &'static Theme,
@@ -27,10 +31,19 @@ pub struct TextField {
     compact: bool,
 }
 
+fn byte_index(s: &str, char_index: usize) -> usize {
+    s.char_indices()
+        .nth(char_index)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
 impl TextField {
     pub fn new(placeholder: &str, theme: &'static Theme, cx: &mut Context<Self>) -> Self {
         Self {
             value: String::new(),
+            caret: 0,
+            anchor: None,
             placeholder: placeholder.to_string().into(),
             focus_handle: cx.focus_handle(),
             theme,
@@ -45,6 +58,16 @@ impl TextField {
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.value.clear();
+        self.caret = 0;
+        self.anchor = None;
+        cx.notify();
+    }
+
+    /// Prefill with `text`, fully selected (typing replaces it wholesale).
+    pub fn set_text_selected(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.value = text.to_string();
+        self.caret = self.value.chars().count();
+        self.anchor = (self.caret > 0).then_some(0);
         cx.notify();
     }
 
@@ -56,8 +79,93 @@ impl TextField {
         self.focus_handle.is_focused(window)
     }
 
+    fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        if anchor == self.caret {
+            return None;
+        }
+        Some((anchor.min(self.caret), anchor.max(self.caret)))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let (b0, b1) = (byte_index(&self.value, start), byte_index(&self.value, end));
+        Some(self.value[b0..b1].to_string())
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            return false;
+        };
+        let (b0, b1) = (byte_index(&self.value, start), byte_index(&self.value, end));
+        self.value.replace_range(b0..b1, "");
+        self.caret = start;
+        self.anchor = None;
+        true
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.delete_selection();
+        let at = byte_index(&self.value, self.caret);
+        self.value.insert_str(at, text);
+        self.caret += text.chars().count();
+    }
+
+    fn move_caret(&mut self, to: usize, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.caret);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.caret = to.min(self.value.chars().count());
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
+        let m = &ks.modifiers;
+        let len = self.value.chars().count();
+
+        if m.platform {
+            match ks.key.as_str() {
+                "a" => {
+                    self.anchor = (len > 0).then_some(0);
+                    self.caret = len;
+                    cx.notify();
+                }
+                "c" => {
+                    if let Some(text) = self.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }
+                "x" => {
+                    if let Some(text) = self.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        self.delete_selection();
+                        cx.notify();
+                    }
+                }
+                "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                        self.insert(&clean);
+                        cx.notify();
+                    }
+                }
+                "left" => {
+                    self.move_caret(0, m.shift);
+                    cx.notify();
+                }
+                "right" => {
+                    self.move_caret(len, m.shift);
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match ks.key.as_str() {
             "enter" => {
                 cx.emit(TextFieldEvent::Submitted(self.value.clone()));
@@ -68,18 +176,65 @@ impl TextField {
                 return;
             }
             "backspace" => {
-                self.value.pop();
+                if !self.delete_selection() && self.caret > 0 {
+                    let b0 = byte_index(&self.value, self.caret - 1);
+                    let b1 = byte_index(&self.value, self.caret);
+                    self.value.replace_range(b0..b1, "");
+                    self.caret -= 1;
+                }
+                cx.notify();
+                return;
+            }
+            "delete" => {
+                if !self.delete_selection() && self.caret < len {
+                    let b0 = byte_index(&self.value, self.caret);
+                    let b1 = byte_index(&self.value, self.caret + 1);
+                    self.value.replace_range(b0..b1, "");
+                }
+                cx.notify();
+                return;
+            }
+            "left" => {
+                if !m.shift && self.selection().is_some() {
+                    let (start, _) = self.selection().unwrap();
+                    self.caret = start;
+                    self.anchor = None;
+                } else {
+                    self.move_caret(self.caret.saturating_sub(1), m.shift);
+                }
+                cx.notify();
+                return;
+            }
+            "right" => {
+                if !m.shift && self.selection().is_some() {
+                    let (_, end) = self.selection().unwrap();
+                    self.caret = end;
+                    self.anchor = None;
+                } else {
+                    self.move_caret(self.caret + 1, m.shift);
+                }
+                cx.notify();
+                return;
+            }
+            "home" => {
+                self.move_caret(0, m.shift);
+                cx.notify();
+                return;
+            }
+            "end" => {
+                self.move_caret(len, m.shift);
                 cx.notify();
                 return;
             }
             _ => {}
         }
-        if ks.modifiers.platform || ks.modifiers.control {
+
+        if m.control {
             return;
         }
         if let Some(key_char) = &ks.key_char {
             if !key_char.is_empty() && !key_char.chars().any(char::is_control) {
-                self.value.push_str(key_char);
+                self.insert(key_char);
                 cx.notify();
             }
         }
@@ -98,12 +253,72 @@ impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let focused = self.focus_handle.is_focused(window);
+        let caret_h = if self.compact { 11.0 } else { 14.0 };
+
+        // Value split into [pre-selection][selection][post] with the caret
+        // rendered at its char position.
+        let mut pieces: Vec<gpui::AnyElement> = Vec::new();
         let showing_placeholder = self.value.is_empty();
-        let text: SharedString = if showing_placeholder {
-            self.placeholder.clone()
+        if showing_placeholder {
+            if focused {
+                pieces.push(
+                    div()
+                        .w(px(1.5))
+                        .h(px(caret_h))
+                        .bg(rgb(theme.cursor))
+                        .into_any_element(),
+                );
+            }
+            pieces.push(
+                div()
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(self.placeholder.clone())
+                    .into_any_element(),
+            );
         } else {
-            SharedString::from(self.value.clone())
-        };
+            let (sel_start, sel_end) = self.selection().unwrap_or((self.caret, self.caret));
+            let b_start = byte_index(&self.value, sel_start);
+            let b_end = byte_index(&self.value, sel_end);
+            let pre = self.value[..b_start].to_string();
+            let mid = self.value[b_start..b_end].to_string();
+            let post = self.value[b_end..].to_string();
+            let caret_at_start = self.caret == sel_start;
+
+            let push_caret = |pieces: &mut Vec<gpui::AnyElement>| {
+                if focused {
+                    pieces.push(
+                        div()
+                            .w(px(1.5))
+                            .h(px(caret_h))
+                            .flex_none()
+                            .bg(rgb(theme.cursor))
+                            .into_any_element(),
+                    );
+                }
+            };
+
+            if !pre.is_empty() {
+                pieces.push(div().child(SharedString::from(pre)).into_any_element());
+            }
+            if caret_at_start {
+                push_caret(&mut pieces);
+            }
+            if !mid.is_empty() {
+                pieces.push(
+                    div()
+                        .bg(rgb(theme.selection))
+                        .child(SharedString::from(mid))
+                        .into_any_element(),
+                );
+            }
+            if !caret_at_start {
+                push_caret(&mut pieces);
+            }
+            if !post.is_empty() {
+                pieces.push(div().child(SharedString::from(post)).into_any_element());
+            }
+        }
+
         let (pad_x, pad_y) = if self.compact { (4.0, 0.0) } else { (8.0, 4.0) };
         div()
             .track_focus(&self.focus_handle)
@@ -120,19 +335,12 @@ impl Render for TextField {
             } else {
                 theme.ui_border
             }))
-            .text_color(rgb(if showing_placeholder {
-                theme.ui_text_muted
-            } else {
-                theme.ui_text
-            }))
-            .child(text)
-            .child(div().w(px(1.5)).h(px(14.0)).bg(rgb(if focused {
-                theme.cursor
-            } else {
-                theme.ui_background
-            })))
+            .text_color(rgb(theme.ui_text))
             .flex()
             .flex_row()
             .items_center()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .children(pieces)
     }
 }
