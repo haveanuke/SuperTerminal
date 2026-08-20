@@ -97,6 +97,22 @@ struct PetDrag {
     moved: bool,
 }
 
+/// Busy history for one terminal, driving the "done working" cues.
+struct CueState {
+    busy: bool,
+    busy_since: Option<std::time::Instant>,
+    /// Whether the running job had already gone output-quiet (cued).
+    quiet_cued: bool,
+    last_cue: Option<std::time::Instant>,
+}
+
+/// Fire-and-forget system sound.
+fn play_sound(name: &str) {
+    let _ = std::process::Command::new("/usr/bin/afplay")
+        .arg(format!("/System/Library/Sounds/{name}.aiff"))
+        .spawn();
+}
+
 struct DragState {
     tab_index: usize,
     /// The window this drag started in — resizes must never follow an
@@ -145,6 +161,10 @@ pub struct Workspace {
     sidebar_status_cache: HashMap<String, (String, bool)>,
     /// Projects collapsed in the sidebar (by tab id).
     collapsed_projects: std::collections::HashSet<String>,
+    /// Per-terminal busy tracking for audio cues.
+    cue_track: HashMap<String, CueState>,
+    /// The currently speaking `say` process (killed before a new note).
+    tts_child: Option<std::process::Child>,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -229,6 +249,8 @@ impl Workspace {
             sidebar_view: SidebarView::Projects,
             sidebar_status_cache: HashMap::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            cue_track: HashMap::new(),
+            tts_child: None,
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -286,6 +308,75 @@ impl Workspace {
         let _ = self.settings.save();
     }
 
+    /// Detect "done working" transitions and chime: a terminal that was
+    /// busy 5s+ returning to the prompt plays Glass; an interactive job
+    /// going output-quiet (awaiting input, e.g. claude finishing) plays
+    /// Ping. Quick commands never ding; per-terminal cues are spaced 5s.
+    fn audio_cue_tick(&mut self, cx: &mut Context<Self>) {
+        const MIN_BUSY: Duration = Duration::from_secs(5);
+        const MIN_GAP: Duration = Duration::from_secs(5);
+        const QUIET: Duration = Duration::from_secs(3);
+        let now = std::time::Instant::now();
+        let mut cues: Vec<&'static str> = Vec::new();
+        for (id, pane) in &self.panes {
+            let pane_ref = pane.read(cx);
+            let busy = pane_ref.foreground_busy();
+            let quiet = pane_ref.last_activity.elapsed() >= QUIET;
+            let state = self.cue_track.entry(id.clone()).or_insert(CueState {
+                busy,
+                busy_since: busy.then_some(now),
+                quiet_cued: false,
+                last_cue: None,
+            });
+            let worked_long_enough = state
+                .busy_since
+                .is_some_and(|since| now.duration_since(since) >= MIN_BUSY);
+            let gap_ok = state
+                .last_cue
+                .is_none_or(|last| now.duration_since(last) >= MIN_GAP);
+            if state.busy && !busy {
+                // Job finished, back at the prompt.
+                if worked_long_enough && gap_ok {
+                    cues.push("Glass");
+                    state.last_cue = Some(now);
+                }
+                state.busy_since = None;
+                state.quiet_cued = false;
+            } else if !state.busy && busy {
+                state.busy_since = Some(now);
+                state.quiet_cued = false;
+            } else if busy && quiet && !state.quiet_cued {
+                // Interactive job stopped producing output: awaiting input.
+                if worked_long_enough && gap_ok {
+                    cues.push("Ping");
+                    state.last_cue = Some(now);
+                }
+                state.quiet_cued = true;
+            } else if busy && !quiet {
+                state.quiet_cued = false;
+            }
+            state.busy = busy;
+        }
+        let live: std::collections::HashSet<&String> = self.panes.keys().collect();
+        self.cue_track.retain(|id, _| live.contains(id));
+        // One chime per tick even if several terminals finished together.
+        if let Some(name) = cues.first() {
+            play_sound(name);
+        }
+    }
+
+    /// Speak a buddy note via macOS `say`, replacing any current speech.
+    fn speak_note(&mut self, text: &str) {
+        if let Some(mut child) = self.tts_child.take() {
+            let _ = child.kill();
+        }
+        let capped: String = text.chars().take(400).collect();
+        self.tts_child = std::process::Command::new("/usr/bin/say")
+            .arg(capped)
+            .spawn()
+            .ok();
+    }
+
     /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
     /// decay, and speech-bubble expiry.
     fn pet_tick(&mut self, cx: &mut Context<Self>) {
@@ -308,6 +399,9 @@ impl Workspace {
         // Keep the sidebar following the focused terminal's cwd (a `cd`
         // changes it without any focus event) — INDEPENDENT of pet
         // visibility. The panels dedupe unchanged paths, so this is cheap.
+        if self.pet_tick_count.is_multiple_of(3) && self.settings.audio_cues {
+            self.audio_cue_tick(cx);
+        }
         if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
             self.push_git_cwd(cx);
             // The projects view's activity dots decay with time alone and
@@ -433,6 +527,9 @@ impl Workspace {
                     ws.buddy_last_hash = hash;
                     ws.buddy_backoff_until = None;
                     ws.buddy_note = Some(result.text.clone());
+                    if ws.settings.buddy_tts {
+                        ws.speak_note(&result.text);
+                    }
                     ws.pet_bubble = Some((result.text, std::time::Instant::now()));
                     cx.notify();
                 } else {
@@ -2383,6 +2480,58 @@ impl Workspace {
             )
     }
 
+    fn render_alerts_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .child(div().w(px(72.0)).child("alerts"))
+            .child(self.chip_button(
+                if self.settings.audio_cues {
+                    "cues: on"
+                } else {
+                    "cues: off"
+                },
+                self.settings.audio_cues,
+                |ws, _window, cx| {
+                    ws.settings.audio_cues = !ws.settings.audio_cues;
+                    let _ = ws.settings.save();
+                    if ws.settings.audio_cues {
+                        play_sound("Glass");
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.chip_button(
+                if self.settings.buddy_tts {
+                    "buddy voice: on"
+                } else {
+                    "buddy voice: off"
+                },
+                self.settings.buddy_tts,
+                |ws, _window, cx| {
+                    ws.settings.buddy_tts = !ws.settings.buddy_tts;
+                    let _ = ws.settings.save();
+                    if ws.settings.buddy_tts {
+                        ws.speak_note("buddy voice on");
+                    } else if let Some(mut child) = ws.tts_child.take() {
+                        let _ = child.kill();
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .child("terminal done: Glass - awaiting input: Ping"),
+            )
+    }
+
     /// Configure and enable the reviewer with a preset agent command.
     fn set_buddy_agent(&mut self, command: &str, args: &[&str], cx: &mut Context<Self>) {
         self.settings.buddy_command = command.to_string();
@@ -2798,6 +2947,7 @@ impl Workspace {
                         .child(self.render_font_family_row(window, cx))
                         .child(self.render_background_row(cx))
                         .child(self.render_buddy_row(cx))
+                        .child(self.render_alerts_row(cx))
                         .child(
                             div()
                                 .flex()

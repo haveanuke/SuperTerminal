@@ -264,6 +264,11 @@ impl TerminalPane {
         self.session.as_ref().is_some_and(|s| !s.is_exited())
     }
 
+    /// Cheap busy probe (no cwd lookup) for the always-on cue poll.
+    pub fn foreground_busy(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.foreground_busy())
+    }
+
     /// (cwd, foreground-job-running) in one probe.
     pub fn status(&self) -> (Option<String>, bool) {
         self.session

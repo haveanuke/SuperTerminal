@@ -439,6 +439,16 @@ impl TermSession {
         self.exited.is_some()
     }
 
+    /// Busy probe WITHOUT the cwd lookup: one tcgetpgrp, nothing else —
+    /// cheap enough for an always-on poll.
+    pub fn foreground_busy(&self) -> bool {
+        if self.exited.is_some() {
+            return false;
+        }
+        let fg = unsafe { tcgetpgrp(self.master_fd) };
+        fg > 0 && fg != self.shell_pid
+    }
+
     /// One ioctl for both answers: (cwd, foreground-job-owns-terminal).
     /// A failed tcgetpgrp reads as "no job" (ready) — indistinguishable
     /// from the prompt without shell integration.

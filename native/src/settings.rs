@@ -25,6 +25,10 @@ pub struct Settings {
     pub buddy_pet_visible: bool,
     /// Last dragged pet position (window coordinates), clamped on render.
     pub buddy_pet_pos: Option<(f32, f32)>,
+    /// Audio cue when a terminal finishes working / awaits input.
+    pub audio_cues: bool,
+    /// Speak buddy review notes aloud (macOS `say`).
+    pub buddy_tts: bool,
     /// Imported custom themes, in the old app's export JSON format.
     pub custom_themes: Vec<serde_json::Value>,
 }
@@ -45,6 +49,8 @@ impl Default for Settings {
             buddy_companion: None,
             buddy_pet_visible: true,
             buddy_pet_pos: None,
+            audio_cues: true,
+            buddy_tts: false,
             custom_themes: Vec::new(),
         }
     }
@@ -139,6 +145,8 @@ mod tests {
             }),
             buddy_pet_visible: false,
             buddy_pet_pos: Some((120.0, 240.0)),
+            audio_cues: false,
+            buddy_tts: true,
             custom_themes: Vec::new(),
         };
         s.save_to(&path).unwrap();
