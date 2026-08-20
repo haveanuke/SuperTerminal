@@ -454,7 +454,7 @@ impl Workspace {
         }
     }
 
-    fn start_tab_rename(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn start_tab_rename(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let theme = self.theme;
         let field = cx.new(|field_cx| TextField::new("tab name", theme, field_cx).compact());
         cx.subscribe(
@@ -478,6 +478,7 @@ impl Workspace {
             },
         )
         .detach();
+        field.read(cx).focus(window);
         self.rename_field = Some((index, field));
         cx.notify();
     }
@@ -1219,7 +1220,7 @@ impl Workspace {
                                 return; // typing into the rename field
                             }
                             if event.click_count >= 2 {
-                                ws.start_tab_rename(index, cx);
+                                ws.start_tab_rename(index, window, cx);
                             } else {
                                 ws.select_tab(index, cx);
                                 ws.focus_active_pane(window, cx);
@@ -1793,8 +1794,19 @@ impl Render for Workspace {
             None => div().size_full().into_any_element(),
         };
 
-        if let Some((_, field)) = &self.rename_field {
-            field.read(cx).focus(window);
+        // Clicking away from a tab rename commits it (matching the old
+        // app's blur behavior) — never re-steal focus from whatever the
+        // user clicked.
+        if let Some((index, field)) = self.rename_field.clone() {
+            if !field.read(cx).is_focused(window) {
+                let name = field.read(cx).value.trim().to_string();
+                if !name.is_empty() {
+                    if let Some(tab) = self.tabs.get_mut(index) {
+                        tab.label = name;
+                    }
+                }
+                self.rename_field = None;
+            }
         }
 
         let background_layer = self.settings.background_image.as_ref().map(|path| {

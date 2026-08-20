@@ -52,6 +52,10 @@ impl TextField {
         self.focus_handle.focus(window);
     }
 
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle.is_focused(window)
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         match ks.key.as_str() {
