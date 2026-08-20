@@ -143,6 +143,9 @@ pub struct Workspace {
     pet_name_field: Option<Entity<TextField>>,
     /// Two-click confirm for re-roll (it permanently replaces the pet).
     pet_reroll_armed: bool,
+    /// Debounce for pet-count persistence: rapid petting must not write
+    /// settings to disk on every click.
+    pet_save_at: Option<std::time::Instant>,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -200,6 +203,7 @@ impl Workspace {
             pet_pos,
             pet_name_field: None,
             pet_reroll_armed: false,
+            pet_save_at: None,
             swap_source: None,
         };
         // First launch (or a healed save): persist the hatched identity so
@@ -241,6 +245,13 @@ impl Workspace {
     /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
     /// decay, and speech-bubble expiry.
     fn pet_tick(&mut self, cx: &mut Context<Self>) {
+        if self
+            .pet_save_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+        {
+            self.pet_save_at = None;
+            self.save_companion();
+        }
         if self
             .pet_bubble
             .as_ref()
@@ -371,6 +382,10 @@ impl Workspace {
     /// Collect shutdown handles for every live pane plus any pending ones.
     /// The caller joins them OFF the UI thread with a bounded deadline.
     pub fn shutdown_all(&mut self, cx: &mut Context<Self>) -> Vec<ShutdownHandle> {
+        // Flush a debounced pet-count save so quitting mid-pet loses nothing.
+        if self.pet_save_at.take().is_some() {
+            self.save_companion();
+        }
         let mut handles: Vec<ShutdownHandle> =
             self.pending_shutdowns.lock().unwrap().drain(..).collect();
         for pane in self.panes.values() {
@@ -1450,9 +1465,10 @@ impl Workspace {
         if self.pet_name_field.is_none() {
             let theme_ref = self.theme;
             let field = cx.new(|field_cx| TextField::new("name", theme_ref, field_cx));
-            cx.subscribe(
+            cx.subscribe_in(
                 &field,
-                |ws, _field, event: &TextFieldEvent, cx| match event {
+                window,
+                |ws, _field, event: &TextFieldEvent, window, cx| match event {
                     TextFieldEvent::Submitted(name) => {
                         let name: String = name.trim().chars().take(14).collect();
                         if !name.is_empty() {
@@ -1462,8 +1478,7 @@ impl Workspace {
                         cx.notify();
                     }
                     TextFieldEvent::Cancelled => {
-                        ws.overlay = Overlay::None;
-                        cx.notify();
+                        ws.close_overlay(window, cx);
                     }
                 },
             )
@@ -1475,9 +1490,9 @@ impl Workspace {
             field.update(cx, |field, field_cx| {
                 field.set_text_selected(&name, field_cx)
             });
+            field.read(cx).focus(window);
         }
         self.pet_reroll_armed = false;
-        window.focus(&self.focus_handle);
         self.overlay = Overlay::PetCard;
         cx.notify();
     }
@@ -1502,7 +1517,7 @@ impl Workspace {
             .unwrap_or((vw - PET_W - 24.0, vh - PET_H - 60.0));
         let x = x.clamp(0.0, (vw - PET_W).max(0.0));
         let y = y.clamp(34.0, (vh - PET_H).max(34.0));
-        let hop = if self.pet_hop > 0 { -5.0 } else { 0.0 };
+        let hop = if self.pet_hop > 0 { 5.0 } else { 0.0 };
         let art = self.companion.art_frame(self.pet_frame, self.pet_blink);
         let color = self.companion.rarity_color();
         let bubble = self.pet_bubble.as_ref().map(|(text, _)| text.clone());
@@ -1510,8 +1525,12 @@ impl Workspace {
             div()
                 .id("buddy-pet")
                 .absolute()
-                .left(px(x))
-                .top(px(y + hop))
+                // Anchor the RIGHT and BOTTOM edges of the creature: a speech
+                // bubble then grows up and to the left instead of shoving the
+                // pet around or spilling off-screen. `(x, y)` stays the
+                // creature's top-left for the drag math.
+                .right(px((vw - x - PET_W).max(0.0)))
+                .bottom(px(vh - PET_H - y + hop))
                 .flex()
                 .flex_col()
                 .items_end()
@@ -2386,7 +2405,10 @@ impl Workspace {
             .gap(px(8.0))
             .text_size(px(12.0))
             .text_color(rgb(theme.ui_text))
-            .on_mouse_down(MouseButton::Left, |_, _, _| {}) // swallow
+            // Swallow clicks so sheet chrome never reaches the terminal
+            // beneath (child controls have already handled theirs by the
+            // time this bubbles).
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .flex()
@@ -2615,8 +2637,10 @@ impl Render for Workspace {
                             let _ = ws.settings.save();
                         } else {
                             // A plain click is a pet: bump the count, hop.
-                            ws.companion.save.pet_count += 1;
-                            ws.save_companion();
+                            // The count persists after a 1s quiet debounce.
+                            ws.companion.save.pet_count =
+                                ws.companion.save.pet_count.saturating_add(1);
+                            ws.pet_save_at = Some(std::time::Instant::now());
                             ws.pet_hop = 2;
                         }
                         cx.notify();
