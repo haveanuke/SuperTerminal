@@ -1626,9 +1626,10 @@ impl Workspace {
                     let theme_ref = self.theme;
                     let field = cx
                         .new(|field_cx| TextField::new("find in scrollback", theme_ref, field_cx));
-                    cx.subscribe(
+                    cx.subscribe_in(
                         &field,
-                        |ws, field, event: &TextFieldEvent, cx| match event {
+                        window,
+                        |ws, field, event: &TextFieldEvent, window, cx| match event {
                             TextFieldEvent::Submitted(_) => {
                                 // Enter jumps to the next (older) match.
                                 let needle = field.read(cx).value.clone();
@@ -1642,13 +1643,9 @@ impl Workspace {
                                 }
                             }
                             TextFieldEvent::Cancelled => {
-                                if let Some(pane) =
-                                    ws.focused_terminal.as_ref().and_then(|id| ws.panes.get(id))
-                                {
-                                    pane.update(cx, |pane, pane_cx| pane.set_search(None, pane_cx));
-                                }
-                                ws.overlay = Overlay::None;
-                                cx.notify();
+                                // Same close path as the toolbar/root-escape:
+                                // clears highlights and restores pane focus.
+                                ws.close_overlay(window, cx);
                             }
                         },
                     )

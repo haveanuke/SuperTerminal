@@ -167,6 +167,22 @@ impl GitPanel {
                         let branch_changed = panel.report.as_ref().is_some_and(|prev| {
                             prev.branch != report.branch || prev.detached != report.detached
                         });
+                        // Disarm a pending discard unless the armed entry is
+                        // still exactly what it was — the second click must
+                        // never delete contents the user hasn't seen.
+                        if let Some(armed) = panel.pending_discard.clone() {
+                            let entry_state = |r: &StatusReport| {
+                                r.entries
+                                    .iter()
+                                    .find(|e| e.path == armed)
+                                    .map(|e| (e.kind.clone(), e.worktree_status.clone()))
+                            };
+                            let prev = panel.report.as_ref().and_then(&entry_state);
+                            let now = entry_state(&report);
+                            if branch_changed || now.is_none() || prev != now {
+                                panel.pending_discard = None;
+                            }
+                        }
                         panel.report = Some(report);
                         if branch_changed {
                             panel.refresh_graph(cx);
@@ -225,7 +241,10 @@ impl GitPanel {
         self.error = None;
         self.pending_discard = None;
         cx.notify();
-        let is_commit = matches!(op, GitOp::Commit(_));
+        let commit_message = match &op {
+            GitOp::Commit(message) => Some(message.clone()),
+            _ => None,
+        };
         let state = Arc::clone(&self.state);
         let generation = self.generation;
         cx.spawn(async move |panel, cx| {
@@ -266,9 +285,13 @@ impl GitPanel {
                 match result {
                     Ok(action) => {
                         panel.report = Some(action.report);
-                        if is_commit {
+                        if let Some(message) = &commit_message {
+                            // Clear only the message that was committed — the
+                            // user may already be drafting the next one.
                             panel.commit_field.update(cx, |field, field_cx| {
-                                field.reset(field_cx);
+                                if field.value.trim() == message.as_str() {
+                                    field.reset(field_cx);
+                                }
                             });
                         }
                         panel.refresh_graph(cx);
