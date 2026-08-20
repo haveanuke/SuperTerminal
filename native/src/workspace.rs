@@ -109,6 +109,17 @@ struct CueState {
 /// One line of `say -v ?`: name (may contain spaces and suffixes like
 /// "(Enhanced)"), then a locale token, then "# sample". The name is
 /// everything before the locale token.
+/// Break every `[[` pair (repeatedly — overlapping runs like `[[[` must
+/// not survive a single pass) so note text cannot open an embedded
+/// speech command.
+fn neutralize_say_commands(text: &str) -> String {
+    let mut out = text.to_string();
+    while out.contains("[[") {
+        out = out.replace("[[", "[ [");
+    }
+    out
+}
+
 fn parse_voice_name(line: &str) -> Option<String> {
     let before_hash = line.split('#').next()?.trim_end();
     let name = before_hash
@@ -409,11 +420,7 @@ impl Workspace {
         }
         // `[[` opens say's embedded-command syntax; model-authored note
         // text must not be able to smuggle rate/volume/etc commands.
-        let capped: String = text
-            .chars()
-            .take(400)
-            .collect::<String>()
-            .replace("[[", "[ [");
+        let capped = neutralize_say_commands(&text.chars().take(400).collect::<String>());
         let mut command = std::process::Command::new("/usr/bin/say");
         if let Some(voice) = &self.settings.buddy_tts_voice {
             command.arg("-v").arg(voice);
@@ -445,6 +452,7 @@ impl Workspace {
                         .args(["-v", "?"])
                         .output()
                         .ok()
+                        .filter(|out| out.status.success())
                         .map(|out| {
                             String::from_utf8_lossy(&out.stdout)
                                 .lines()
@@ -3958,5 +3966,35 @@ impl Render for Workspace {
             .children(self.render_pet(window, cx))
             .children(self.render_pet_bubble(window, cx))
             .children(self.render_overlay(window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_names_survive_spaces_and_variants() {
+        assert_eq!(
+            parse_voice_name("Albert              en_US    # Hello!"),
+            Some("Albert".to_string())
+        );
+        assert_eq!(
+            parse_voice_name("Bad News            en_US    # ..."),
+            Some("Bad News".to_string())
+        );
+        assert_eq!(
+            parse_voice_name("Ava (Premium)       en_US    # ..."),
+            Some("Ava (Premium)".to_string())
+        );
+        assert_eq!(parse_voice_name(""), None);
+    }
+
+    #[test]
+    fn say_command_injection_is_neutralized() {
+        assert!(!neutralize_say_commands("[[rate 500]]").contains("[["));
+        assert!(!neutralize_say_commands("[[[[volm 1]]").contains("[["));
+        assert!(!neutralize_say_commands("[[[").contains("[["));
+        assert_eq!(neutralize_say_commands("plain [text]"), "plain [text]");
     }
 }
