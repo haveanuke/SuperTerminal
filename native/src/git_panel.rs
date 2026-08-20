@@ -661,11 +661,18 @@ impl GitPanel {
         entries: Vec<StatusEntry>,
         staged: bool,
         header_actions: Vec<gpui::AnyElement>,
+        show_when_empty: bool,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        if entries.is_empty() {
+        if entries.is_empty() && !show_when_empty {
             return None;
         }
+        // Bulk actions make no sense over nothing.
+        let header_actions = if entries.is_empty() {
+            Vec::new()
+        } else {
+            header_actions
+        };
         let theme = self.theme;
         let count = entries.len();
         Some(
@@ -1141,12 +1148,19 @@ impl Render for GitPanel {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .children(self.section("merge changes", conflicts, false, Vec::new(), cx))
+                    .children(self.section(
+                        "merge changes",
+                        conflicts,
+                        false,
+                        Vec::new(),
+                        false,
+                        cx,
+                    ))
                     .children({
                         let actions = vec![self
                             .chip("unstage all", GitOp::UnstageAll, cx)
                             .into_any_element()];
-                        self.section("staged changes", staged, true, actions, cx)
+                        self.section("staged changes", staged, true, actions, false, cx)
                     })
                     .children({
                         let actions = vec![
@@ -1155,7 +1169,7 @@ impl Render for GitPanel {
                             self.chip("stage all", GitOp::StageAll, cx)
                                 .into_any_element(),
                         ];
-                        self.section("changes", changes, false, actions, cx)
+                        self.section("changes", changes, false, actions, true, cx)
                     })
                     .child(self.render_graph(cx)),
             )
