@@ -985,7 +985,7 @@ impl Render for GitPanel {
             .flex()
             .flex_col()
             .bg(rgb(theme.ui_background))
-            .border_l_1()
+            .border_r_1()
             .border_color(rgb(theme.ui_border))
             .text_size(px(11.0))
             .text_color(rgb(theme.ui_text));

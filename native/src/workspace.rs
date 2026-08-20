@@ -840,6 +840,55 @@ impl Workspace {
         }
     }
 
+    /// The left sidebar: a slim activity rail plus the active view. Only
+    /// git lives here today; future views join the rail and tab between.
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let panel = self.git_panel.clone()?;
+        let theme = self.theme;
+        Some(
+            div()
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_row()
+                .child(
+                    div()
+                        .w(px(34.0))
+                        .h_full()
+                        .flex_none()
+                        .bg(rgb(theme.ui_surface))
+                        .border_r_1()
+                        .border_color(rgb(theme.ui_border))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(6.0))
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .id("rail-git")
+                                .cursor_pointer()
+                                .px(px(4.0))
+                                .py(px(3.0))
+                                .rounded(px(3.0))
+                                .text_size(px(9.0))
+                                .text_color(rgb(theme.ui_accent))
+                                .bg(rgb(theme.ui_background))
+                                .hover(|style| style.bg(rgb(theme.ui_border)))
+                                .child("git")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|ws, _, window, cx| {
+                                        ws.toggle_git_panel(cx);
+                                        ws.focus_active_pane(window, cx);
+                                    }),
+                                ),
+                        ),
+                )
+                .child(panel),
+        )
+    }
+
     fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
         if self.git_panel.take().is_none() {
             let theme = self.theme;
@@ -2991,21 +3040,21 @@ impl Render for Workspace {
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
             .child(
-                // Content row: the terminal tree, with the git panel docked
-                // on the right when open.
+                // Content row: the sidebar (activity rail + view) on the
+                // left, the terminal tree filling the rest.
                 div()
                     .flex_grow()
                     .overflow_hidden()
                     .flex()
                     .flex_row()
+                    .children(self.render_sidebar(cx))
                     .child(
                         div()
                             .flex_grow()
                             .overflow_hidden()
                             .relative()
                             .child(content),
-                    )
-                    .children(self.git_panel.clone()),
+                    ),
             )
             .child(self.render_bar(cx))
             .children(self.render_pet(window, cx))
