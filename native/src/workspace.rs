@@ -114,6 +114,10 @@ struct CueState {
     busy_since: Option<std::time::Instant>,
     /// Whether the running job had already gone output-quiet (cued).
     quiet_cued: bool,
+    /// Start of the current continuous-output streak. Idle TUIs (claude's
+    /// spinner) emit sparse blips; only a SUSTAINED streak re-arms the
+    /// awaiting-input cue, so blips can't ping repeatedly.
+    active_since: Option<std::time::Instant>,
     last_cue: Option<std::time::Instant>,
 }
 
@@ -218,6 +222,10 @@ pub struct Workspace {
     /// After a failed run, hold off retries until this instant so a broken
     /// command doesn't respawn every tick.
     buddy_backoff_until: Option<std::time::Instant>,
+    /// Candidate content awaiting stability: idle-TUI blips (clocks,
+    /// spinners) change the hash constantly; only content unchanged for
+    /// two ticks gets reviewed.
+    buddy_pending_hash: Option<(u64, std::time::Instant)>,
     /// The pet: visual personality only — its bubble text is reviewer output.
     companion: Companion,
     pet_frame: usize,
@@ -305,6 +313,7 @@ impl Workspace {
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             buddy_last_hash: 0,
             buddy_backoff_until: None,
+            buddy_pending_hash: None,
             companion,
             pet_frame: 0,
             pet_blink: false,
@@ -378,6 +387,7 @@ impl Workspace {
                 busy,
                 busy_since: busy.then_some(now),
                 quiet_cued: false,
+                active_since: None,
                 last_cue: None,
             });
             let worked_long_enough = state
@@ -406,8 +416,17 @@ impl Workspace {
                     state.last_cue = Some(now);
                     state.quiet_cued = true;
                 }
+                state.active_since = None;
             } else if busy && !quiet {
-                state.quiet_cued = false;
+                // Re-arm only after 5s of CONTINUOUS output — a spinner
+                // blip is not "working again".
+                match state.active_since {
+                    None => state.active_since = Some(now),
+                    Some(since) if now.duration_since(since) >= Duration::from_secs(5) => {
+                        state.quiet_cued = false;
+                    }
+                    Some(_) => {}
+                }
             }
             state.busy = busy;
         }
@@ -590,6 +609,20 @@ impl Workspace {
         {
             return;
         }
+        // Content must hold still for ~8s (two ticks) before a review — a
+        // changing hash means the screen is still animating.
+        let now = std::time::Instant::now();
+        match self.buddy_pending_hash {
+            Some((pending, since)) if pending == hash => {
+                if now.duration_since(since) < Duration::from_secs(8) {
+                    return;
+                }
+            }
+            _ => {
+                self.buddy_pending_hash = Some((hash, now));
+                return;
+            }
+        }
         let cwd = pane_ref.cwd();
         let command = self.settings.buddy_command.clone();
         let args = self.settings.buddy_args.clone();
@@ -616,6 +649,16 @@ impl Workspace {
                                 .collect::<String>()
                         })
                         .unwrap_or_default();
+                    // The buddy reviews CHANGES; with nothing in the working
+                    // tree there is nothing to say — stay silent (the
+                    // failure path's backoff retries once changes exist).
+                    if diff.trim().is_empty() {
+                        return superterminal_core::buddy::BuddyResult {
+                            ok: false,
+                            text: String::new(),
+                            error: None,
+                        };
+                    }
                     let tail: String = text.chars().rev().take(2000).collect::<String>()
                         .chars().rev().collect();
                     let prompt = format!(

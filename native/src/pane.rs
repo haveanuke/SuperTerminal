@@ -93,6 +93,10 @@ pub struct TerminalPane {
     /// (origin_x, origin_y, width, height) written during prepaint by the
     /// measuring canvas; applied outside the render pass.
     pending_bounds: std::sync::Arc<std::sync::Mutex<Option<MeasuredBounds>>>,
+    /// Resize debounce: the size waiting to be applied and when it last
+    /// changed, plus when a resize was last delivered to the PTY.
+    resize_candidate: Option<(Pixels, Pixels, std::time::Instant)>,
+    last_resize_applied: std::time::Instant,
 }
 
 const PADDING: f32 = 6.0;
@@ -135,8 +139,36 @@ impl TerminalPane {
                     let measured = pane.pending_bounds.lock().unwrap().take();
                     if let Some((x, y, w, h)) = measured {
                         pane.origin = (x, y);
-                        pane.resize_to(w, h);
-                        cx.notify();
+                        // Coalesce resizes: every PTY resize SIGWINCHes the
+                        // foreground app into a full re-render, and inline
+                        // TUIs (claude) leave a stale copy in scrollback per
+                        // repaint during live drags. Leading edge keeps
+                        // one-shot changes (fullscreen toggle) instant;
+                        // continuous changes wait until the size settles.
+                        let now = std::time::Instant::now();
+                        let changed = pane
+                            .resize_candidate
+                            .map(|(cw, ch, _)| cw != w || ch != h)
+                            .unwrap_or(true);
+                        if changed {
+                            let calm = now.duration_since(pane.last_resize_applied)
+                                >= Duration::from_millis(400);
+                            if calm && pane.resize_candidate.is_none() {
+                                pane.last_resize_applied = now;
+                                pane.resize_to(w, h);
+                                cx.notify();
+                            } else {
+                                pane.resize_candidate = Some((w, h, now));
+                            }
+                        }
+                    }
+                    if let Some((w, h, since)) = pane.resize_candidate {
+                        if since.elapsed() >= Duration::from_millis(150) {
+                            pane.resize_candidate = None;
+                            pane.last_resize_applied = std::time::Instant::now();
+                            pane.resize_to(w, h);
+                            cx.notify();
+                        }
                     }
                     // Auto-run: fire the command every interval (ticks are
                     // ~16ms). ESC lands escape_delay into each cycle without
@@ -224,6 +256,8 @@ impl TerminalPane {
             last_activity: std::time::Instant::now(),
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            resize_candidate: None,
+            last_resize_applied: std::time::Instant::now(),
         }
     }
 
