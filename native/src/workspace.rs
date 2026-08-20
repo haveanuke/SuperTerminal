@@ -714,6 +714,9 @@ impl Workspace {
         if let Some(panel) = self.git_panel.clone() {
             panel.update(cx, |panel, panel_cx| panel.set_theme(theme, panel_cx));
         }
+        if let Some(panel) = self.files_panel.clone() {
+            panel.update(cx, |panel, panel_cx| panel.set_theme(theme, panel_cx));
+        }
         // Text fields capture the theme at creation; keep them current.
         let fields = [
             self.session_field.clone(),
