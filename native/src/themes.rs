@@ -443,13 +443,130 @@ const PRESETS: [Theme; 13] = [
 ];
 
 /// Returns all built-in theme presets, in the same order as the TS file.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn presets() -> &'static [Theme] {
     &PRESETS
 }
 
+/// Custom themes imported at runtime (leaked: themes are tiny and few).
+fn customs() -> &'static std::sync::Mutex<Vec<&'static Theme>> {
+    static CUSTOM: std::sync::OnceLock<std::sync::Mutex<Vec<&'static Theme>>> =
+        std::sync::OnceLock::new();
+    CUSTOM.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Every selectable theme: built-ins plus imported customs.
+pub fn all_themes() -> Vec<&'static Theme> {
+    let mut all: Vec<&'static Theme> = PRESETS.iter().collect();
+    all.extend(customs().lock().unwrap().iter().copied());
+    all
+}
+
+/// Parse `#rrggbb` (or `rrggbb`) into 0xRRGGBB.
+fn parse_hex(value: &serde_json::Value) -> Option<u32> {
+    let s = value.as_str()?.trim_start_matches('#');
+    (s.len() == 6)
+        .then(|| u32::from_str_radix(s, 16).ok())
+        .flatten()
+}
+
+/// Import a theme from the old app's export format (ThemeConfig JSON with
+/// `#rrggbb` strings). Returns the registered static theme.
+pub fn import_custom(json: &serde_json::Value) -> Result<&'static Theme, String> {
+    let get = |key: &str| -> Result<u32, String> {
+        json.get(key)
+            .and_then(parse_hex)
+            .ok_or_else(|| format!("invalid theme: missing or malformed \"{key}\""))
+    };
+    let name = json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("invalid theme: missing \"name\"")?
+        .to_string();
+    if by_name(&name).is_some() {
+        return Err(format!("a theme named \"{name}\" already exists"));
+    }
+    let theme = Theme {
+        name: Box::leak(name.into_boxed_str()),
+        background: get("background")?,
+        foreground: get("foreground")?,
+        cursor: get("cursor")?,
+        selection: get("selection")?,
+        black: get("black")?,
+        red: get("red")?,
+        green: get("green")?,
+        yellow: get("yellow")?,
+        blue: get("blue")?,
+        magenta: get("magenta")?,
+        cyan: get("cyan")?,
+        white: get("white")?,
+        bright_black: get("brightBlack")?,
+        bright_red: get("brightRed")?,
+        bright_green: get("brightGreen")?,
+        bright_yellow: get("brightYellow")?,
+        bright_blue: get("brightBlue")?,
+        bright_magenta: get("brightMagenta")?,
+        bright_cyan: get("brightCyan")?,
+        bright_white: get("brightWhite")?,
+        ui_background: get("uiBackground")?,
+        ui_surface: get("uiSurface")?,
+        ui_border: get("uiBorder")?,
+        ui_accent: get("uiAccent")?,
+        ui_text: get("uiText")?,
+        ui_text_muted: get("uiTextMuted")?,
+    };
+    let leaked: &'static Theme = Box::leak(Box::new(theme));
+    customs().lock().unwrap().push(leaked);
+    Ok(leaked)
+}
+
+fn hex_string(color: u32) -> String {
+    format!("#{color:06x}")
+}
+
+/// Export in the old app's format (round-trips through import_custom).
+pub fn export_json(theme: &Theme) -> serde_json::Value {
+    serde_json::json!({
+        "name": theme.name,
+        "background": hex_string(theme.background),
+        "foreground": hex_string(theme.foreground),
+        "cursor": hex_string(theme.cursor),
+        "selection": hex_string(theme.selection),
+        "black": hex_string(theme.black),
+        "red": hex_string(theme.red),
+        "green": hex_string(theme.green),
+        "yellow": hex_string(theme.yellow),
+        "blue": hex_string(theme.blue),
+        "magenta": hex_string(theme.magenta),
+        "cyan": hex_string(theme.cyan),
+        "white": hex_string(theme.white),
+        "brightBlack": hex_string(theme.bright_black),
+        "brightRed": hex_string(theme.bright_red),
+        "brightGreen": hex_string(theme.bright_green),
+        "brightYellow": hex_string(theme.bright_yellow),
+        "brightBlue": hex_string(theme.bright_blue),
+        "brightMagenta": hex_string(theme.bright_magenta),
+        "brightCyan": hex_string(theme.bright_cyan),
+        "brightWhite": hex_string(theme.bright_white),
+        "uiBackground": hex_string(theme.ui_background),
+        "uiSurface": hex_string(theme.ui_surface),
+        "uiBorder": hex_string(theme.ui_border),
+        "uiAccent": hex_string(theme.ui_accent),
+        "uiText": hex_string(theme.ui_text),
+        "uiTextMuted": hex_string(theme.ui_text_muted),
+    })
+}
+
 /// Looks up a preset by its display name (exact match).
 pub fn by_name(name: &str) -> Option<&'static Theme> {
-    PRESETS.iter().find(|t| t.name == name)
+    PRESETS.iter().find(|t| t.name == name).or_else(|| {
+        customs()
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|t| t.name == name)
+    })
 }
 
 /// The default theme (Tokyo Night, matching the TS default).
@@ -529,6 +646,19 @@ mod tests {
         assert_eq!(ansi_256(231, theme), 0xffffff);
         // Grayscale ramp: 8 + 10 * (244 - 232) = 128 -> 0x808080.
         assert_eq!(ansi_256(244, theme), 0x808080);
+    }
+
+    #[test]
+    fn custom_theme_import_export_round_trip() {
+        let mut json = export_json(&DRACULA);
+        json["name"] = serde_json::Value::String("Dracula Custom Test".to_string());
+        let imported = import_custom(&json).expect("import");
+        assert_eq!(imported.background, DRACULA.background);
+        assert_eq!(imported.bright_green, DRACULA.bright_green);
+        assert!(by_name("Dracula Custom Test").is_some());
+        assert!(import_custom(&json).is_err(), "duplicate name rejected");
+        let missing = serde_json::json!({"name": "Broken", "background": "#123456"});
+        assert!(import_custom(&missing).is_err());
     }
 
     #[test]

@@ -793,7 +793,21 @@ impl Render for TerminalPane {
                     this.focus(window);
                     cx.emit(PaneEvent::Focused);
                     let m = &event.modifiers;
-                    if m.platform || m.control || m.shift {
+                    if m.platform {
+                        // Cmd+click: open the URL under the pointer, if any
+                        // (parity with the old app's web-links handler).
+                        let (col, row) = this.cell_at(
+                            event.position.x,
+                            event.position.y,
+                            this.last_origin_x(),
+                            this.last_origin_y(),
+                        );
+                        if let Some(url) = this.url_at(col, row) {
+                            let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+                        }
+                        return;
+                    }
+                    if m.control || m.shift {
                         return; // reserved-modifier clicks never reach the PTY
                     }
                     // Cell math needs the pane's origin: derive from the event
@@ -919,6 +933,41 @@ impl TerminalPane {
                 f32::from(self.line_height) as u16,
             );
         }
+    }
+
+    /// URL spanning the given cell, if any: scans the row for http(s):// or
+    /// www. runs delimited by whitespace/quotes, trimming trailing
+    /// punctuation the way the old web-links matcher did.
+    fn url_at(&self, col: usize, row: usize) -> Option<String> {
+        let cells = self.snapshot.rows.get(row)?;
+        let text: String = cells.iter().map(|cell| cell.ch).collect();
+        let chars: Vec<char> = text.chars().collect();
+        let is_break = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`');
+        let mut start = 0;
+        while start < chars.len() {
+            while start < chars.len() && is_break(chars[start]) {
+                start += 1;
+            }
+            let mut end = start;
+            while end < chars.len() && !is_break(chars[end]) {
+                end += 1;
+            }
+            if start < end && col >= start && col < end {
+                let mut token: String = chars[start..end].iter().collect();
+                while token.ends_with([')', ']', '.', ',', ';', ':', '!', '?']) {
+                    token.pop();
+                }
+                if token.starts_with("http://") || token.starts_with("https://") {
+                    return Some(token);
+                }
+                if token.starts_with("www.") {
+                    return Some(format!("https://{token}"));
+                }
+                return None;
+            }
+            start = end;
+        }
+        None
     }
 
     fn handle_click(&mut self, col: usize, row: usize, cx: &mut Context<Self>) {

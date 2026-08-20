@@ -20,6 +20,8 @@ pub struct Settings {
     pub buddy_command: String,
     /// `{prompt}` is substituted with the review prompt.
     pub buddy_args: Vec<String>,
+    /// Imported custom themes, in the old app's export JSON format.
+    pub custom_themes: Vec<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -35,6 +37,7 @@ impl Default for Settings {
             buddy_enabled: false,
             buddy_command: String::new(),
             buddy_args: vec!["-p".to_string(), "{prompt}".to_string()],
+            custom_themes: Vec::new(),
         }
     }
 }
@@ -120,6 +123,7 @@ mod tests {
             buddy_enabled: true,
             buddy_command: "claude".into(),
             buddy_args: vec!["-p".into(), "{prompt}".into()],
+            custom_themes: Vec::new(),
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);

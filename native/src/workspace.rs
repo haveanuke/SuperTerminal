@@ -109,6 +109,8 @@ pub struct Workspace {
     pending_shutdowns: Arc<Mutex<Vec<ShutdownHandle>>>,
     broadcast: Arc<BroadcastHub>,
     git_panel: Option<Entity<GitPanel>>,
+    /// Transient status line for the theme sheet (import/export results).
+    theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
     buddy_note: Option<String>,
     buddy_busy: Arc<std::sync::atomic::AtomicBool>,
@@ -120,6 +122,9 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let settings = Settings::load();
+        for custom in &settings.custom_themes {
+            let _ = themes::import_custom(custom);
+        }
         let theme = themes::by_name(&settings.theme).unwrap_or_else(themes::default_theme);
         let mut this = Self {
             tabs: Vec::new(),
@@ -146,6 +151,7 @@ impl Workspace {
             pending_shutdowns: Arc::new(Mutex::new(Vec::new())),
             broadcast: Arc::new(BroadcastHub::default()),
             git_panel: None,
+            theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             buddy_last_hash: 0,
@@ -628,6 +634,73 @@ impl Workspace {
             .and_then(|id| self.panes.get(id))
             .and_then(|pane| pane.read(cx).cwd());
         panel.update(cx, |panel, panel_cx| panel.set_target_cwd(cwd, panel_cx));
+    }
+
+    fn import_theme(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |ws, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("/usr/bin/osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose file of type {\"public.json\", \"public.plain-text\"} with prompt \"Theme JSON\")",
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .filter(|path| !path.is_empty())
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                })
+                .await;
+            let _ = ws.update(cx, |ws, cx| {
+                let note = match picked
+                    .ok_or_else(|| "no file chosen".to_string())
+                    .and_then(|raw| {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .map_err(|_| "invalid JSON file".to_string())
+                    })
+                    .and_then(|json| {
+                        themes::import_custom(&json).map(|theme| (json, theme.name))
+                    }) {
+                    Ok((json, name)) => {
+                        ws.settings.custom_themes.push(json);
+                        ws.apply_theme(name, cx);
+                        format!("imported and applied: {name}")
+                    }
+                    Err(err) => err,
+                };
+                ws.theme_action_note = Some(note);
+                cx.notify();
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    fn export_theme(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme;
+        let json = themes::export_json(theme);
+        let name: String = theme
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        let dest = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Downloads")
+            .join(format!("{name}-theme.json"));
+        let note = match serde_json::to_string_pretty(&json)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| std::fs::write(&dest, raw).map_err(|e| e.to_string()))
+        {
+            Ok(()) => format!("exported to {}", dest.display()),
+            Err(err) => format!("export failed: {err}"),
+        };
+        self.theme_action_note = Some(note);
+        cx.notify();
     }
 
     fn refresh_sessions(&mut self) {
@@ -1355,8 +1428,8 @@ impl Workspace {
             Overlay::None => None,
             Overlay::ThemePicker => {
                 let current = self.settings.theme.clone();
-                let chips: Vec<_> = themes::presets()
-                    .iter()
+                let chips: Vec<_> = themes::all_themes()
+                    .into_iter()
                     .map(|preset| {
                         let name = preset.name;
                         let selected = name == current;
@@ -1444,6 +1517,28 @@ impl Workspace {
                         .child(self.render_font_family_row(window, cx))
                         .child(self.render_background_row(cx))
                         .child(self.render_buddy_row(cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_color(rgb(theme.ui_text_muted))
+                                .child(div().w(px(72.0)).child("custom"))
+                                .child(self.overlay_button(
+                                    "import theme",
+                                    |ws, _window, cx| ws.import_theme(cx),
+                                    cx,
+                                ))
+                                .child(self.overlay_button(
+                                    "export current",
+                                    |ws, _window, cx| ws.export_theme(cx),
+                                    cx,
+                                ))
+                                .children(self.theme_action_note.clone().map(|note| {
+                                    div().text_size(px(10.0)).child(SharedString::from(note))
+                                })),
+                        )
                         .into_any_element(),
                 )
             }
