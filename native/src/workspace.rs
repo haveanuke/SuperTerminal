@@ -1126,8 +1126,10 @@ impl Workspace {
                             .child(pane_btn("timer").on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, _, cx| {
-                                    ws.focused_terminal = Some(id_timer.clone());
+                                    // Clear highlights BEFORE retargeting
+                                    // focus, or the wrong pane gets cleared.
                                     ws.leave_search_highlights(cx);
+                                    ws.focused_terminal = Some(id_timer.clone());
                                     ws.overlay = if ws.overlay == Overlay::AutoRun {
                                         Overlay::None
                                     } else {
