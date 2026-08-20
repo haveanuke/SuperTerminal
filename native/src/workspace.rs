@@ -205,6 +205,8 @@ pub struct Workspace {
     cue_track: HashMap<String, CueState>,
     /// The currently speaking `say` process (killed before a new note).
     tts_child: Option<std::process::Child>,
+    /// Keep-awake `caffeinate -dimsu` child; Some = the bar toggle is on.
+    caffeinate_child: Option<std::process::Child>,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
     /// Installed `say` voices, loaded lazily for the alerts row.
@@ -303,6 +305,7 @@ impl Workspace {
             collapsed_projects: std::collections::HashSet::new(),
             cue_track: HashMap::new(),
             tts_child: None,
+            caffeinate_child: None,
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
@@ -475,6 +478,24 @@ impl Workspace {
         self.tts_child = command.arg(spoken).spawn().ok();
     }
 
+    /// Toggle the keep-awake hold: spawn or kill `caffeinate -dimsu`
+    /// (idle/display/disk/system sleep prevented, user-active asserted).
+    /// `-w` ties it to our pid so a crash or force-quit that skips
+    /// shutdown_all can never leave the Mac held awake.
+    fn toggle_caffeinate(&mut self) {
+        if let Some(mut child) = self.caffeinate_child.take() {
+            let _ = child.kill();
+            let _ = child.wait(); // reap
+        } else {
+            self.caffeinate_child = std::process::Command::new("/usr/bin/caffeinate")
+                .arg("-dimsu")
+                .arg("-w")
+                .arg(std::process::id().to_string())
+                .spawn()
+                .ok();
+        }
+    }
+
     /// Load the installed voice list once (background, `say -v ?`).
     fn load_tts_voices(&mut self, cx: &mut Context<Self>) {
         if self.tts_voices.is_some() || self.tts_voices_loading {
@@ -528,6 +549,16 @@ impl Workspace {
             cx.notify();
         }
         self.pet_tick_count = self.pet_tick_count.wrapping_add(1);
+        // A caffeinate killed externally must not leave the toggle lying —
+        // checked on the unconditional heartbeat, not the cue tick, so it
+        // holds with audio cues off. Only a definite exit clears the state;
+        // on a try_wait error the process may still live, so keep the handle.
+        if let Some(child) = &mut self.caffeinate_child {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                self.caffeinate_child = None;
+                cx.notify();
+            }
+        }
         // Keep the sidebar following the focused terminal's cwd (a `cd`
         // changes it without any focus event) — INDEPENDENT of pet
         // visibility. The panels dedupe unchanged paths, so this is cheap.
@@ -711,6 +742,11 @@ impl Workspace {
         // Flush a debounced pet-count save so quitting mid-pet loses nothing.
         if self.pet_save_at.take().is_some() {
             self.save_companion();
+        }
+        // Never leave a stray caffeinate holding the Mac awake after quit.
+        if let Some(mut child) = self.caffeinate_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
         let mut handles: Vec<ShutdownHandle> =
             self.pending_shutdowns.lock().unwrap().drain(..).collect();
@@ -3116,6 +3152,34 @@ impl Workspace {
             )
             .children(self.render_focused_controls(cx))
             .child({
+                let enabled = self.caffeinate_child.is_some();
+                let theme = self.theme;
+                div()
+                    .id("awake-toggle")
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(if enabled {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_surface
+                    }))
+                    .text_color(rgb(if enabled {
+                        theme.ui_background
+                    } else {
+                        theme.ui_text_muted
+                    }))
+                    .child("awake")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, _window, cx| {
+                            ws.toggle_caffeinate();
+                            cx.notify();
+                        }),
+                    )
+            })
+            .child({
                 let enabled = self.broadcast.is_enabled();
                 let theme = self.theme;
                 div()
@@ -3147,7 +3211,6 @@ impl Workspace {
                         }),
                     )
             })
-            .child(self.overlay_button("git", |ws, _window, cx| ws.toggle_git_panel(cx), cx))
             .child(self.overlay_button("search", |ws, window, cx| ws.toggle_search(window, cx), cx))
             .child(self.overlay_button(
                 "sessions",
