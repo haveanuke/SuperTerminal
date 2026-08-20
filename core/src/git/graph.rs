@@ -64,9 +64,19 @@ pub fn run_commit_files(
         return Err("invalid commit hash".to_string());
     }
     let entry = state.entry(repo_id).ok_or("unknown repo")?;
+    // Merges produce NO output under git's default merge-diff behavior;
+    // first-parent semantics show what the merge brought in — the right
+    // reading for a history UI.
     let out = run_git(
         Some(&entry.root),
-        &["show", "--name-status", "--format=", "-z", hash],
+        &[
+            "show",
+            "--name-status",
+            "--format=",
+            "--diff-merges=first-parent",
+            "-z",
+            hash,
+        ],
         false,
     )?;
     Ok(parse_name_status(&out.stdout))
@@ -88,7 +98,8 @@ pub fn parse_name_status(bytes: &[u8]) -> Vec<CommitFileChange> {
         let path = if matches!(status_letter, 'R' | 'C') {
             match fields.next() {
                 Some(new_path) => format!("{first_path} -> {new_path}"),
-                None => first_path,
+                // Truncated rename record: drop it rather than mislabel.
+                None => break,
             }
         } else {
             first_path
@@ -288,6 +299,10 @@ mod tests {
     fn name_status_survives_truncated_input() {
         assert_eq!(parse_name_status(b"M\0").len(), 0);
         assert_eq!(parse_name_status(b"").len(), 0);
+        // A truncated rename must be dropped, not mislabeled.
+        let truncated = parse_name_status(b"M\0kept.rs\0R100\0old.rs\0");
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0].path, "kept.rs");
     }
 
     #[test]

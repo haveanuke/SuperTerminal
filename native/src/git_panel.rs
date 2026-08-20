@@ -33,6 +33,14 @@ enum GitOp {
     Fetch,
 }
 
+/// What a discard confirm is armed against. A typed target, not a magic
+/// path string — a file literally named `*` must stay a single-file discard.
+#[derive(Clone, Debug, PartialEq)]
+enum DiscardTarget {
+    Path(String),
+    All,
+}
+
 pub struct GitPanel {
     state: Arc<GitState>,
     theme: &'static Theme,
@@ -48,9 +56,9 @@ pub struct GitPanel {
     /// Monotonic guard for graph loads: an older in-flight request must not
     /// overwrite a newer one landing first.
     graph_seq: u64,
-    /// Two-click discard confirm: path armed by the first click. Discarding
+    /// Two-click discard confirm: target armed by the first click. Discarding
     /// an untracked entry deletes it permanently, so nothing runs unarmed.
-    pending_discard: Option<String>,
+    pending_discard: Option<DiscardTarget>,
     /// Commit expanded in the history view, and its fetched files.
     expanded_commit: Option<String>,
     expanded_files: Option<Vec<CommitFileChange>>,
@@ -67,14 +75,7 @@ impl GitPanel {
         cx.subscribe(
             &commit_field,
             |panel, _field, event: &TextFieldEvent, cx| match event {
-                TextFieldEvent::Submitted(message) => {
-                    let message = message.trim().to_string();
-                    if !message.is_empty() {
-                        // The field keeps the message; it only clears once the
-                        // commit lands (see the success path in `run`).
-                        panel.run(GitOp::Commit(message), cx);
-                    }
-                }
+                TextFieldEvent::Submitted(_) => panel.try_commit(cx),
                 TextFieldEvent::Cancelled => cx.emit(PanelClosed),
             },
         )
@@ -178,19 +179,25 @@ impl GitPanel {
                         let branch_changed = panel.report.as_ref().is_some_and(|prev| {
                             prev.branch != report.branch || prev.detached != report.detached
                         });
-                        // Disarm a pending discard unless the armed entry is
+                        // Disarm a pending discard unless what it targets is
                         // still exactly what it was — the second click must
                         // never delete contents the user hasn't seen.
                         if let Some(armed) = panel.pending_discard.clone() {
-                            let entry_state = |r: &StatusReport| {
-                                r.entries
-                                    .iter()
-                                    .find(|e| e.path == armed)
-                                    .map(|e| (e.kind.clone(), e.worktree_status.clone()))
+                            let disarm = match &armed {
+                                DiscardTarget::All => branch_changed,
+                                DiscardTarget::Path(path) => {
+                                    let entry_state = |r: &StatusReport| {
+                                        r.entries
+                                            .iter()
+                                            .find(|e| &e.path == path)
+                                            .map(|e| (e.kind.clone(), e.worktree_status.clone()))
+                                    };
+                                    let prev = panel.report.as_ref().and_then(entry_state);
+                                    let now = entry_state(&report);
+                                    branch_changed || now.is_none() || prev != now
+                                }
                             };
-                            let prev = panel.report.as_ref().and_then(&entry_state);
-                            let now = entry_state(&report);
-                            if branch_changed || now.is_none() || prev != now {
+                            if disarm {
                                 panel.pending_discard = None;
                             }
                         }
@@ -327,10 +334,35 @@ impl GitPanel {
 
     /// Expand a commit to show its changed files (VS Code's history view);
     /// clicking the expanded commit again collapses it.
+    /// The ONE commit gate: a message, staged changes, and not busy. Both
+    /// the button and Enter in the field go through here, so the disabled
+    /// look never lies.
+    fn can_commit(&self, cx: &Context<Self>) -> bool {
+        !self.busy
+            && !self.commit_field.read(cx).value.trim().is_empty()
+            && self.report.as_ref().is_some_and(|r| {
+                r.entries
+                    .iter()
+                    .any(|e| e.kind != "untracked" && e.kind != "unmerged" && e.index_status != ".")
+            })
+    }
+
+    fn try_commit(&mut self, cx: &mut Context<Self>) {
+        if !self.can_commit(cx) {
+            return;
+        }
+        // The field keeps the message; it only clears once the commit lands
+        // (see the success path in `run`).
+        let message = self.commit_field.read(cx).value.trim().to_string();
+        self.run(GitOp::Commit(message), cx);
+    }
+
     fn toggle_commit(&mut self, hash: String, cx: &mut Context<Self>) {
         if self.expanded_commit.as_ref() == Some(&hash) {
             self.expanded_commit = None;
             self.expanded_files = None;
+            // Cancels any in-flight file load for the collapsed commit.
+            self.files_seq += 1;
             cx.notify();
             return;
         }
@@ -338,21 +370,30 @@ impl GitPanel {
         self.expanded_files = None;
         self.files_seq += 1;
         let seq = self.files_seq;
-        let generation = self.generation;
         let state = Arc::clone(&self.state);
         let Some(repo) = self.repo.clone() else {
             return;
         };
         cx.notify();
         cx.spawn(async move |panel, cx| {
+            let request_hash = hash.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    superterminal_core::git::graph::run_commit_files(&state, &repo.repo_id, &hash)
+                    superterminal_core::git::graph::run_commit_files(
+                        &state,
+                        &repo.repo_id,
+                        &request_hash,
+                    )
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation || panel.files_seq != seq {
+                // Gate on the sequence and on the expansion still pointing at
+                // this commit — NOT on repo generation, which a same-repo cwd
+                // retarget bumps spuriously (that would strand "loading...").
+                // A repo change clears expanded_commit, so stale results
+                // from another repo can never attach.
+                if panel.files_seq != seq || panel.expanded_commit.as_ref() != Some(&hash) {
                     return;
                 }
                 if let Ok(files) = result {
@@ -432,29 +473,39 @@ impl GitPanel {
     /// for "discard all changes" (resolved to explicit paths on confirm).
     fn discard_control(
         &self,
-        path: String,
+        target: DiscardTarget,
         untracked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let armed = self.pending_discard.as_deref() == Some(path.as_str());
-        let label = if !armed {
-            "\u{21a9}"
-        } else if untracked {
-            "delete?"
-        } else {
-            "sure?"
+        let armed = self.pending_discard.as_ref() == Some(&target);
+        let id: SharedString = match &target {
+            DiscardTarget::All => "git-discard-all".into(),
+            DiscardTarget::Path(path) => format!("git-discard-{path}").into(),
         };
+        let label = match (&target, armed, untracked) {
+            (DiscardTarget::All, false, _) => "discard all",
+            (DiscardTarget::All, true, _) => "discard all?",
+            (DiscardTarget::Path(_), false, _) => "\u{21a9}",
+            (DiscardTarget::Path(_), true, true) => "delete?",
+            (DiscardTarget::Path(_), true, false) => "sure?",
+        };
+        let is_all = matches!(target, DiscardTarget::All);
         div()
-            .id(SharedString::from(format!("git-discard-{path}")))
+            .id(id)
             .cursor_pointer()
             .h(px(16.0))
-            .px(px(if armed { 4.0 } else { 0.0 }))
+            .px(px(if armed || is_all { 4.0 } else { 0.0 }))
             .min_w(px(16.0))
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(3.0))
+            .when(is_all, |d| {
+                d.border_1()
+                    .border_color(rgb(theme.ui_border))
+                    .text_size(px(10.0))
+            })
             .text_color(rgb(if armed {
                 theme.red
             } else {
@@ -468,9 +519,9 @@ impl GitPanel {
                     if panel.busy {
                         return;
                     }
-                    if panel.pending_discard.as_deref() == Some(path.as_str()) {
-                        let paths = if path == "*" {
-                            panel
+                    if panel.pending_discard.as_ref() == Some(&target) {
+                        let paths = match &target {
+                            DiscardTarget::All => panel
                                 .report
                                 .iter()
                                 .flat_map(|r| r.entries.iter())
@@ -480,15 +531,14 @@ impl GitPanel {
                                         && (e.kind == "untracked" || e.worktree_status != ".")
                                 })
                                 .map(|e| e.path.clone())
-                                .collect()
-                        } else {
-                            vec![path.clone()]
+                                .collect(),
+                            DiscardTarget::Path(path) => vec![path.clone()],
                         };
                         if !paths.is_empty() {
                             panel.run(GitOp::Discard(paths), cx);
                         }
                     } else {
-                        panel.pending_discard = Some(path.clone());
+                        panel.pending_discard = Some(target.clone());
                         cx.notify();
                     }
                 }),
@@ -594,7 +644,11 @@ impl GitPanel {
                         .flex_row()
                         .items_center()
                         .gap(px(2.0))
-                        .child(self.discard_control(path.clone(), entry.kind == "untracked", cx))
+                        .child(self.discard_control(
+                            DiscardTarget::Path(path.clone()),
+                            entry.kind == "untracked",
+                            cx,
+                        ))
                         .child(self.glyph_button(
                             format!("git-stage-{path}"),
                             "+",
@@ -662,14 +716,14 @@ impl GitPanel {
         let theme = self.theme;
         let rows: Vec<_> = match &self.expanded_files {
             None => vec![div()
-                .pl(px(24.0))
+                .pl(px(6.0))
                 .h(px(18.0))
                 .text_size(px(10.0))
                 .text_color(rgb(theme.ui_text_muted))
                 .child("loading...")
                 .into_any_element()],
             Some(files) if files.is_empty() => vec![div()
-                .pl(px(24.0))
+                .pl(px(6.0))
                 .h(px(18.0))
                 .text_size(px(10.0))
                 .text_color(rgb(theme.ui_text_muted))
@@ -685,7 +739,7 @@ impl GitPanel {
                         .flex_row()
                         .items_center()
                         .gap(px(6.0))
-                        .pl(px(24.0))
+                        .pl(px(6.0))
                         .pr(px(8.0))
                         .h(px(18.0))
                         .child(
@@ -710,22 +764,30 @@ impl GitPanel {
                 })
                 .collect(),
         };
+        // Indented past the graph gutter so the painted branch lines stay
+        // visible while the block is open; row heights must stay 18px to
+        // match the canvas offset math in `graph_body`.
         div()
             .flex()
             .flex_col()
+            .ml(px(78.0))
             .bg(rgb(theme.ui_surface))
             .children(rows)
     }
 
-    /// One contiguous run of commit rows with the branch lines painted
-    /// behind them (edges between adjacent rows only, so uniform row height
-    /// holds within a segment).
-    fn graph_segment(
+    /// Commit rows with branch lines painted behind them on ONE canvas:
+    /// rows after the expanded commit are shifted down by the height of its
+    /// file block, and the expanded row's edges run straight through that
+    /// block's gutter, so the topology never breaks around an expansion.
+    fn graph_body(
         &self,
         rows: &[superterminal_core::git::graph::GraphRow],
+        expanded_index: Option<usize>,
+        insert_height: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         const ROW_H: f32 = 18.0;
+        const MAX_LANE: usize = 7;
         let theme = self.theme;
         let lane_colors = [
             theme.ui_accent,
@@ -736,17 +798,26 @@ impl GitPanel {
             theme.blue,
             theme.red,
         ];
-        let lane_x = |lane: usize| 8.0 + (lane.min(7) as f32) * 8.0;
+        // One capping policy everywhere: dots, edges and colors all use the
+        // capped lane, so crowded graphs stay consistent if squeezed.
+        let lane_color = move |lane: usize| lane_colors[lane.min(MAX_LANE) % lane_colors.len()];
+        let lane_x = |lane: usize| 8.0 + (lane.min(MAX_LANE) as f32) * 8.0;
         let gutter = px(8.0 + 8.0 * 8.0 + 6.0);
+        // Rows after the expansion sit lower by the file block's height.
+        let y_of = move |index: usize| {
+            (index as f32) * ROW_H
+                + match expanded_index {
+                    Some(k) if index > k => insert_height,
+                    _ => 0.0,
+                }
+        };
 
-        // Geometry for the paint pass: (row index, lane, edges).
-        type PaintRow = (usize, usize, Vec<(usize, usize)>);
+        // Geometry for the paint pass: (lane, edges) per row.
+        type PaintRow = (usize, Vec<(usize, usize)>);
         let paint_rows: Vec<PaintRow> = rows
             .iter()
-            .enumerate()
-            .map(|(index, row)| {
+            .map(|row| {
                 (
-                    index,
                     row.lane,
                     row.edges
                         .iter()
@@ -755,26 +826,25 @@ impl GitPanel {
                 )
             })
             .collect();
-        let edge_colors: Vec<u32> = lane_colors.to_vec();
-        let last = paint_rows.len().saturating_sub(1);
 
         let lines = gpui::canvas(
             |_, _, _| (),
             move |bounds, _, window, _| {
                 let ox = f32::from(bounds.origin.x);
                 let oy = f32::from(bounds.origin.y);
-                for (index, _, edges) in &paint_rows {
-                    if *index >= last {
-                        continue; // edges connect to the NEXT row inside this segment
+                let last = paint_rows.len().saturating_sub(1);
+                for (index, (_, edges)) in paint_rows.iter().enumerate() {
+                    if index >= last {
+                        break; // edges connect to the NEXT row
                     }
-                    let y_top = oy + (*index as f32) * ROW_H + ROW_H / 2.0;
+                    let y_from = oy + y_of(index) + ROW_H / 2.0;
+                    let y_to = oy + y_of(index + 1) + ROW_H / 2.0;
                     for (from, to) in edges {
                         let mut builder = gpui::PathBuilder::stroke(px(1.5));
-                        builder.move_to(gpui::point(px(ox + lane_x(*from)), px(y_top)));
-                        builder.line_to(gpui::point(px(ox + lane_x(*to)), px(y_top + ROW_H)));
+                        builder.move_to(gpui::point(px(ox + lane_x(*from)), px(y_from)));
+                        builder.line_to(gpui::point(px(ox + lane_x(*to)), px(y_to)));
                         if let Ok(path) = builder.build() {
-                            let color = edge_colors[from.min(&7) % edge_colors.len()];
-                            window.paint_path(path, rgb(color));
+                            window.paint_path(path, rgb(lane_color(*from)));
                         }
                     }
                 }
@@ -789,7 +859,7 @@ impl GitPanel {
         let row_divs: Vec<_> = rows
             .iter()
             .map(|row| {
-                let color = lane_colors[row.lane % lane_colors.len()];
+                let color = lane_color(row.lane);
                 let hash = row.hash.clone();
                 let selected = expanded.as_deref() == Some(row.hash.as_str());
                 div()
@@ -849,17 +919,30 @@ impl GitPanel {
             })
             .collect();
 
+        let mut files_block = if expanded_index.is_some() {
+            Some(self.commit_file_rows().into_any_element())
+        } else {
+            None
+        };
+        let mut children: Vec<gpui::AnyElement> = vec![lines.into_any_element()];
+        for (index, row_div) in row_divs.into_iter().enumerate() {
+            children.push(row_div.into_any_element());
+            if Some(index) == expanded_index {
+                if let Some(block) = files_block.take() {
+                    children.push(block);
+                }
+            }
+        }
         div()
             .relative()
             .flex()
             .flex_col()
-            .child(lines)
-            .children(row_divs)
+            .children(children)
             .into_any_element()
     }
 
     /// The commit history with painted branch lines; the expanded commit's
-    /// files are spliced in between two graph segments.
+    /// file list is spliced in beneath it.
     fn render_graph(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let rows: Vec<superterminal_core::git::graph::GraphRow> = self
@@ -869,25 +952,25 @@ impl GitPanel {
             .take(120)
             .cloned()
             .collect();
-        let split_at = self
+        let expanded_index = self
             .expanded_commit
             .as_ref()
             .and_then(|hash| rows.iter().position(|row| &row.hash == hash));
+        // Height of the spliced file block, mirrored by the canvas offsets.
+        let file_rows = match &self.expanded_files {
+            None => 1,
+            Some(files) if files.is_empty() => 1,
+            Some(files) => files.len().min(80),
+        };
+        let insert_height = if expanded_index.is_some() {
+            18.0 * file_rows as f32
+        } else {
+            0.0
+        };
 
         let mut children: Vec<gpui::AnyElement> = Vec::new();
-        match split_at {
-            Some(index) => {
-                children.push(self.graph_segment(&rows[..=index], cx));
-                children.push(self.commit_file_rows().into_any_element());
-                if index + 1 < rows.len() {
-                    children.push(self.graph_segment(&rows[index + 1..], cx));
-                }
-            }
-            None => {
-                if !rows.is_empty() {
-                    children.push(self.graph_segment(&rows, cx));
-                }
-            }
+        if !rows.is_empty() {
+            children.push(self.graph_body(&rows, expanded_index, insert_height, cx));
         }
 
         div()
@@ -969,8 +1052,7 @@ impl Render for GitPanel {
             .cloned()
             .collect();
 
-        let commit_ready =
-            !self.commit_field.read(cx).value.trim().is_empty() && !self.busy && !staged.is_empty();
+        let commit_ready = self.can_commit(cx);
 
         base
             // header: repo, branch, sync counters, network actions
@@ -1056,16 +1138,7 @@ impl Render for GitPanel {
                             .child("Commit")
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|panel, _, _, cx| {
-                                    if panel.busy {
-                                        return;
-                                    }
-                                    let message =
-                                        panel.commit_field.read(cx).value.trim().to_string();
-                                    if !message.is_empty() {
-                                        panel.run(GitOp::Commit(message), cx);
-                                    }
-                                }),
+                                cx.listener(|panel, _, _, cx| panel.try_commit(cx)),
                             ),
                     ),
             )
@@ -1086,7 +1159,7 @@ impl Render for GitPanel {
             })
             .children({
                 let actions = vec![
-                    self.discard_control("*".to_string(), false, cx)
+                    self.discard_control(DiscardTarget::All, false, cx)
                         .into_any_element(),
                     self.chip("stage all", GitOp::StageAll, cx)
                         .into_any_element(),
