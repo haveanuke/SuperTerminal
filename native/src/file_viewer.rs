@@ -201,6 +201,12 @@ impl FileViewer {
             }
             out.push_str(&line[byte_index(line, from)..byte_index(line, to)]);
         }
+        // A selection reaching the very end of the file includes its
+        // trailing newline (Cmd+A -> Cmd+C must reproduce the bytes).
+        let last = lines.len().saturating_sub(1);
+        if self.trailing_newline && end.0 >= last && end.1 >= lines[last].chars().count() {
+            out.push_str(self.line_ending);
+        }
         Some(out)
     }
 
@@ -420,7 +426,7 @@ impl Render for FileViewer {
                             },
                         ));
                     match span {
-                        Some((from, to, continues)) if from < to || len == 0 || continues => {
+                        Some((from, to, continues)) if from < to || continues => {
                             let b0 = byte_index(line, from);
                             let b1 = byte_index(line, to);
                             let pre = line[..b0].to_string();
@@ -432,9 +438,8 @@ impl Render for FileViewer {
                             row = row.child(
                                 div()
                                     .bg(rgb(theme.selection))
-                                    // Selected newline / empty line: keep a
-                                    // visible sliver of selection.
-                                    .when(continues || len == 0, |d| d.pr(px(6.0)))
+                                    // Selected newline: a visible sliver.
+                                    .when(continues, |d| d.pr(px(6.0)))
                                     .child(SharedString::from(mid)),
                             );
                             if !post.is_empty() {
