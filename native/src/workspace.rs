@@ -1129,6 +1129,7 @@ impl Workspace {
         self.leave_search_highlights(cx);
         self.overlay = Overlay::None;
         self.pet_reroll_armed = false;
+        self.tts_voice_list_open = false;
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -2615,6 +2616,7 @@ impl Workspace {
                     div()
                         .id("tts-voice-toggle")
                         .cursor_pointer()
+                        .flex_none()
                         .w(px(170.0))
                         .px(px(7.0))
                         .py(px(1.0))
@@ -3113,6 +3115,7 @@ impl Workspace {
                 "settings",
                 |ws, window, cx| {
                     ws.leave_search_highlights(cx);
+                    ws.tts_voice_list_open = false;
                     ws.overlay = if ws.overlay == Overlay::SettingsSheet {
                         Overlay::None
                     } else {
@@ -3135,63 +3138,70 @@ impl Workspace {
             Overlay::None => None,
             Overlay::SettingsSheet => {
                 let current = self.settings.theme.clone();
-                let chips: Vec<_> = themes::all_themes()
-                    .into_iter()
-                    .map(|preset| {
-                        let name = preset.name;
-                        let selected = name == current;
-                        // The palette IS the content: bg swatch + four accents.
-                        let strip = [
-                            preset.background,
-                            preset.red,
-                            preset.green,
-                            preset.blue,
-                            preset.magenta,
-                        ];
-                        div()
-                            .id(SharedString::from(format!("theme-{name}")))
-                            .cursor_pointer()
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(5.0))
-                            .border_1()
-                            .border_color(rgb(if selected {
-                                theme.ui_accent
-                            } else {
-                                theme.ui_border
-                            }))
-                            .bg(rgb(preset.background))
-                            .hover(|style| style.border_color(rgb(theme.ui_accent)))
-                            .flex()
-                            .flex_col()
-                            .gap(px(5.0))
-                            .child(div().flex().flex_row().gap(px(3.0)).children(
-                                strip.into_iter().map(|color| {
-                                    div().w(px(14.0)).h(px(6.0)).rounded(px(2.0)).bg(rgb(color))
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    // Some themes have muted foregrounds that
-                                    // vanish on their own background; nudge
-                                    // the label away from the chip color.
-                                    .text_color(rgb(themes::contrast_boost(
-                                        preset.foreground,
-                                        preset.background,
-                                    )))
-                                    .child(SharedString::from(name)),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |ws, _, _window, cx| {
-                                    // Apply live but keep the sheet open so
-                                    // themes can be browsed; esc closes.
-                                    ws.apply_theme(name, cx);
-                                }),
-                            )
-                    })
-                    .collect();
+                // Built only while the themes section is active — hidden
+                // sections must not pay for the whole chip grid per render.
+                let on_themes = self.settings_section == SettingsSection::Themes;
+                let chips: Vec<_> = if !on_themes {
+                    Vec::new()
+                } else {
+                    themes::all_themes()
+                        .into_iter()
+                        .map(|preset| {
+                            let name = preset.name;
+                            let selected = name == current;
+                            // The palette IS the content: bg swatch + four accents.
+                            let strip = [
+                                preset.background,
+                                preset.red,
+                                preset.green,
+                                preset.blue,
+                                preset.magenta,
+                            ];
+                            div()
+                                .id(SharedString::from(format!("theme-{name}")))
+                                .cursor_pointer()
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(rgb(if selected {
+                                    theme.ui_accent
+                                } else {
+                                    theme.ui_border
+                                }))
+                                .bg(rgb(preset.background))
+                                .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                                .flex()
+                                .flex_col()
+                                .gap(px(5.0))
+                                .child(div().flex().flex_row().gap(px(3.0)).children(
+                                    strip.into_iter().map(|color| {
+                                        div().w(px(14.0)).h(px(6.0)).rounded(px(2.0)).bg(rgb(color))
+                                    }),
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        // Some themes have muted foregrounds that
+                                        // vanish on their own background; nudge
+                                        // the label away from the chip color.
+                                        .text_color(rgb(themes::contrast_boost(
+                                            preset.foreground,
+                                            preset.background,
+                                        )))
+                                        .child(SharedString::from(name)),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |ws, _, _window, cx| {
+                                        // Apply live but keep the sheet open so
+                                        // themes can be browsed; esc closes.
+                                        ws.apply_theme(name, cx);
+                                    }),
+                                )
+                        })
+                        .collect()
+                };
                 let font_size = self.settings.font_size;
 
                 // Section content — exactly ONE section shows at a time; the
@@ -3975,6 +3985,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &ToggleSettingsSheet, window, cx| {
                 ws.leave_search_highlights(cx);
+                ws.tts_voice_list_open = false;
                 ws.overlay = if ws.overlay == Overlay::SettingsSheet {
                     Overlay::None
                 } else {
