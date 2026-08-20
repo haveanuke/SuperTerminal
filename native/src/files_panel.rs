@@ -42,6 +42,45 @@ pub struct FilesPanel {
     /// same directory loses to a newer one.
     load_tokens: HashMap<PathBuf, u64>,
     next_token: u64,
+    /// Inline previews open under file rows: path -> lines once loaded.
+    previews: HashMap<PathBuf, Option<Vec<String>>>,
+}
+
+/// Byte/line caps for inline previews.
+const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
+const MAX_PREVIEW_LINES: usize = 400;
+
+/// Bounded, binary-safe text preview of a file.
+fn read_preview(path: &Path) -> Vec<String> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return vec!["could not open file".to_string()];
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_PREVIEW_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return vec!["could not read file".to_string()];
+    }
+    if bytes.contains(&0) {
+        return vec!["binary file - use 'open' to view".to_string()];
+    }
+    let capped = bytes.len() as u64 >= MAX_PREVIEW_BYTES;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<String> = text
+        .lines()
+        .take(MAX_PREVIEW_LINES)
+        .map(String::from)
+        .collect();
+    if capped || text.lines().count() > MAX_PREVIEW_LINES {
+        lines.push("... truncated".to_string());
+    }
+    if lines.is_empty() {
+        lines.push("empty file".to_string());
+    }
+    lines
 }
 
 fn read_dir_sorted(path: &Path) -> DirListing {
@@ -82,6 +121,7 @@ impl FilesPanel {
             root_gen: 0,
             load_tokens: HashMap::new(),
             next_token: 0,
+            previews: HashMap::new(),
         }
     }
 
@@ -102,6 +142,7 @@ impl FilesPanel {
         self.listings.clear();
         self.expanded.clear();
         self.load_tokens.clear();
+        self.previews.clear();
         self.root_gen += 1;
         self.load_dir(cwd, cx);
     }
@@ -141,6 +182,122 @@ impl FilesPanel {
             Ok::<(), ()>(())
         })
         .detach();
+    }
+
+    /// Toggle the inline preview under a file row.
+    fn toggle_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.previews.remove(&path).is_some() {
+            cx.notify();
+            return;
+        }
+        self.previews.insert(path.clone(), None);
+        let root_gen = self.root_gen;
+        cx.notify();
+        cx.spawn(async move |panel, cx| {
+            let read_path = path.clone();
+            let lines = cx
+                .background_executor()
+                .spawn(async move { read_preview(&read_path) })
+                .await;
+            let _ = panel.update(cx, |panel: &mut FilesPanel, cx| {
+                if panel.root_gen == root_gen {
+                    if let Some(slot) = panel.previews.get_mut(&path) {
+                        *slot = Some(lines);
+                        cx.notify();
+                    }
+                }
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    /// The preview block spliced under an open file row.
+    fn render_preview(
+        &self,
+        path: &Path,
+        depth: usize,
+        lines: &Option<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+        let indent = 10.0 + depth as f32 * 12.0;
+        let open_path = path.to_path_buf();
+        let chip_id = {
+            use std::hash::{Hash, Hasher};
+            use std::os::unix::ffi::OsStrExt;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.as_os_str().as_bytes().hash(&mut hasher);
+            hasher.finish()
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(indent))
+            .h(px(18.0))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child("PREVIEW"),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("preview-open-{chip_id:x}")))
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(theme.ui_border))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text))
+                    .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                    .child("open")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            let _ = std::process::Command::new("/usr/bin/open")
+                                .arg(&open_path)
+                                .spawn();
+                        }),
+                    ),
+            );
+        let body: Vec<gpui::AnyElement> = match lines {
+            None => vec![div()
+                .pl(px(indent))
+                .h(px(14.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("loading...")
+                .into_any_element()],
+            Some(lines) => lines
+                .iter()
+                .map(|line| {
+                    div()
+                        .pl(px(indent))
+                        .pr(px(4.0))
+                        .min_h(px(14.0))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme.ui_text))
+                        .child(SharedString::from(line.clone()))
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .py(px(2.0))
+            .bg(rgb(theme.ui_surface))
+            .font_family("Menlo")
+            .text_size(px(10.0))
+            .child(header)
+            .children(body)
+            .into_any_element()
     }
 
     fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -228,14 +385,19 @@ impl FilesPanel {
                         if is_dir {
                             panel.toggle_dir(path.clone(), cx);
                         } else {
-                            // Files open with the system default app.
-                            let _ = std::process::Command::new("/usr/bin/open")
-                                .arg(&path)
-                                .spawn();
+                            // Files preview INSIDE the panel; the preview
+                            // header offers external open.
+                            panel.toggle_preview(path.clone(), cx);
                         }
                     }),
                 );
             rows.push(row.into_any_element());
+            if !entry.is_dir {
+                if let Some(lines) = self.previews.get(&entry.path) {
+                    let lines = lines.clone();
+                    rows.push(self.render_preview(&entry.path, depth + 1, &lines, cx));
+                }
+            }
             if expanded {
                 self.push_rows(&entry.path, depth + 1, rows, cx);
             }
