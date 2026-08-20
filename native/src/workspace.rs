@@ -581,12 +581,18 @@ impl Workspace {
                 }))
                 .child(self.overlay_button(
                     "split-h",
-                    |ws, _window, cx| ws.split_focused(SplitDirection::Horizontal, cx),
+                    |ws, window, cx| {
+                        ws.split_focused(SplitDirection::Horizontal, cx);
+                        ws.focus_active_pane(window, cx);
+                    },
                     cx,
                 ))
                 .child(self.overlay_button(
                     "split-v",
-                    |ws, _window, cx| ws.split_focused(SplitDirection::Vertical, cx),
+                    |ws, window, cx| {
+                        ws.split_focused(SplitDirection::Vertical, cx);
+                        ws.focus_active_pane(window, cx);
+                    },
                     cx,
                 ))
                 .child(self.overlay_button(
