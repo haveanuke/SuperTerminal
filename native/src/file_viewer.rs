@@ -15,8 +15,10 @@ use gpui::{
 use crate::themes::Theme;
 
 /// Byte / line caps: enough for logs and sources, never a gigabyte.
+/// (Rows are rebuilt per frame — the line cap keeps drags responsive
+/// until the list is virtualized.)
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_LINES: usize = 20_000;
+const MAX_LINES: usize = 5_000;
 const PAD: f32 = 8.0;
 
 pub struct ViewerClosed;
@@ -32,6 +34,10 @@ pub struct FileViewer {
     font_size: f32,
     path: PathBuf,
     lines: Option<Vec<String>>,
+    /// Original separator ("\r\n" or "\n") and whether the file ended
+    /// with one — copies must reproduce the bytes, not normalize them.
+    line_ending: &'static str,
+    trailing_newline: bool,
     notice: Option<&'static str>,
     /// Selection anchor and head; normalized on use.
     anchor: Option<TextPos>,
@@ -41,32 +47,58 @@ pub struct FileViewer {
     /// measuring canvas; read by mouse handlers for column math.
     origin: Arc<Mutex<(f32, f32)>>,
     cell_width: f32,
+    /// Verified-monospace family actually used for rendering AND
+    /// hit-testing (settings family may be absent or proportional).
+    resolved_family: Option<String>,
     focus_handle: FocusHandle,
     /// Grab keyboard focus on the first render so esc/Cmd+C work
     /// immediately after opening (one-shot: never steals afterwards).
     needs_focus: bool,
 }
 
-fn load_file(path: &PathBuf) -> (Option<Vec<String>>, Option<&'static str>) {
+struct Loaded {
+    lines: Option<Vec<String>>,
+    line_ending: &'static str,
+    trailing_newline: bool,
+    notice: Option<&'static str>,
+}
+
+fn load_file(path: &PathBuf) -> Loaded {
+    let failed = |notice| Loaded {
+        lines: None,
+        line_ending: "\n",
+        trailing_newline: false,
+        notice: Some(notice),
+    };
     let Ok(file) = std::fs::File::open(path) else {
-        return (None, Some("could not open file"));
+        return failed("could not open file");
     };
     let mut bytes = Vec::new();
-    if file.take(MAX_BYTES).read_to_end(&mut bytes).is_err() {
-        return (None, Some("could not read file"));
+    // One sentinel byte past the cap distinguishes exactly-cap files
+    // from truncated ones.
+    if file.take(MAX_BYTES + 1).read_to_end(&mut bytes).is_err() {
+        return failed("could not read file");
     }
+    let byte_capped = bytes.len() as u64 > MAX_BYTES;
+    bytes.truncate(MAX_BYTES as usize);
     if bytes.contains(&0) {
-        return (None, Some("binary file - use 'open' to view externally"));
+        return failed("binary file - use 'open' to view externally");
     }
-    let capped = bytes.len() as u64 >= MAX_BYTES;
     let text = String::from_utf8_lossy(&bytes);
+    let line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let trailing_newline = text.ends_with('\n');
     let mut lines: Vec<String> = text.lines().take(MAX_LINES).map(String::from).collect();
-    let truncated = capped || text.lines().count() > MAX_LINES;
+    let truncated = byte_capped || text.lines().count() > MAX_LINES;
     let notice = truncated.then_some("truncated - use 'open' for the full file");
     if lines.is_empty() {
         lines.push(String::new());
     }
-    (Some(lines), notice)
+    Loaded {
+        lines: Some(lines),
+        line_ending,
+        trailing_newline,
+        notice,
+    }
 }
 
 fn byte_index(s: &str, char_index: usize) -> usize {
@@ -91,9 +123,10 @@ impl FileViewer {
                 .spawn(async move { load_file(&load_path) })
                 .await;
             let _ = viewer.update(cx, |viewer: &mut FileViewer, cx| {
-                let (lines, notice) = loaded;
-                viewer.lines = lines;
-                viewer.notice = notice;
+                viewer.lines = loaded.lines;
+                viewer.line_ending = loaded.line_ending;
+                viewer.trailing_newline = loaded.trailing_newline;
+                viewer.notice = loaded.notice;
                 cx.notify();
             });
             Ok::<(), ()>(())
@@ -105,12 +138,15 @@ impl FileViewer {
             font_size,
             path,
             lines: None,
+            line_ending: "\n",
+            trailing_newline: false,
             notice: None,
             anchor: None,
             head: None,
             selecting: false,
             origin: Arc::new(Mutex::new((0.0, 0.0))),
             cell_width: font_size * 0.6,
+            resolved_family: None,
             focus_handle: cx.focus_handle(),
             needs_focus: true,
         }
@@ -126,6 +162,7 @@ impl FileViewer {
         self.theme = theme;
         self.font_family = font_family.to_string();
         self.font_size = font_size;
+        self.resolved_family = None; // re-resolve on next render
         cx.notify();
     }
 
@@ -160,7 +197,7 @@ impl FileViewer {
                 len
             };
             if line_index > start.0 {
-                out.push('\n');
+                out.push_str(self.line_ending);
             }
             out.push_str(&line[byte_index(line, from)..byte_index(line, to)]);
         }
@@ -168,18 +205,53 @@ impl FileViewer {
     }
 
     fn copy(&self, cx: &mut Context<Self>) {
-        let text = self
-            .selected_text()
-            .or_else(|| self.lines.as_ref().map(|lines| lines.join("\n")));
+        let text = self.selected_text().or_else(|| {
+            self.lines.as_ref().map(|lines| {
+                let mut all = lines.join(self.line_ending);
+                if self.trailing_newline {
+                    all.push_str(self.line_ending);
+                }
+                all
+            })
+        });
         if let Some(text) = text {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
 
-    fn column_at(&self, x: f32, line: &str) -> usize {
+    /// Char column under window-x, via the TEXT SYSTEM's shaping of this
+    /// exact line — fixed-cell math drifts on tabs/CJK/fallback glyphs.
+    fn column_at(&self, window: &mut Window, x: f32, line: &str) -> usize {
         let origin_x = self.origin.lock().unwrap().0;
-        let col = ((x - origin_x - PAD) / self.cell_width.max(1.0)).round();
-        (col.max(0.0) as usize).min(line.chars().count())
+        let x_rel = x - origin_x - PAD;
+        if x_rel <= 0.0 {
+            return 0;
+        }
+        let len = line.chars().count();
+        if line.is_empty() {
+            return 0;
+        }
+        let family = self
+            .resolved_family
+            .clone()
+            .unwrap_or_else(|| self.font_family.clone());
+        let text: SharedString = line.to_string().into();
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(family),
+            color: gpui::Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window
+            .text_system()
+            .shape_line(text, px(self.font_size), &[run], None);
+        if x_rel >= f32::from(shaped.width) {
+            return len;
+        }
+        let byte_index = shaped.closest_index_for_x(px(x_rel));
+        line[..byte_index.min(line.len())].chars().count()
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -218,11 +290,35 @@ impl Render for FileViewer {
             self.focus_handle.focus(window);
             self.needs_focus = false;
         }
+        // Resolve to an INSTALLED, verified-monospace family exactly like
+        // the terminal pane — rendering one font while hit-testing another
+        // is how selections land characters away from the pointer.
+        if self.resolved_family.is_none() {
+            let available = window.text_system().all_font_names();
+            let preferred = self.font_family.clone();
+            let resolved = [preferred.as_str(), "Menlo", "Monaco"]
+                .into_iter()
+                .find(|candidate| {
+                    available.iter().any(|name| name == candidate)
+                        && crate::pane::TerminalPane::family_is_monospace(
+                            candidate,
+                            self.font_size,
+                            window,
+                        )
+                })
+                .unwrap_or("Menlo")
+                .to_string();
+            self.resolved_family = Some(resolved);
+        }
+        let render_family = self
+            .resolved_family
+            .clone()
+            .unwrap_or_else(|| self.font_family.clone());
         // Measure through the shaping pipeline so column math matches glyphs.
         let probe: SharedString = "MMMMMMMMMM".into();
         let run = gpui::TextRun {
             len: probe.len(),
-            font: gpui::font(self.font_family.clone()),
+            font: gpui::font(render_family.clone()),
             color: gpui::Hsla::default(),
             background_color: None,
             underline: None,
@@ -279,7 +375,10 @@ impl Render for FileViewer {
                             0
                         };
                         let to = if index == end.0 { end.1.min(len) } else { len };
-                        Some((from, to))
+                        // Selection running past this line's end selects the
+                        // newline; show it as a trailing sliver.
+                        let continues = index < end.0;
+                        Some((from, to, continues))
                     });
                     let line_for_down = line.clone();
                     let line_for_move = line.clone();
@@ -296,8 +395,11 @@ impl Render for FileViewer {
                             cx.listener(move |viewer, event: &gpui::MouseDownEvent, window, cx| {
                                 viewer.focus_handle.focus(window);
                                 window.prevent_default();
-                                let col =
-                                    viewer.column_at(f32::from(event.position.x), &line_for_down);
+                                let col = viewer.column_at(
+                                    window,
+                                    f32::from(event.position.x),
+                                    &line_for_down,
+                                );
                                 viewer.anchor = Some((index, col));
                                 viewer.head = Some((index, col));
                                 viewer.selecting = true;
@@ -305,17 +407,20 @@ impl Render for FileViewer {
                             }),
                         )
                         .on_mouse_move(cx.listener(
-                            move |viewer, event: &gpui::MouseMoveEvent, _, cx| {
+                            move |viewer, event: &gpui::MouseMoveEvent, window, cx| {
                                 if viewer.selecting {
-                                    let col = viewer
-                                        .column_at(f32::from(event.position.x), &line_for_move);
+                                    let col = viewer.column_at(
+                                        window,
+                                        f32::from(event.position.x),
+                                        &line_for_move,
+                                    );
                                     viewer.head = Some((index, col));
                                     cx.notify();
                                 }
                             },
                         ));
                     match span {
-                        Some((from, to)) if from < to || len == 0 => {
+                        Some((from, to, continues)) if from < to || len == 0 || continues => {
                             let b0 = byte_index(line, from);
                             let b1 = byte_index(line, to);
                             let pre = line[..b0].to_string();
@@ -327,9 +432,9 @@ impl Render for FileViewer {
                             row = row.child(
                                 div()
                                     .bg(rgb(theme.selection))
-                                    // Full-line middle rows still show a
-                                    // selected empty width.
-                                    .min_w(px(4.0))
+                                    // Selected newline / empty line: keep a
+                                    // visible sliver of selection.
+                                    .when(continues || len == 0, |d| d.pr(px(6.0)))
                                     .child(SharedString::from(mid)),
                             );
                             if !post.is_empty() {
@@ -482,7 +587,7 @@ impl Render for FileViewer {
                     .relative()
                     .overflow_y_scroll()
                     .py(px(4.0))
-                    .font_family(self.font_family.clone())
+                    .font_family(render_family)
                     .text_size(px(self.font_size))
                     .line_height(line_height)
                     .text_color(rgb(theme.foreground))

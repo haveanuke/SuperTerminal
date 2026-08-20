@@ -914,25 +914,19 @@ impl Workspace {
                 SidebarView::Git => crate::icons::Icon::GitBranch,
                 SidebarView::Files => crate::icons::Icon::Files,
             };
+            let _ = label;
             div()
                 .id(SharedString::from(id))
                 .cursor_pointer()
-                .w(px(40.0))
-                .py(px(4.0))
-                .rounded(px(4.0))
+                .w(px(26.0))
+                .h(px(26.0))
+                .rounded(px(5.0))
                 .flex()
-                .flex_col()
                 .items_center()
-                .gap(px(2.0))
+                .justify_center()
                 .when(active, |d| d.bg(rgb(theme.ui_background)))
                 .hover(|style| style.bg(rgb(theme.ui_border)))
                 .child(crate::icons::icon(glyph, color))
-                .child(
-                    div()
-                        .text_size(px(8.0))
-                        .text_color(rgb(color))
-                        .child(SharedString::from(label)),
-                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |ws, _, window, cx| {
@@ -965,7 +959,7 @@ impl Workspace {
                 .flex_row()
                 .child(
                     div()
-                        .w(px(46.0))
+                        .w(px(34.0))
                         .h_full()
                         .flex_none()
                         .bg(rgb(theme.ui_surface))
@@ -1178,7 +1172,7 @@ impl Workspace {
             }
         }
         div()
-            .w(px(280.0))
+            .w(px(240.0))
             .flex_none()
             .h_full()
             .flex()

@@ -1212,7 +1212,7 @@ impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let base = div()
-            .w(px(320.0))
+            .w(px(280.0))
             .flex_none()
             .h_full()
             .flex()
