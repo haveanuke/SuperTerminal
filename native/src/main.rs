@@ -26,6 +26,21 @@ use workspace::{
 };
 
 fn main() {
+    // When the app is launched FROM a terminal session (dev installs run
+    // `open` from inside one), agent-CLI session markers leak into our
+    // process env — and from there into every shell this terminal spawns,
+    // making tools like `claude` believe they're nested child sessions
+    // (e.g. "transcript saving is off"). Scrub them before anything runs;
+    // safe here: no other threads exist yet.
+    for var in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SSE_PORT",
+    ] {
+        std::env::remove_var(var);
+    }
+
     // Process-global PTY env (TERM etc.) before any spawn; PTYs themselves
     // are always constructed on this (main) thread — contract rev 2 §4.
     alacritty_terminal::tty::setup_env();
