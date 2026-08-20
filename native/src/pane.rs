@@ -77,6 +77,13 @@ pub struct TerminalPane {
     cell_width: Pixels,
     line_height: Pixels,
     selecting: bool,
+    /// Live pointer position (window coords) during a selection drag; the
+    /// pump auto-scrolls while it sits past the pane's vertical edge.
+    drag_position: Option<(Pixels, Pixels)>,
+    drag_scroll_tick: u8,
+    /// Freshly measured pane size for drag edge math — unlike
+    /// `last_applied_size` it is NOT held back by the resize debounce.
+    measured_size: Option<(Pixels, Pixels)>,
     blink_on: bool,
     blink_tick: u32,
     /// Held marked text during IME composition (not yet sent to the PTY).
@@ -140,6 +147,7 @@ impl TerminalPane {
                     let measured = pane.pending_bounds.lock().unwrap().take();
                     if let Some((x, y, w, h)) = measured {
                         pane.origin = (x, y);
+                        pane.measured_size = Some((w, h));
                         // Coalesce resizes: every PTY resize SIGWINCHes the
                         // foreground app into a full re-render, and inline
                         // TUIs (claude) leave a stale copy in scrollback per
@@ -194,6 +202,45 @@ impl TerminalPane {
                             bytes.push(b'\r');
                             pane.write_self(bytes);
                         }
+                    }
+                    // Selection drag held past the top/bottom edge auto-scrolls
+                    // the viewport (parity with xterm.js in the old app). The
+                    // buffer-anchored selection start stays put; the end tracks
+                    // the revealed edge row. gpui mouse-move listeners are
+                    // hover-gated, so outside the pane the pointer is tracked
+                    // by render reading window.mouse_position() — the
+                    // every-tick notify below keeps that loop turning for the
+                    // drag's duration. Scrolls run every 4th tick (~64ms) so
+                    // speed is governed by drag_scroll_lines, not pump rate.
+                    if pane.selecting {
+                        pane.drag_scroll_tick = pane.drag_scroll_tick.wrapping_add(1);
+                        if let (Some((drag_x, drag_y)), Some((_, height))) =
+                            (pane.drag_position, pane.measured_size)
+                        {
+                            if pane.drag_scroll_tick % 4 == 0 {
+                                let top = f32::from(pane.origin.1) + PADDING;
+                                let bottom = f32::from(pane.origin.1) + f32::from(height) - PADDING;
+                                let lines = drag_scroll_lines(f32::from(drag_y), top, bottom);
+                                if lines != 0 {
+                                    let (col, _) = pane.cell_at(
+                                        drag_x,
+                                        drag_y,
+                                        pane.last_origin_x(),
+                                        pane.last_origin_y(),
+                                    );
+                                    let row = if lines > 0 {
+                                        0
+                                    } else {
+                                        pane.snapshot.lines.saturating_sub(1)
+                                    };
+                                    if let Some(session) = pane.session.as_mut() {
+                                        session.queue_scroll(lines);
+                                        session.queue_selection_update(col, row);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
                     }
                     // Cursor blink: ~530ms phase flip while focused.
                     pane.blink_tick += 1;
@@ -252,6 +299,9 @@ impl TerminalPane {
             cell_width,
             line_height,
             selecting: false,
+            drag_position: None,
+            drag_scroll_tick: 0,
+            measured_size: None,
             blink_on: true,
             blink_tick: 0,
             marked_text: None,
@@ -501,7 +551,23 @@ impl TerminalPane {
         let row = (y / f32::from(self.line_height)) as usize;
         (col, row)
     }
+}
 
+/// Lines to scroll per auto-scroll step while a selection drag sits past the
+/// pane's vertical edge (positive = toward history, matching `queue_scroll`).
+/// Speed scales with how far past the edge the pointer is, capped at 5.
+fn drag_scroll_lines(pointer_y: f32, top: f32, bottom: f32) -> i32 {
+    let (overshoot, sign) = if pointer_y < top {
+        (top - pointer_y, 1)
+    } else if pointer_y > bottom {
+        (pointer_y - bottom, -1)
+    } else {
+        return 0;
+    };
+    sign * (1 + (overshoot / 40.0) as i32).min(5)
+}
+
+impl TerminalPane {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let m = &ks.modifiers;
@@ -737,6 +803,14 @@ impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.measure_cell(window, cx);
 
+        // Hover-gated move listeners go quiet once a selection drag leaves the
+        // pane, so while selecting the pointer is sampled here instead — the
+        // pump notifies every tick during a drag, keeping this fresh.
+        if self.selecting {
+            let position = window.mouse_position();
+            self.drag_position = Some((position.x, position.y));
+        }
+
         if let Some(session) = self.session.as_mut() {
             self.snapshot = session.sync_and_snapshot();
         }
@@ -942,6 +1016,7 @@ impl Render for TerminalPane {
                 cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
                     let _ = &pane_for_move;
                     if this.selecting && event.dragging() {
+                        this.drag_position = Some((event.position.x, event.position.y));
                         let (col, row) = this.cell_at(
                             event.position.x,
                             event.position.y,
@@ -960,6 +1035,17 @@ impl Render for TerminalPane {
                 cx.listener(move |this, _event: &MouseUpEvent, _window, _cx| {
                     let _ = &pane_for_up;
                     this.selecting = false;
+                    this.drag_position = None;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseUpEvent, _window, _cx| {
+                    // Releases outside the pane are invisible to the hover-
+                    // gated on_mouse_up; without this the pump auto-scrolls
+                    // forever off the stale drag state.
+                    this.selecting = false;
+                    this.drag_position = None;
                 }),
             )
             .on_scroll_wheel(
@@ -1115,6 +1201,37 @@ impl TerminalPane {
             session.queue_selection_start(col, row);
         }
         self.selecting = true;
+        self.drag_position = None;
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drag_scroll_lines;
+
+    #[test]
+    fn no_scroll_inside_pane() {
+        assert_eq!(drag_scroll_lines(100.0, 50.0, 500.0), 0);
+        assert_eq!(drag_scroll_lines(50.0, 50.0, 500.0), 0); // exactly at top
+        assert_eq!(drag_scroll_lines(500.0, 50.0, 500.0), 0); // exactly at bottom
+    }
+
+    #[test]
+    fn above_top_scrolls_toward_history() {
+        assert_eq!(drag_scroll_lines(49.0, 50.0, 500.0), 1);
+        assert_eq!(drag_scroll_lines(10.0, 50.0, 500.0), 2);
+    }
+
+    #[test]
+    fn below_bottom_scrolls_toward_present() {
+        assert_eq!(drag_scroll_lines(501.0, 50.0, 500.0), -1);
+        assert_eq!(drag_scroll_lines(540.0, 50.0, 500.0), -2);
+    }
+
+    #[test]
+    fn speed_caps_at_five_lines() {
+        assert_eq!(drag_scroll_lines(-1000.0, 50.0, 500.0), 5);
+        assert_eq!(drag_scroll_lines(5000.0, 50.0, 500.0), -5);
     }
 }
