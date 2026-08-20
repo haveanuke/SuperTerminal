@@ -1009,16 +1009,20 @@ impl Workspace {
                         let bc_on = self.broadcast.is_enabled();
                         let bc_member = bc_on && self.broadcast.is_member(terminal_id);
                         let id_bc = terminal_id.clone();
-                        let pane_btn = |label: &'static str| {
+                        // Track the terminal font size a little (dampened, so
+                        // the cluster grows with big fonts without ballooning).
+                        let scale =
+                            (1.0 + (self.settings.font_size / 14.0 - 1.0) * 0.6).clamp(0.8, 1.6);
+                        let pane_btn = move |label: &'static str| {
                             div()
                                 .id(SharedString::from(format!("{label}-{terminal_id}")))
                                 .cursor_pointer()
-                                .px(px(4.0))
-                                .h(px(15.0))
+                                .px(px(4.0 * scale))
+                                .h(px(15.0 * scale))
                                 .flex()
                                 .items_center()
                                 .rounded(px(3.0))
-                                .text_size(px(9.0))
+                                .text_size(px(9.0 * scale))
                                 .text_color(rgb(theme.ui_text_muted))
                                 .hover(|style| style.bg(rgb(theme.ui_border)))
                                 .child(SharedString::from(label))
