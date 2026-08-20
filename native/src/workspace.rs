@@ -319,12 +319,9 @@ impl Workspace {
                     .panes
                     .iter()
                     .map(|(id, pane)| {
-                        let pane_ref = pane.read(cx);
-                        let cwd = pane_ref
-                            .cwd()
-                            .map(|cwd| cwd.replace(&home, "~"))
-                            .unwrap_or_default();
-                        (id.clone(), (cwd, pane_ref.is_busy()))
+                        let (cwd, busy) = pane.read(cx).status();
+                        let cwd = cwd.map(|cwd| cwd.replace(&home, "~")).unwrap_or_default();
+                        (id.clone(), (cwd, busy))
                     })
                     .collect();
                 cx.notify();
@@ -597,6 +594,13 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Drop sidebar state for projects that no longer exist.
+    fn prune_collapsed_projects(&mut self) {
+        let live: std::collections::HashSet<String> =
+            self.tabs.iter().map(|tab| tab.id.clone()).collect();
+        self.collapsed_projects.retain(|id| live.contains(id));
+    }
+
     /// Keep an in-progress tab rename pointing at the same tab after a tab
     /// removal shifts the indices; drop it if its own tab was closed.
     fn fix_rename_after_removal(&mut self, removed: usize) {
@@ -661,6 +665,7 @@ impl Workspace {
                     || self.focused_terminal.as_deref() == Some(terminal_id);
                 self.tabs.remove(tab_index);
                 self.fix_rename_after_removal(tab_index);
+                self.prune_collapsed_projects();
                 if self.tabs.is_empty() {
                     self.add_tab(None, cx);
                 } else {
@@ -708,6 +713,7 @@ impl Workspace {
         }
         self.tabs.remove(index);
         self.fix_rename_after_removal(index);
+        self.prune_collapsed_projects();
         if self.tabs.is_empty() {
             self.add_tab(None, cx);
         } else {
@@ -1250,10 +1256,23 @@ impl Workspace {
                         .cloned()
                         .unwrap_or_default();
                     let cwd: SharedString = cwd.into();
-                    // Quick status dot, Orca-style: yellow = a foreground
-                    // job is running; green = at the prompt, awaiting
-                    // commands.
-                    let dot_color = if busy { theme.yellow } else { theme.green };
+                    // Quick status dot, Orca-style. tcgetpgrp alone can't
+                    // tell "computing" from "interactive program awaiting
+                    // input", so output silence disambiguates: a claude
+                    // session that finished and sits at its input box goes
+                    // cyan within seconds.
+                    //   green  = shell prompt, ready for commands
+                    //   yellow = foreground job producing output (working)
+                    //   cyan   = foreground job quiet - awaiting input
+                    let quiet =
+                        pane_ref.last_activity.elapsed() >= std::time::Duration::from_secs(3);
+                    let dot_color = if !busy {
+                        theme.green
+                    } else if quiet {
+                        theme.cyan
+                    } else {
+                        theme.yellow
+                    };
                     let jump_id = terminal_id.clone();
                     rows.push(
                         div()

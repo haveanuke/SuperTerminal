@@ -254,9 +254,12 @@ impl TerminalPane {
         self.session.as_ref()?.cwd()
     }
 
-    /// True while a foreground job runs in this pane's terminal.
-    pub fn is_busy(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.is_busy())
+    /// (cwd, foreground-job-running) in one probe.
+    pub fn status(&self) -> (Option<String>, bool) {
+        self.session
+            .as_ref()
+            .map(|s| s.status())
+            .unwrap_or((None, false))
     }
 
     pub fn focus(&self, window: &mut Window) {

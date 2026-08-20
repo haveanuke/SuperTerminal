@@ -436,24 +436,25 @@ impl TermSession {
 
     /// Current working directory of the foreground process in this terminal
     /// (falls back to the shell process; best-effort).
-    /// True while a foreground job (not the shell itself) owns the
-    /// terminal — i.e. something is running; false at the prompt.
-    pub fn is_busy(&self) -> bool {
+    /// One ioctl for both answers: (cwd, foreground-job-owns-terminal).
+    /// A failed tcgetpgrp reads as "no job" (ready) — indistinguishable
+    /// from the prompt without shell integration.
+    pub fn status(&self) -> (Option<String>, bool) {
         if self.exited.is_some() {
-            return false;
+            return (None, false);
         }
         let fg = unsafe { tcgetpgrp(self.master_fd) };
-        fg > 0 && fg != self.shell_pid
+        let busy = fg > 0 && fg != self.shell_pid;
+        let pid = if fg > 0 { fg } else { self.shell_pid };
+        let cwd = superterminal_core::proc_cwd::pid_cwd(pid)
+            .or_else(|| superterminal_core::proc_cwd::pid_cwd(self.shell_pid));
+        (cwd, busy)
     }
 
+    /// Where the focused terminal is (foreground process's directory,
+    /// falling back to the shell's).
     pub fn cwd(&self) -> Option<String> {
-        if self.exited.is_some() {
-            return None;
-        }
-        let fg = unsafe { tcgetpgrp(self.master_fd) };
-        let pid = if fg > 0 { fg } else { self.shell_pid };
-        superterminal_core::proc_cwd::pid_cwd(pid)
-            .or_else(|| superterminal_core::proc_cwd::pid_cwd(self.shell_pid))
+        self.status().0
     }
 
     /// Apply all deferred ops and copy out a render snapshot under ONE lock.
