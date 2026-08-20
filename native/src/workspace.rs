@@ -132,6 +132,8 @@ pub struct Workspace {
     broadcast: Arc<BroadcastHub>,
     git_panel: Option<Entity<GitPanel>>,
     files_panel: Option<Entity<crate::files_panel::FilesPanel>>,
+    /// Read-only file viewer docked beside the terminal tree.
+    file_viewer: Option<Entity<crate::file_viewer::FileViewer>>,
     sidebar_open: bool,
     sidebar_view: SidebarView,
     /// cwd per terminal for the projects view, refreshed on the sidebar
@@ -216,6 +218,7 @@ impl Workspace {
             broadcast: Arc::new(BroadcastHub::default()),
             git_panel: None,
             files_panel: None,
+            file_viewer: None,
             sidebar_open: true,
             sidebar_view: SidebarView::Projects,
             sidebar_cwd_cache: HashMap::new(),
@@ -745,6 +748,11 @@ impl Workspace {
         if let Some(panel) = self.files_panel.clone() {
             panel.update(cx, |panel, panel_cx| panel.set_theme(theme, panel_cx));
         }
+        if let Some(viewer) = self.file_viewer.clone() {
+            viewer.update(cx, |viewer, viewer_cx| {
+                viewer.set_appearance(theme, &family, size, viewer_cx)
+            });
+        }
         // Text fields capture the theme at creation; keep them current.
         let fields = [
             self.session_field.clone(),
@@ -890,27 +898,41 @@ impl Workspace {
         let theme = self.theme;
         let view = self.sidebar_view;
         let open = self.sidebar_open;
-        let rail_item = |ws: &Self,
+        let rail_item = |_ws: &Self,
                          id: &'static str,
                          label: &'static str,
                          item: SidebarView,
                          cx: &mut Context<Self>| {
             let active = open && view == item;
+            let color = if active {
+                theme.ui_accent
+            } else {
+                theme.ui_text_muted
+            };
+            let glyph = match item {
+                SidebarView::Projects => crate::icons::Icon::Projects,
+                SidebarView::Git => crate::icons::Icon::GitBranch,
+                SidebarView::Files => crate::icons::Icon::Files,
+            };
             div()
                 .id(SharedString::from(id))
                 .cursor_pointer()
-                .px(px(4.0))
-                .py(px(3.0))
-                .rounded(px(3.0))
-                .text_size(px(9.0))
-                .text_color(rgb(if active {
-                    theme.ui_accent
-                } else {
-                    ws.theme.ui_text_muted
-                }))
+                .w(px(40.0))
+                .py(px(4.0))
+                .rounded(px(4.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(2.0))
                 .when(active, |d| d.bg(rgb(theme.ui_background)))
                 .hover(|style| style.bg(rgb(theme.ui_border)))
-                .child(SharedString::from(label))
+                .child(crate::icons::icon(glyph, color))
+                .child(
+                    div()
+                        .text_size(px(8.0))
+                        .text_color(rgb(color))
+                        .child(SharedString::from(label)),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |ws, _, window, cx| {
@@ -1262,13 +1284,40 @@ impl Workspace {
             SidebarView::Files => {
                 if self.files_panel.is_none() {
                     let theme = self.theme;
-                    self.files_panel = Some(
-                        cx.new(|panel_cx| crate::files_panel::FilesPanel::new(theme, panel_cx)),
-                    );
+                    let panel =
+                        cx.new(|panel_cx| crate::files_panel::FilesPanel::new(theme, panel_cx));
+                    cx.subscribe(
+                        &panel,
+                        |ws, _panel, event: &crate::files_panel::OpenFile, cx| {
+                            ws.open_file_viewer(event.0.clone(), cx);
+                        },
+                    )
+                    .detach();
+                    self.files_panel = Some(panel);
                 }
             }
         }
         self.push_git_cwd(cx);
+        cx.notify();
+    }
+
+    /// Open (or replace) the docked file viewer.
+    fn open_file_viewer(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let theme = self.theme;
+        let family = self.settings.font_family.clone();
+        let size = self.settings.font_size;
+        let viewer = cx.new(|viewer_cx| {
+            crate::file_viewer::FileViewer::new(path, theme, family, size, viewer_cx)
+        });
+        cx.subscribe(
+            &viewer,
+            |ws, _viewer, _event: &crate::file_viewer::ViewerClosed, cx| {
+                ws.file_viewer = None;
+                cx.notify();
+            },
+        )
+        .detach();
+        self.file_viewer = Some(viewer);
         cx.notify();
     }
 
@@ -3345,7 +3394,8 @@ impl Render for Workspace {
                             .overflow_hidden()
                             .relative()
                             .child(content),
-                    ),
+                    )
+                    .children(self.file_viewer.clone()),
             )
             .child(self.render_bar(cx))
             .children(self.render_pet(window, cx))

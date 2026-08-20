@@ -1,8 +1,10 @@
 //! SuperTerminal Native: gpui + alacritty_terminal, no webview.
 
 mod buddy_pet;
+mod file_viewer;
 mod files_panel;
 mod git_panel;
+mod icons;
 mod keys;
 mod layout;
 mod pane;
