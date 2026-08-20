@@ -366,7 +366,7 @@ impl Workspace {
         self.next_id += 1;
         self.tabs.push(Tab {
             id: tab_id,
-            label: "Terminal".to_string(),
+            label: "terminal".to_string(),
             pane: PaneNode::terminal(&terminal_id),
         });
         self.active_tab = self.tabs.len() - 1;
@@ -1341,6 +1341,10 @@ impl Workspace {
                     } else {
                         theme.ui_text_muted
                     }))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
                     .child(
                         if let Some((rename_index, field)) = self
                             .rename_field
@@ -1351,9 +1355,30 @@ impl Workspace {
                             div().w(px(120.0)).child(field.clone()).into_any_element()
                         } else {
                             div()
-                                .child(SharedString::from(format!("{}:{}", index + 1, tab.label)))
+                                .child(SharedString::from(tab.label.clone()))
                                 .into_any_element()
                         },
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("tab-close-{index}")))
+                            .cursor_pointer()
+                            .px(px(2.0))
+                            .text_color(rgb(if active {
+                                theme.ui_background
+                            } else {
+                                theme.ui_text_muted
+                            }))
+                            .hover(|style| style.text_color(rgb(theme.red)))
+                            .child("x")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.close_tab(index, cx);
+                                    ws.focus_active_pane(window, cx);
+                                }),
+                            ),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
