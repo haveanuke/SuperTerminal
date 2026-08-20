@@ -859,8 +859,8 @@ impl Workspace {
     }
 
     /// Pick a directory and open a new tab there (the bar's cwd control).
-    fn open_folder(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |ws, cx| {
+    fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |ws, cx| {
             let picked = cx
                 .background_executor()
                 .spawn(async {
@@ -876,9 +876,10 @@ impl Workspace {
                         .filter(|path| !path.is_empty())
                 })
                 .await;
-            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+            let _ = ws.update_in(cx, |ws: &mut Workspace, window, cx| {
                 if let Some(path) = picked {
                     ws.add_tab(Some(PathBuf::from(path)), cx);
+                    ws.focus_active_pane(window, cx);
                     cx.notify();
                 }
             });
@@ -1433,7 +1434,7 @@ impl Workspace {
                         .child(SharedString::from(format!("dir: {display}")))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|ws, _, _, cx| ws.open_folder(cx)),
+                            cx.listener(|ws, _, window, cx| ws.open_folder(window, cx)),
                         )
                 })
                 .children(self.swap_source.is_some().then(|| {
