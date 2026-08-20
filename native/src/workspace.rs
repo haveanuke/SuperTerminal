@@ -539,12 +539,12 @@ impl Workspace {
 
     /// A new full-pane WINDOW inside a project — no split, one shows at a
     /// time; the sidebar lists and switches them.
-    fn new_window(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+    fn new_window(&mut self, tab_index: usize, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         if tab_index >= self.tabs.len() {
             return;
         }
         let terminal_id = self.fresh_id();
-        self.spawn_pane(terminal_id.clone(), None, cx);
+        self.spawn_pane(terminal_id.clone(), cwd, cx);
         let tab = &mut self.tabs[tab_index];
         tab.windows.push(PaneNode::terminal(&terminal_id));
         tab.active_window = tab.windows.len() - 1;
@@ -1141,7 +1141,7 @@ impl Workspace {
                                         if let Some(index) =
                                             ws.tabs.iter().position(|t| t.id == new_win_tab_id)
                                         {
-                                            ws.new_window(index, cx);
+                                            ws.new_window(index, None, cx);
                                             ws.focus_active_pane(window, cx);
                                         }
                                     }
@@ -1494,7 +1494,10 @@ impl Workspace {
         }
     }
 
-    /// Pick a directory and open a new tab there (the bar's cwd control).
+    /// Pick a directory and MOVE the focused terminal there (the bar's cwd
+    /// control): a `cd` typed at its prompt. When a program currently owns
+    /// that terminal, a new window opens in the project instead — never
+    /// type into a running program.
     fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |ws, cx| {
             let picked = cx
@@ -1503,7 +1506,7 @@ impl Workspace {
                     std::process::Command::new("/usr/bin/osascript")
                         .args([
                             "-e",
-                            "POSIX path of (choose folder with prompt \"Open folder in a new tab\")",
+                            "POSIX path of (choose folder with prompt \"Change directory\")",
                         ])
                         .output()
                         .ok()
@@ -1513,11 +1516,33 @@ impl Workspace {
                 })
                 .await;
             let _ = ws.update_in(cx, |ws: &mut Workspace, window, cx| {
-                if let Some(path) = picked {
-                    ws.add_tab(Some(PathBuf::from(path)), cx);
-                    ws.focus_active_pane(window, cx);
-                    cx.notify();
+                let Some(path) = picked else { return };
+                let focused = ws
+                    .focused_terminal
+                    .as_ref()
+                    .and_then(|id| ws.panes.get(id))
+                    .cloned();
+                match focused {
+                    Some(pane) if !pane.read(cx).status().1 => {
+                        // Shell at its prompt: a plain cd, single-quoted
+                        // with the POSIX '\'' escape for safety.
+                        let quoted = path.replace('\'', "'\\''");
+                        pane.read(cx).send_text(&format!("cd '{quoted}'\r"));
+                        ws.focus_active_pane(window, cx);
+                    }
+                    _ => {
+                        // Busy (or no) terminal: open a new window in the
+                        // current project at that directory.
+                        let index = ws.active_tab;
+                        if index < ws.tabs.len() {
+                            ws.new_window(index, Some(PathBuf::from(path)), cx);
+                        } else {
+                            ws.add_tab(Some(PathBuf::from(path)), cx);
+                        }
+                        ws.focus_active_pane(window, cx);
+                    }
                 }
+                cx.notify();
             });
             Ok::<(), ()>(())
         })
@@ -3408,7 +3433,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &NewWindow, window, cx| {
                 let index = ws.active_tab;
-                ws.new_window(index, cx);
+                ws.new_window(index, None, cx);
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &CloseTab, window, cx| {

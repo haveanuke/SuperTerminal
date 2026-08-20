@@ -254,6 +254,11 @@ impl TerminalPane {
         self.session.as_ref()?.cwd()
     }
 
+    /// Type text into this pane's PTY (bypasses broadcast).
+    pub fn send_text(&self, text: &str) {
+        self.write_self(text.as_bytes().to_vec());
+    }
+
     /// (cwd, foreground-job-running) in one probe.
     pub fn status(&self) -> (Option<String>, bool) {
         self.session
