@@ -5,6 +5,7 @@
 //! follows the focused terminal's working directory (the workspace pushes
 //! cwd changes in via [`GitPanel::set_target_cwd`]).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,10 +60,11 @@ pub struct GitPanel {
     /// Two-click discard confirm: target armed by the first click. Discarding
     /// an untracked entry deletes it permanently, so nothing runs unarmed.
     pending_discard: Option<DiscardTarget>,
-    /// Commit expanded in the history view, and its fetched files.
-    expanded_commit: Option<String>,
-    expanded_files: Option<Vec<CommitFileChange>>,
-    files_seq: u64,
+    /// Commits expanded in the history view: hash -> files once loaded
+    /// (None while the load is in flight). Any number may be open at once;
+    /// a commit's files are immutable per hash, so late results are always
+    /// safe to attach while the hash stays expanded.
+    expanded: HashMap<String, Option<Vec<CommitFileChange>>>,
 }
 
 pub struct PanelClosed;
@@ -107,9 +109,7 @@ impl GitPanel {
             generation: 0,
             graph_seq: 0,
             pending_discard: None,
-            expanded_commit: None,
-            expanded_files: None,
-            files_seq: 0,
+            expanded: HashMap::new(),
         }
     }
 
@@ -146,8 +146,7 @@ impl GitPanel {
                     panel.report = None;
                     panel.graph = None;
                     panel.pending_discard = None;
-                    panel.expanded_commit = None;
-                    panel.expanded_files = None;
+                    panel.expanded.clear();
                     panel.refresh_status(cx);
                     panel.refresh_graph(cx);
                 }
@@ -358,18 +357,11 @@ impl GitPanel {
     }
 
     fn toggle_commit(&mut self, hash: String, cx: &mut Context<Self>) {
-        if self.expanded_commit.as_ref() == Some(&hash) {
-            self.expanded_commit = None;
-            self.expanded_files = None;
-            // Cancels any in-flight file load for the collapsed commit.
-            self.files_seq += 1;
+        if self.expanded.remove(&hash).is_some() {
             cx.notify();
             return;
         }
-        self.expanded_commit = Some(hash.clone());
-        self.expanded_files = None;
-        self.files_seq += 1;
-        let seq = self.files_seq;
+        self.expanded.insert(hash.clone(), None);
         let state = Arc::clone(&self.state);
         let Some(repo) = self.repo.clone() else {
             return;
@@ -388,16 +380,11 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                // Gate on the sequence and on the expansion still pointing at
-                // this commit — NOT on repo generation, which a same-repo cwd
-                // retarget bumps spuriously (that would strand "loading...").
-                // A repo change clears expanded_commit, so stale results
-                // from another repo can never attach.
-                if panel.files_seq != seq || panel.expanded_commit.as_ref() != Some(&hash) {
-                    return;
-                }
-                if let Ok(files) = result {
-                    panel.expanded_files = Some(files);
+                // Attach only while the hash is still expanded. A repo change
+                // clears the map; per-hash file lists are immutable, so any
+                // surviving slot accepts the result safely.
+                if let (Ok(files), Some(slot)) = (result, panel.expanded.get_mut(&hash)) {
+                    *slot = Some(files);
                     cx.notify();
                 }
             });
@@ -711,10 +698,10 @@ impl GitPanel {
         )
     }
 
-    /// Rows of files for the expanded commit, indented under it.
-    fn commit_file_rows(&self) -> impl IntoElement {
+    /// Rows of files for an expanded commit, indented under it.
+    fn commit_file_rows(&self, files: &Option<Vec<CommitFileChange>>) -> impl IntoElement {
         let theme = self.theme;
-        let rows: Vec<_> = match &self.expanded_files {
+        let rows: Vec<_> = match files {
             None => vec![div()
                 .pl(px(6.0))
                 .h(px(18.0))
@@ -776,14 +763,14 @@ impl GitPanel {
     }
 
     /// Commit rows with branch lines painted behind them on ONE canvas:
-    /// rows after the expanded commit are shifted down by the height of its
-    /// file block, and the expanded row's edges run straight through that
-    /// block's gutter, so the topology never breaks around an expansion.
+    /// each row's y is offset by the accumulated heights of every expanded
+    /// file block above it, and edges run straight through those blocks'
+    /// gutters, so the topology never breaks around expansions.
     fn graph_body(
         &self,
         rows: &[superterminal_core::git::graph::GraphRow],
-        expanded_index: Option<usize>,
-        insert_height: f32,
+        offsets: Vec<f32>,
+        mut blocks: Vec<Option<gpui::AnyElement>>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         const ROW_H: f32 = 18.0;
@@ -803,13 +790,10 @@ impl GitPanel {
         let lane_color = move |lane: usize| lane_colors[lane.min(MAX_LANE) % lane_colors.len()];
         let lane_x = |lane: usize| 8.0 + (lane.min(MAX_LANE) as f32) * 8.0;
         let gutter = px(8.0 + 8.0 * 8.0 + 6.0);
-        // Rows after the expansion sit lower by the file block's height.
+        // Rows sit lower by the total height of file blocks spliced above.
+        let paint_offsets = offsets.clone();
         let y_of = move |index: usize| {
-            (index as f32) * ROW_H
-                + match expanded_index {
-                    Some(k) if index > k => insert_height,
-                    _ => 0.0,
-                }
+            (index as f32) * ROW_H + paint_offsets.get(index).copied().unwrap_or(0.0)
         };
 
         // Geometry for the paint pass: (lane, edges) per row.
@@ -855,13 +839,12 @@ impl GitPanel {
         .left_0()
         .size_full();
 
-        let expanded = self.expanded_commit.clone();
         let row_divs: Vec<_> = rows
             .iter()
             .map(|row| {
                 let color = lane_color(row.lane);
                 let hash = row.hash.clone();
-                let selected = expanded.as_deref() == Some(row.hash.as_str());
+                let selected = self.expanded.contains_key(&row.hash);
                 div()
                     .id(SharedString::from(format!("commit-{}", row.hash)))
                     .relative()
@@ -919,18 +902,11 @@ impl GitPanel {
             })
             .collect();
 
-        let mut files_block = if expanded_index.is_some() {
-            Some(self.commit_file_rows().into_any_element())
-        } else {
-            None
-        };
         let mut children: Vec<gpui::AnyElement> = vec![lines.into_any_element()];
         for (index, row_div) in row_divs.into_iter().enumerate() {
             children.push(row_div.into_any_element());
-            if Some(index) == expanded_index {
-                if let Some(block) = files_block.take() {
-                    children.push(block);
-                }
+            if let Some(block) = blocks.get_mut(index).and_then(Option::take) {
+                children.push(block);
             }
         }
         div()
@@ -941,41 +917,47 @@ impl GitPanel {
             .into_any_element()
     }
 
-    /// The commit history with painted branch lines; the expanded commit's
-    /// file list is spliced in beneath it.
+    /// The commit history with painted branch lines; every expanded commit
+    /// gets its file list spliced in beneath it.
     fn render_graph(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let rows: Vec<superterminal_core::git::graph::GraphRow> = self
             .graph
             .iter()
             .flat_map(|graph| graph.rows.iter())
-            .take(120)
+            .take(300)
             .cloned()
             .collect();
-        let expanded_index = self
-            .expanded_commit
-            .as_ref()
-            .and_then(|hash| rows.iter().position(|row| &row.hash == hash));
-        // Height of the spliced file block, mirrored by the canvas offsets.
-        let file_rows = match &self.expanded_files {
-            None => 1,
-            Some(files) if files.is_empty() => 1,
-            Some(files) => files.len().min(80),
-        };
-        let insert_height = if expanded_index.is_some() {
-            18.0 * file_rows as f32
-        } else {
-            0.0
-        };
+
+        // Per-row y offset = total heights of the file blocks spliced above;
+        // block heights are 18px rows (loading and no-files both one row),
+        // mirrored exactly by `commit_file_rows`.
+        let mut offsets = Vec::with_capacity(rows.len());
+        let mut blocks: Vec<Option<gpui::AnyElement>> = Vec::with_capacity(rows.len());
+        let mut accumulated = 0.0f32;
+        for row in &rows {
+            offsets.push(accumulated);
+            match self.expanded.get(&row.hash) {
+                Some(files) => {
+                    let count = match files {
+                        None => 1,
+                        Some(list) if list.is_empty() => 1,
+                        Some(list) => list.len().min(80),
+                    };
+                    accumulated += 18.0 * count as f32;
+                    let files = files.clone();
+                    blocks.push(Some(self.commit_file_rows(&files).into_any_element()));
+                }
+                None => blocks.push(None),
+            }
+        }
 
         let mut children: Vec<gpui::AnyElement> = Vec::new();
         if !rows.is_empty() {
-            children.push(self.graph_body(&rows, expanded_index, insert_height, cx));
+            children.push(self.graph_body(&rows, offsets, blocks, cx));
         }
 
         div()
-            .flex_grow()
-            .overflow_hidden()
             .border_t_1()
             .border_color(rgb(theme.ui_border))
             .flex()
@@ -1150,22 +1132,32 @@ impl Render for GitPanel {
                     .text_color(rgb(theme.red))
                     .child(SharedString::from(error))
             }))
-            .children(self.section("merge changes", conflicts, false, Vec::new(), cx))
-            .children({
-                let actions = vec![self
-                    .chip("unstage all", GitOp::UnstageAll, cx)
-                    .into_any_element()];
-                self.section("staged changes", staged, true, actions, cx)
-            })
-            .children({
-                let actions = vec![
-                    self.discard_control(DiscardTarget::All, false, cx)
-                        .into_any_element(),
-                    self.chip("stage all", GitOp::StageAll, cx)
-                        .into_any_element(),
-                ];
-                self.section("changes", changes, false, actions, cx)
-            })
-            .child(self.render_graph(cx))
+            .child(
+                // Everything below the commit box scrolls as one column,
+                // VS Code style: sections first, then the commit history.
+                div()
+                    .id("git-scroll")
+                    .flex_grow()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(self.section("merge changes", conflicts, false, Vec::new(), cx))
+                    .children({
+                        let actions = vec![self
+                            .chip("unstage all", GitOp::UnstageAll, cx)
+                            .into_any_element()];
+                        self.section("staged changes", staged, true, actions, cx)
+                    })
+                    .children({
+                        let actions = vec![
+                            self.discard_control(DiscardTarget::All, false, cx)
+                                .into_any_element(),
+                            self.chip("stage all", GitOp::StageAll, cx)
+                                .into_any_element(),
+                        ];
+                        self.section("changes", changes, false, actions, cx)
+                    })
+                    .child(self.render_graph(cx)),
+            )
     }
 }
