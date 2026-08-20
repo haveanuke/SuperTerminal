@@ -52,16 +52,39 @@ fn classify(line: &str) -> DiffLineKind {
 }
 
 /// Classify unified diff text, capped with an explicit truncation marker.
+/// Classification is stateful: file headers only occur before the first
+/// hunk of each file, so `+++x`/`---x` CONTENT inside a hunk stays
+/// added/removed instead of being mislabeled a header.
 pub fn parse_unified(text: &str) -> Vec<DiffLine> {
     let mut lines: Vec<DiffLine> = Vec::new();
     let mut truncated = false;
+    let mut in_hunk = false;
     for (index, line) in text.lines().enumerate() {
         if index >= MAX_DIFF_LINES {
             truncated = true;
             break;
         }
+        if line.starts_with("diff ") {
+            in_hunk = false; // next file's header zone begins
+        }
+        let kind = if line.starts_with("@@") {
+            in_hunk = true;
+            DiffLineKind::Hunk
+        } else if in_hunk {
+            if line.starts_with('+') {
+                DiffLineKind::Added
+            } else if line.starts_with('-') {
+                DiffLineKind::Removed
+            } else if line.starts_with('\\') {
+                DiffLineKind::Header // "\ No newline at end of file"
+            } else {
+                DiffLineKind::Context
+            }
+        } else {
+            classify(line)
+        };
         lines.push(DiffLine {
-            kind: classify(line),
+            kind,
             text: line.to_string(),
         });
     }
@@ -92,12 +115,16 @@ pub fn run_file_diff(
     Ok(parse_unified(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Byte cap for reading untracked files (display needs far less).
+pub const MAX_UNTRACKED_BYTES: u64 = 256 * 1024;
+
 /// Untracked files have no diff yet; show their contents as additions.
 pub fn read_untracked(
     state: &GitState,
     repo_id: &str,
     path: &str,
 ) -> Result<Vec<DiffLine>, String> {
+    use std::io::Read;
     let entry = state.entry(repo_id).ok_or("unknown repo")?;
     let full = entry.root.join(path);
     // This is a raw filesystem read: refuse anything that resolves outside
@@ -107,16 +134,23 @@ pub fn read_untracked(
     if !canonical.starts_with(&root) {
         return Err("path escapes repository".to_string());
     }
-    let bytes = std::fs::read(&canonical).map_err(|e| e.to_string())?;
-    if bytes.iter().take(8192).any(|&b| b == 0) {
+    // Bounded read: never pull a multi-gigabyte file into memory for a
+    // 400-line preview.
+    let file = std::fs::File::open(&canonical).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_UNTRACKED_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.contains(&0) {
         return Ok(vec![DiffLine {
             kind: DiffLineKind::Header,
             text: "binary file".to_string(),
         }]);
     }
+    let byte_capped = bytes.len() as u64 >= MAX_UNTRACKED_BYTES;
     let text = String::from_utf8_lossy(&bytes);
     let mut lines: Vec<DiffLine> = Vec::new();
-    let mut truncated = false;
+    let mut truncated = byte_capped;
     for (index, line) in text.lines().enumerate() {
         if index >= MAX_DIFF_LINES {
             truncated = true;
@@ -130,7 +164,7 @@ pub fn read_untracked(
     if truncated {
         lines.push(DiffLine {
             kind: DiffLineKind::Header,
-            text: format!("... truncated at {MAX_DIFF_LINES} lines"),
+            text: "... truncated".to_string(),
         });
     }
     Ok(lines)

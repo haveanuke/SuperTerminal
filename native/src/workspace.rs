@@ -298,6 +298,12 @@ impl Workspace {
             cx.notify();
         }
         if self.pet_tick_count.is_multiple_of(3) {
+            // Piggyback: keep the sidebar following the focused terminal's
+            // cwd (a `cd` changes it without any focus event). The panels
+            // dedupe unchanged paths, so this is cheap.
+            if self.sidebar_open {
+                self.push_git_cwd(cx);
+            }
             self.pet_frame = (self.pet_frame + 1) % 3;
             // ~1-in-5 frames blink for one tick (300ms), like the old app.
             self.pet_blink = crate::buddy_pet::hash_string(&self.pet_tick_count.to_string(), 7)
@@ -695,6 +701,7 @@ impl Workspace {
             self.focused_terminal = collect_terminal_ids(&self.tabs[index].pane)
                 .into_iter()
                 .next();
+            self.push_git_cwd(cx);
             cx.notify();
         }
     }
@@ -856,19 +863,18 @@ impl Workspace {
         }
     }
 
-    /// The left sidebar: a slim activity rail plus the active view.
+    /// The left sidebar: the activity rail is ALWAYS visible (so every view
+    /// stays one click away); the active view opens beside it.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.sidebar_open {
-            return None;
-        }
         let theme = self.theme;
         let view = self.sidebar_view;
+        let open = self.sidebar_open;
         let rail_item = |ws: &Self,
                          id: &'static str,
                          label: &'static str,
                          item: SidebarView,
                          cx: &mut Context<Self>| {
-            let active = view == item;
+            let active = open && view == item;
             div()
                 .id(SharedString::from(id))
                 .cursor_pointer()
@@ -896,15 +902,16 @@ impl Workspace {
                     }),
                 )
         };
-        let active_view: gpui::AnyElement = match self.sidebar_view {
-            SidebarView::Git => self
-                .git_panel
-                .clone()
-                .map(|panel| panel.into_any_element())?,
-            SidebarView::Files => self
-                .files_panel
-                .clone()
-                .map(|panel| panel.into_any_element())?,
+        let active_view: Option<gpui::AnyElement> = if self.sidebar_open {
+            match self.sidebar_view {
+                SidebarView::Git => self.git_panel.clone().map(|panel| panel.into_any_element()),
+                SidebarView::Files => self
+                    .files_panel
+                    .clone()
+                    .map(|panel| panel.into_any_element()),
+            }
+        } else {
+            None
         };
         Some(
             div()
@@ -934,7 +941,7 @@ impl Workspace {
                             cx,
                         )),
                 )
-                .child(active_view),
+                .children(active_view),
         )
     }
 

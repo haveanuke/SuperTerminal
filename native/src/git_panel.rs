@@ -66,9 +66,18 @@ pub struct GitPanel {
     /// a commit's files are immutable per hash, so late results are always
     /// safe to attach while the hash stays expanded.
     expanded: HashMap<String, Option<Vec<CommitFileChange>>>,
-    /// Inline diffs open in the change sections: (path, staged) -> lines
-    /// once loaded (None while in flight).
-    file_diffs: HashMap<(String, bool), Option<Vec<DiffLine>>>,
+    /// Inline diffs open in the change sections: (path, staged) -> slot.
+    /// The token pins each slot to its newest request so a slow older load
+    /// (or one from a previous repo) can never attach.
+    file_diffs: HashMap<(String, bool), DiffSlot>,
+    diff_seq: u64,
+}
+
+/// One open inline diff: which request owns the slot, and its lines once
+/// that request lands.
+struct DiffSlot {
+    token: u64,
+    lines: Option<Vec<DiffLine>>,
 }
 
 pub struct PanelClosed;
@@ -115,6 +124,7 @@ impl GitPanel {
             pending_discard: None,
             expanded: HashMap::new(),
             file_diffs: HashMap::new(),
+            diff_seq: 0,
         }
     }
 
@@ -206,7 +216,9 @@ impl GitPanel {
                                 panel.pending_discard = None;
                             }
                         }
-                        // Drop inline diffs whose entry left the section.
+                        // Drop inline diffs whose entry left the section,
+                        // then reload the survivors so open diffs track the
+                        // file's CURRENT contents, not a click-time snapshot.
                         panel.file_diffs.retain(|(path, staged), _| {
                             report.entries.iter().any(|e| {
                                 &e.path == path
@@ -221,7 +233,29 @@ impl GitPanel {
                                     }
                             })
                         });
+                        let open_keys: Vec<(String, bool)> = panel
+                            .file_diffs
+                            .iter()
+                            .filter(|(_, slot)| slot.lines.is_some())
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        let untracked_of = |path: &str| {
+                            report
+                                .entries
+                                .iter()
+                                .any(|e| e.path == path && e.kind == "untracked")
+                        };
+                        let reloads: Vec<(String, bool, bool)> = open_keys
+                            .into_iter()
+                            .map(|(path, staged)| {
+                                let untracked = untracked_of(&path);
+                                (path, staged, untracked)
+                            })
+                            .collect();
                         panel.report = Some(report);
+                        for (path, staged, untracked) in reloads {
+                            panel.load_file_diff(path, staged, untracked, cx);
+                        }
                         if branch_changed {
                             panel.refresh_graph(cx);
                         }
@@ -427,8 +461,34 @@ impl GitPanel {
             cx.notify();
             return;
         }
-        self.file_diffs.insert(key.clone(), None);
+        self.load_file_diff(path, staged, untracked, cx);
+    }
+
+    /// (Re)request one inline diff; the slot's token pins the newest request.
+    fn load_file_diff(
+        &mut self,
+        path: String,
+        staged: bool,
+        untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (path.clone(), staged);
+        self.diff_seq += 1;
+        let token = self.diff_seq;
+        let previous = self
+            .file_diffs
+            .get(&key)
+            .and_then(|slot| slot.lines.clone());
+        self.file_diffs.insert(
+            key.clone(),
+            DiffSlot {
+                token,
+                // Keep showing the previous lines during a reload.
+                lines: previous,
+            },
+        );
         let state = Arc::clone(&self.state);
+        let generation = self.generation;
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -455,11 +515,17 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
                 if let Some(slot) = panel.file_diffs.get_mut(&key) {
+                    if slot.token != token {
+                        return;
+                    }
                     match result {
-                        Ok(lines) => *slot = Some(lines),
+                        Ok(lines) => slot.lines = Some(lines),
                         Err(err) => {
-                            *slot = Some(vec![DiffLine {
+                            slot.lines = Some(vec![DiffLine {
                                 kind: DiffLineKind::Header,
                                 text: err.chars().take(120).collect(),
                             }])
@@ -847,8 +913,8 @@ impl GitPanel {
                 )
                 .children(entries.into_iter().flat_map(|entry| {
                     let mut parts = vec![self.entry_row(&entry, staged, cx).into_any_element()];
-                    if let Some(lines) = self.file_diffs.get(&(entry.path.clone(), staged)) {
-                        let lines = lines.clone();
+                    if let Some(slot) = self.file_diffs.get(&(entry.path.clone(), staged)) {
+                        let lines = slot.lines.clone();
                         parts.push(self.render_diff_block(&lines).into_any_element());
                     }
                     parts

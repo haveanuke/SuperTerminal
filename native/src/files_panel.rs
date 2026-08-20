@@ -12,6 +12,9 @@ use crate::themes::Theme;
 
 /// Cap per directory so a node_modules can't flood the panel.
 const MAX_ENTRIES: usize = 500;
+/// Hard scan bound: stop READING a directory after this many raw entries,
+/// so the cap limits work, not just display.
+const MAX_SCAN: usize = 2000;
 
 #[derive(Clone, Debug)]
 struct FileEntry {
@@ -32,15 +35,23 @@ pub struct FilesPanel {
     root: Option<PathBuf>,
     listings: HashMap<PathBuf, DirListing>,
     expanded: HashSet<PathBuf>,
-    /// Monotonic guard: listings only apply while their load is current.
-    load_seq: u64,
+    /// Bumped whenever the tree resets (root change, refresh); results from
+    /// an older tree never attach.
+    root_gen: u64,
+    /// Newest request token per directory; an older in-flight load for the
+    /// same directory loses to a newer one.
+    load_tokens: HashMap<PathBuf, u64>,
+    next_token: u64,
 }
 
 fn read_dir_sorted(path: &Path) -> DirListing {
+    let mut scanned = 0usize;
     let mut entries: Vec<FileEntry> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
         .flatten()
+        .take(MAX_SCAN)
+        .inspect(|_| scanned += 1)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry.file_type().ok()?.is_dir();
@@ -56,7 +67,7 @@ fn read_dir_sorted(path: &Path) -> DirListing {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    let truncated = entries.len() > MAX_ENTRIES;
+    let truncated = entries.len() > MAX_ENTRIES || scanned >= MAX_SCAN;
     entries.truncate(MAX_ENTRIES);
     DirListing { entries, truncated }
 }
@@ -68,7 +79,9 @@ impl FilesPanel {
             root: None,
             listings: HashMap::new(),
             expanded: HashSet::new(),
-            load_seq: 0,
+            root_gen: 0,
+            load_tokens: HashMap::new(),
+            next_token: 0,
         }
     }
 
@@ -88,12 +101,16 @@ impl FilesPanel {
         self.root = Some(cwd.clone());
         self.listings.clear();
         self.expanded.clear();
+        self.load_tokens.clear();
+        self.root_gen += 1;
         self.load_dir(cwd, cx);
     }
 
     /// Re-list the root and every expanded directory.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.listings.clear();
+        self.load_tokens.clear();
+        self.root_gen += 1;
         if let Some(root) = self.root.clone() {
             self.load_dir(root, cx);
         }
@@ -103,8 +120,10 @@ impl FilesPanel {
     }
 
     fn load_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.load_seq += 1;
-        let seq = self.load_seq;
+        self.next_token += 1;
+        let token = self.next_token;
+        let root_gen = self.root_gen;
+        self.load_tokens.insert(path.clone(), token);
         cx.spawn(async move |panel, cx| {
             let listing_path = path.clone();
             let listing = cx
@@ -112,17 +131,11 @@ impl FilesPanel {
                 .spawn(async move { read_dir_sorted(&listing_path) })
                 .await;
             let _ = panel.update(cx, |panel: &mut FilesPanel, cx| {
-                // A root change bumps load_seq via its own loads and clears
-                // the map, so stale listings from an old root never attach.
-                if panel.load_seq >= seq && panel.root.is_some() {
-                    let belongs = panel
-                        .root
-                        .as_ref()
-                        .is_some_and(|root| path.starts_with(root));
-                    if belongs {
-                        panel.listings.insert(path, listing);
-                        cx.notify();
-                    }
+                // Attach only when this is still the newest request for the
+                // path AND the tree hasn't reset since it started.
+                if panel.root_gen == root_gen && panel.load_tokens.get(&path) == Some(&token) {
+                    panel.listings.insert(path, listing);
+                    cx.notify();
                 }
             });
             Ok::<(), ()>(())
@@ -167,8 +180,15 @@ impl FilesPanel {
             let expanded = entry.is_dir && self.expanded.contains(&entry.path);
             let path = entry.path.clone();
             let is_dir = entry.is_dir;
+            let row_id = {
+                use std::hash::{Hash, Hasher};
+                use std::os::unix::ffi::OsStrExt;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                entry.path.as_os_str().as_bytes().hash(&mut hasher);
+                hasher.finish()
+            };
             let row = div()
-                .id(SharedString::from(format!("file-{}", entry.path.display())))
+                .id(SharedString::from(format!("file-{row_id:x}")))
                 .flex()
                 .flex_row()
                 .items_center()
