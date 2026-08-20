@@ -94,9 +94,10 @@ pub struct TerminalPane {
     /// measuring canvas; applied outside the render pass.
     pending_bounds: std::sync::Arc<std::sync::Mutex<Option<MeasuredBounds>>>,
     /// Resize debounce: the size waiting to be applied and when it last
-    /// changed, plus when a resize was last delivered to the PTY.
+    /// changed, plus when/what was last delivered to the PTY.
     resize_candidate: Option<(Pixels, Pixels, std::time::Instant)>,
     last_resize_applied: std::time::Instant,
+    last_applied_size: Option<(Pixels, Pixels)>,
 }
 
 const PADDING: f32 = 6.0;
@@ -146,15 +147,18 @@ impl TerminalPane {
                         // one-shot changes (fullscreen toggle) instant;
                         // continuous changes wait until the size settles.
                         let now = std::time::Instant::now();
-                        let changed = pane
+                        let already_applied = pane.last_applied_size == Some((w, h))
+                            && pane.resize_candidate.is_none();
+                        let same_candidate = pane
                             .resize_candidate
-                            .map(|(cw, ch, _)| cw != w || ch != h)
-                            .unwrap_or(true);
-                        if changed {
+                            .map(|(cw, ch, _)| cw == w && ch == h)
+                            .unwrap_or(false);
+                        if !already_applied && !same_candidate {
                             let calm = now.duration_since(pane.last_resize_applied)
                                 >= Duration::from_millis(400);
                             if calm && pane.resize_candidate.is_none() {
                                 pane.last_resize_applied = now;
+                                pane.last_applied_size = Some((w, h));
                                 pane.resize_to(w, h);
                                 cx.notify();
                             } else {
@@ -166,6 +170,7 @@ impl TerminalPane {
                         if since.elapsed() >= Duration::from_millis(150) {
                             pane.resize_candidate = None;
                             pane.last_resize_applied = std::time::Instant::now();
+                            pane.last_applied_size = Some((w, h));
                             pane.resize_to(w, h);
                             cx.notify();
                         }
@@ -258,6 +263,7 @@ impl TerminalPane {
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             resize_candidate: None,
             last_resize_applied: std::time::Instant::now(),
+            last_applied_size: None,
         }
     }
 

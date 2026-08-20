@@ -407,16 +407,18 @@ impl Workspace {
             } else if !state.busy && busy {
                 state.busy_since = Some(now);
                 state.quiet_cued = false;
-            } else if busy && quiet && !state.quiet_cued {
-                // Interactive job stopped producing output: awaiting input.
-                // Latch ONLY when the cue actually fires — latching while
-                // still under MIN_BUSY would suppress the Ping forever.
-                if worked_long_enough && gap_ok {
+            } else if busy && quiet {
+                // ANY quiet moment ends the output streak — a stale streak
+                // timestamp must never survive a quiet gap and later re-arm
+                // the cue off a single blip.
+                state.active_since = None;
+                if !state.quiet_cued && worked_long_enough && gap_ok {
+                    // Interactive job stopped producing output: awaiting
+                    // input. Latch ONLY when the cue actually fires.
                     cue_kinds.push("Ping");
                     state.last_cue = Some(now);
                     state.quiet_cued = true;
                 }
-                state.active_since = None;
             } else if busy && !quiet {
                 // Re-arm only after 5s of CONTINUOUS output — a spinner
                 // blip is not "working again".
@@ -600,6 +602,17 @@ impl Workspace {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut hasher);
         let hash = hasher.finish();
+        // Maintain the stability candidate BEFORE any gate, so it can
+        // never carry a stale timestamp across content that changed away
+        // and back while a gate was rejecting.
+        let now = std::time::Instant::now();
+        let fresh_candidate = match self.buddy_pending_hash {
+            Some((pending, _)) if pending == hash => false,
+            _ => {
+                self.buddy_pending_hash = Some((hash, now));
+                true
+            }
+        };
         if hash == self.buddy_last_hash {
             return;
         }
@@ -611,15 +624,11 @@ impl Workspace {
         }
         // Content must hold still for ~8s (two ticks) before a review — a
         // changing hash means the screen is still animating.
-        let now = std::time::Instant::now();
-        match self.buddy_pending_hash {
-            Some((pending, since)) if pending == hash => {
-                if now.duration_since(since) < Duration::from_secs(8) {
-                    return;
-                }
-            }
-            _ => {
-                self.buddy_pending_hash = Some((hash, now));
+        if fresh_candidate {
+            return;
+        }
+        if let Some((_, since)) = self.buddy_pending_hash {
+            if now.duration_since(since) < Duration::from_secs(8) {
                 return;
             }
         }
