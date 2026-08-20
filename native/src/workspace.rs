@@ -106,6 +106,19 @@ struct CueState {
     last_cue: Option<std::time::Instant>,
 }
 
+/// One line of `say -v ?`: name (may contain spaces and suffixes like
+/// "(Enhanced)"), then a locale token, then "# sample". The name is
+/// everything before the locale token.
+fn parse_voice_name(line: &str) -> Option<String> {
+    let before_hash = line.split('#').next()?.trim_end();
+    let name = before_hash
+        .rsplit_once(|c: char| c.is_whitespace())
+        .map(|(name, _locale)| name.trim_end())
+        .unwrap_or(before_hash);
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Spawn a system sound; the caller keeps the child for reaping.
 fn play_sound(name: &str) -> Option<std::process::Child> {
     std::process::Command::new("/usr/bin/afplay")
@@ -394,7 +407,13 @@ impl Workspace {
             let _ = child.kill();
             let _ = child.wait(); // reap
         }
-        let capped: String = text.chars().take(400).collect();
+        // `[[` opens say's embedded-command syntax; model-authored note
+        // text must not be able to smuggle rate/volume/etc commands.
+        let capped: String = text
+            .chars()
+            .take(400)
+            .collect::<String>()
+            .replace("[[", "[ [");
         let mut command = std::process::Command::new("/usr/bin/say");
         if let Some(voice) = &self.settings.buddy_tts_voice {
             command.arg("-v").arg(voice);
@@ -429,17 +448,14 @@ impl Workspace {
                         .map(|out| {
                             String::from_utf8_lossy(&out.stdout)
                                 .lines()
-                                .filter_map(|line| {
-                                    line.split("  ").next().map(|name| name.trim().to_string())
-                                })
-                                .filter(|name| !name.is_empty())
+                                .filter_map(parse_voice_name)
                                 .collect::<Vec<String>>()
                         })
-                        .unwrap_or_default()
                 })
                 .await;
             let _ = ws.update(cx, |ws: &mut Workspace, cx| {
-                ws.tts_voices = Some(voices);
+                // A failed launch stays None so a later open retries.
+                ws.tts_voices = voices;
                 ws.tts_voices_loading = false;
                 cx.notify();
             });
@@ -455,6 +471,9 @@ impl Workspace {
             return;
         };
         if voices.is_empty() {
+            // Nothing to step through; at least allow returning to default.
+            self.settings.buddy_tts_voice = None;
+            let _ = self.settings.save();
             return;
         }
         let current = self
