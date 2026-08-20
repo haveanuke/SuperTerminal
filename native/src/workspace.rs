@@ -920,7 +920,12 @@ impl Workspace {
             .cursor_pointer()
             .px(px(4.0))
             .rounded(px(3.0))
-            .hover(|style| style.bg(rgb(theme.ui_border)))
+            .text_color(rgb(theme.ui_text_muted))
+            .hover(|style| {
+                style
+                    .bg(rgb(theme.ui_border))
+                    .text_color(rgb(theme.ui_text))
+            })
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1318,10 +1323,11 @@ impl Workspace {
             ))
             .child(self.overlay_button(
                 "theme",
-                |ws, _window, cx| {
+                |ws, window, cx| {
                     ws.overlay = if ws.overlay == Overlay::ThemePicker {
                         Overlay::None
                     } else {
+                        window.focus(&ws.focus_handle);
                         Overlay::ThemePicker
                     };
                     cx.notify();
@@ -1807,6 +1813,14 @@ impl Render for Workspace {
             .flex_col()
             .bg(rgb(theme.ui_background))
             .children(background_layer)
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|ws, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && ws.overlay != Overlay::None {
+                    ws.overlay = Overlay::None;
+                    ws.focus_active_pane(window, cx);
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
                 ws.add_tab(None, cx);
                 ws.focus_active_pane(window, cx);
@@ -1828,10 +1842,11 @@ impl Render for Workspace {
                 ws.split_focused(SplitDirection::Vertical, cx);
                 ws.focus_active_pane(window, cx);
             }))
-            .on_action(cx.listener(|ws, _: &ToggleThemePicker, _, cx| {
+            .on_action(cx.listener(|ws, _: &ToggleThemePicker, window, cx| {
                 ws.overlay = if ws.overlay == Overlay::ThemePicker {
                     Overlay::None
                 } else {
+                    window.focus(&ws.focus_handle);
                     Overlay::ThemePicker
                 };
                 cx.notify();
