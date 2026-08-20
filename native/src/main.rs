@@ -19,7 +19,7 @@ use gpui::{
 use workspace::{
     CloseFocused, CloseTab, NewTab, SaveSessionAs, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
     SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitRight,
-    ToggleSessions, ToggleThemePicker, Workspace,
+    ToggleSearch, ToggleSessions, ToggleThemePicker, Workspace,
 };
 
 fn main() {
@@ -37,6 +37,7 @@ fn main() {
             KeyBinding::new("cmd-,", ToggleThemePicker, None),
             KeyBinding::new("cmd-o", ToggleSessions, None),
             KeyBinding::new("cmd-s", SaveSessionAs, None),
+            KeyBinding::new("cmd-f", ToggleSearch, None),
             KeyBinding::new("cmd-1", SelectTab1, None),
             KeyBinding::new("cmd-2", SelectTab2, None),
             KeyBinding::new("cmd-3", SelectTab3, None),

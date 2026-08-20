@@ -192,6 +192,7 @@ impl TerminalPane {
             focused_title: None,
             exited: None,
             selection_text: None,
+            search_matches: Vec::new(),
         };
 
         if let Some(session) = &session {
@@ -289,6 +290,20 @@ impl TerminalPane {
         if let Some(session) = &self.session {
             session.write(bytes);
         }
+    }
+
+    pub fn set_search(&mut self, needle: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_search(needle);
+        }
+        cx.notify();
+    }
+
+    pub fn search_next(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session.as_mut() {
+            session.search_jump_next();
+        }
+        cx.notify();
     }
 
     pub fn set_auto_run(&mut self, config: Option<(String, u32, bool, u32)>) {
@@ -604,6 +619,8 @@ impl Render for TerminalPane {
         // Build styled runs per row.
         let selection: std::collections::HashSet<(usize, usize)> =
             snapshot.selection.iter().copied().collect();
+        let search_hits: std::collections::HashSet<(usize, usize)> =
+            snapshot.search_matches.iter().copied().collect();
         let mut row_divs = Vec::with_capacity(snapshot.lines);
         for (row_idx, row) in snapshot.rows.iter().enumerate() {
             let mut runs: Vec<Run> = Vec::new();
@@ -625,6 +642,10 @@ impl Render for TerminalPane {
                 }
                 if style.hidden {
                     fg = bg.unwrap_or(theme.background);
+                }
+                if search_hits.contains(&(col_idx, row_idx)) {
+                    bg = Some(theme.yellow);
+                    fg = theme.background;
                 }
                 if selected {
                     bg = Some(theme.selection);

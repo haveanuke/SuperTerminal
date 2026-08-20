@@ -37,6 +37,7 @@ gpui::actions!(
         ToggleThemePicker,
         ToggleSessions,
         SaveSessionAs,
+        ToggleSearch,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -67,6 +68,7 @@ enum Overlay {
     ThemePicker,
     Sessions,
     AutoRun,
+    Search,
 }
 
 struct DragState {
@@ -89,6 +91,7 @@ pub struct Workspace {
     session_field: Option<Entity<TextField>>,
     rename_field: Option<(usize, Entity<TextField>)>,
     auto_run_field: Option<Entity<TextField>>,
+    search_field: Option<Entity<TextField>>,
     auto_run_interval: u32,
     auto_run_escape: bool,
     auto_run_escape_delay: u32,
@@ -122,6 +125,7 @@ impl Workspace {
             session_field: None,
             rename_field: None,
             auto_run_field: None,
+            search_field: None,
             auto_run_interval: 5,
             auto_run_escape: false,
             auto_run_escape_delay: 2,
@@ -1078,6 +1082,18 @@ impl Workspace {
                     )
             })
             .child(self.overlay_button(
+                "search",
+                |ws, _window, cx| {
+                    ws.overlay = if ws.overlay == Overlay::Search {
+                        Overlay::None
+                    } else {
+                        Overlay::Search
+                    };
+                    cx.notify();
+                },
+                cx,
+            ))
+            .child(self.overlay_button(
                 "sessions",
                 |ws, _window, cx| {
                     ws.refresh_sessions();
@@ -1202,6 +1218,67 @@ impl Workspace {
                         )
                         .child(self.render_font_family_row(window, cx))
                         .child(self.render_background_row(cx))
+                        .into_any_element(),
+                )
+            }
+            Overlay::Search => {
+                if self.search_field.is_none() {
+                    let theme_ref = self.theme;
+                    let field = cx
+                        .new(|field_cx| TextField::new("find in scrollback", theme_ref, field_cx));
+                    cx.subscribe(
+                        &field,
+                        |ws, field, event: &TextFieldEvent, cx| match event {
+                            TextFieldEvent::Submitted(_) => {
+                                // Enter jumps to the next (older) match.
+                                let needle = field.read(cx).value.clone();
+                                if let Some(pane) =
+                                    ws.focused_terminal.as_ref().and_then(|id| ws.panes.get(id))
+                                {
+                                    pane.update(cx, |pane, pane_cx| {
+                                        pane.set_search(Some(&needle), pane_cx);
+                                        pane.search_next(pane_cx);
+                                    });
+                                }
+                            }
+                            TextFieldEvent::Cancelled => {
+                                if let Some(pane) =
+                                    ws.focused_terminal.as_ref().and_then(|id| ws.panes.get(id))
+                                {
+                                    pane.update(cx, |pane, pane_cx| pane.set_search(None, pane_cx));
+                                }
+                                ws.overlay = Overlay::None;
+                                cx.notify();
+                            }
+                        },
+                    )
+                    .detach();
+                    self.search_field = Some(field);
+                }
+                let field = self.search_field.clone().unwrap();
+                field.read(cx).focus(window);
+                // Live highlight as the needle changes.
+                let needle = field.read(cx).value.clone();
+                if let Some(pane) = self
+                    .focused_terminal
+                    .as_ref()
+                    .and_then(|id| self.panes.get(id))
+                {
+                    pane.update(cx, |pane, pane_cx| {
+                        pane.set_search((!needle.is_empty()).then_some(needle.as_str()), pane_cx)
+                    });
+                }
+                Some(
+                    self.sheet("search", "enter jumps to older matches - esc clears", cx)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().text_color(rgb(theme.ui_accent)).child("find >"))
+                                .child(div().flex_grow().child(field)),
+                        )
                         .into_any_element(),
                 )
             }

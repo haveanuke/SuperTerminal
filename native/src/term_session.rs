@@ -23,9 +23,11 @@ use alacritty_terminal::event::{Event as AlacEvent, EventListener, Notify, Windo
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier, State as IoState};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Direction, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
@@ -149,6 +151,8 @@ pub struct RenderableSnapshot {
     pub exited: Option<i32>,
     /// Text covered by the active selection (captured under the same lock).
     pub selection_text: Option<String>,
+    /// Cells covered by search matches in the viewport, as (col, row) pairs.
+    pub search_matches: Vec<(usize, usize)>,
 }
 
 /// Deferred UI -> terminal operations, applied at the next sync.
@@ -243,6 +247,8 @@ pub struct TermSession {
     cols: usize,
     lines: usize,
     shared_window_size: Arc<Mutex<WindowSize>>,
+    /// Active search: compiled regex (escaped literal) + the raw needle.
+    search: Option<(RegexSearch, String)>,
 }
 
 impl TermSession {
@@ -354,6 +360,7 @@ impl TermSession {
             cols,
             lines,
             shared_window_size,
+            search: None,
         })
     }
 
@@ -541,6 +548,24 @@ impl TermSession {
                 },
             };
 
+            let mut search_matches = Vec::new();
+            if let Some((_, needle)) = &self.search {
+                let needle_lower = needle.to_lowercase();
+                let needle_len = needle.chars().count();
+                for (row_index, row) in rows.iter().enumerate() {
+                    let text: String = row.iter().map(|cell| cell.ch).collect();
+                    let lower = text.to_lowercase();
+                    let mut from = 0;
+                    while let Some(found) = lower[from..].find(&needle_lower) {
+                        let start = lower[..from + found].chars().count();
+                        for offset in 0..needle_len {
+                            search_matches.push((start + offset, row_index));
+                        }
+                        from += found + needle_lower.len().max(1);
+                    }
+                }
+            }
+
             RenderableSnapshot {
                 cols,
                 lines,
@@ -554,7 +579,40 @@ impl TermSession {
                 focused_title: self.title.clone(),
                 exited: self.exited,
                 selection_text,
+                search_matches,
             }
+        }
+    }
+
+    /// Set (or clear) the search needle. Case-insensitive literal match.
+    pub fn set_search(&mut self, needle: Option<&str>) {
+        self.search = needle.filter(|n| !n.is_empty()).and_then(|needle| {
+            let escaped: String = needle
+                .chars()
+                .flat_map(|c| {
+                    let escape = "\\.+*?()|[]{}^$#&-~".contains(c);
+                    escape.then_some('\\').into_iter().chain(std::iter::once(c))
+                })
+                .collect();
+            RegexSearch::new(&format!("(?i){escaped}"))
+                .ok()
+                .map(|regex| (regex, needle.to_string()))
+        });
+    }
+
+    /// Jump the viewport to the next match above the current view (wrapping
+    /// to the bottom of history when none is found).
+    pub fn search_jump_next(&mut self) {
+        let Some((regex, _)) = self.search.as_mut() else {
+            return;
+        };
+        let mut term = self.term.lock();
+        let display_offset = term.grid().display_offset() as i32;
+        let origin = alacritty_terminal::index::Point::new(Line(-display_offset - 1), Column(0));
+        if let Some(matched) = term.search_next(regex, origin, Direction::Left, Side::Left, None) {
+            let target_line = matched.start().line.0;
+            let delta = -target_line - display_offset;
+            term.scroll_display(Scroll::Delta(delta));
         }
     }
 
