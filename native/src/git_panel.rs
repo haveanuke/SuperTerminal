@@ -13,6 +13,7 @@ use gpui::prelude::*;
 use gpui::{div, px, rgb, Context, Entity, EventEmitter, MouseButton, SharedString, Window};
 
 use superterminal_core::git::actions::{ActionKind, ActionResult};
+use superterminal_core::git::diff::{DiffLine, DiffLineKind};
 use superterminal_core::git::graph::{CommitFileChange, GraphData};
 use superterminal_core::git::status::{StatusEntry, StatusReport};
 use superterminal_core::git::{self, GitState, RepoInfo};
@@ -65,6 +66,9 @@ pub struct GitPanel {
     /// a commit's files are immutable per hash, so late results are always
     /// safe to attach while the hash stays expanded.
     expanded: HashMap<String, Option<Vec<CommitFileChange>>>,
+    /// Inline diffs open in the change sections: (path, staged) -> lines
+    /// once loaded (None while in flight).
+    file_diffs: HashMap<(String, bool), Option<Vec<DiffLine>>>,
 }
 
 pub struct PanelClosed;
@@ -110,6 +114,7 @@ impl GitPanel {
             graph_seq: 0,
             pending_discard: None,
             expanded: HashMap::new(),
+            file_diffs: HashMap::new(),
         }
     }
 
@@ -147,6 +152,7 @@ impl GitPanel {
                     panel.graph = None;
                     panel.pending_discard = None;
                     panel.expanded.clear();
+                    panel.file_diffs.clear();
                     panel.refresh_status(cx);
                     panel.refresh_graph(cx);
                 }
@@ -200,6 +206,21 @@ impl GitPanel {
                                 panel.pending_discard = None;
                             }
                         }
+                        // Drop inline diffs whose entry left the section.
+                        panel.file_diffs.retain(|(path, staged), _| {
+                            report.entries.iter().any(|e| {
+                                &e.path == path
+                                    && if *staged {
+                                        e.kind != "untracked"
+                                            && e.kind != "unmerged"
+                                            && e.index_status != "."
+                                    } else {
+                                        e.kind == "untracked"
+                                            || e.kind == "unmerged"
+                                            || e.worktree_status != "."
+                                    }
+                            })
+                        });
                         panel.report = Some(report);
                         if branch_changed {
                             panel.refresh_graph(cx);
@@ -393,6 +414,114 @@ impl GitPanel {
         .detach();
     }
 
+    /// Toggle the inline old-vs-new diff under a changed file's row.
+    fn toggle_file_diff(
+        &mut self,
+        path: String,
+        staged: bool,
+        untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (path.clone(), staged);
+        if self.file_diffs.remove(&key).is_some() {
+            cx.notify();
+            return;
+        }
+        self.file_diffs.insert(key.clone(), None);
+        let state = Arc::clone(&self.state);
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |panel, cx| {
+            let request_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if untracked {
+                        superterminal_core::git::diff::read_untracked(
+                            &state,
+                            &repo.repo_id,
+                            &request_path,
+                        )
+                    } else {
+                        superterminal_core::git::diff::run_file_diff(
+                            &state,
+                            &repo.repo_id,
+                            &request_path,
+                            staged,
+                        )
+                    }
+                })
+                .await;
+            let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
+                if let Some(slot) = panel.file_diffs.get_mut(&key) {
+                    match result {
+                        Ok(lines) => *slot = Some(lines),
+                        Err(err) => {
+                            *slot = Some(vec![DiffLine {
+                                kind: DiffLineKind::Header,
+                                text: err.chars().take(120).collect(),
+                            }])
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    /// The inline diff block rendered under an expanded file row.
+    fn render_diff_block(&self, lines: &Option<Vec<DiffLine>>) -> impl IntoElement {
+        let theme = self.theme;
+        let rows: Vec<gpui::AnyElement> = match lines {
+            None => vec![div()
+                .pl(px(16.0))
+                .h(px(14.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("loading...")
+                .into_any_element()],
+            Some(lines) if lines.is_empty() => vec![div()
+                .pl(px(16.0))
+                .h(px(14.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("no differences")
+                .into_any_element()],
+            Some(lines) => lines
+                .iter()
+                .map(|line| {
+                    let color = match line.kind {
+                        DiffLineKind::Added => theme.green,
+                        DiffLineKind::Removed => theme.red,
+                        DiffLineKind::Hunk => theme.cyan,
+                        DiffLineKind::Header => theme.ui_text_muted,
+                        DiffLineKind::Context => theme.ui_text,
+                    };
+                    div()
+                        .pl(px(16.0))
+                        .pr(px(4.0))
+                        .min_h(px(14.0))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(rgb(color))
+                        .child(SharedString::from(line.text.clone()))
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .py(px(2.0))
+            .bg(rgb(theme.ui_surface))
+            .font_family("Menlo")
+            .text_size(px(10.0))
+            .children(rows)
+    }
+
     /// Bordered chip for header actions (fetch/pull/push/publish, bulk ops).
     fn chip(&self, label: &'static str, op: GitOp, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -414,6 +543,7 @@ impl GitPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
+                    cx.stop_propagation();
                     if !panel.busy {
                         panel.run(op.clone(), cx);
                     }
@@ -449,6 +579,7 @@ impl GitPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
+                    cx.stop_propagation();
                     if !panel.busy {
                         panel.run(op.clone(), cx);
                     }
@@ -503,6 +634,7 @@ impl GitPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
+                    cx.stop_propagation();
                     if panel.busy {
                         return;
                     }
@@ -579,16 +711,32 @@ impl GitPanel {
         };
         let path = entry.path.clone();
         let actionable = entry.actionable;
+        let untracked = entry.kind == "untracked";
+        let diff_open = self.file_diffs.contains_key(&(entry.path.clone(), staged));
+        let toggle_path = entry.path.clone();
         div()
-            .id(SharedString::from(format!("git-entry-{}", entry.path)))
+            .id(SharedString::from(format!(
+                "git-entry-{}-{staged}",
+                entry.path
+            )))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
             .h(px(22.0))
             .px(px(8.0))
+            .cursor_pointer()
             .opacity(if actionable { 1.0 } else { 0.6 })
+            .when(diff_open, |d| d.bg(rgb(theme.ui_surface)))
             .hover(|style| style.bg(rgb(theme.ui_surface)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |panel, _, _, cx| {
+                    // Action buttons stop propagation; a plain row click
+                    // toggles the file's inline diff.
+                    panel.toggle_file_diff(toggle_path.clone(), staged, untracked, cx);
+                }),
+            )
             .child(
                 div()
                     .flex_none()
@@ -697,11 +845,14 @@ impl GitPanel {
                         .child(div().flex_grow())
                         .children(header_actions),
                 )
-                .children(
-                    entries
-                        .into_iter()
-                        .map(|entry| self.entry_row(&entry, staged, cx)),
-                ),
+                .children(entries.into_iter().flat_map(|entry| {
+                    let mut parts = vec![self.entry_row(&entry, staged, cx).into_any_element()];
+                    if let Some(lines) = self.file_diffs.get(&(entry.path.clone(), staged)) {
+                        let lines = lines.clone();
+                        parts.push(self.render_diff_block(&lines).into_any_element());
+                    }
+                    parts
+                })),
         )
     }
 

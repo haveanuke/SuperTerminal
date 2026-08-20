@@ -60,6 +60,13 @@ type SplitBoundsMap = HashMap<String, (Pixels, Pixels, Pixels, Pixels)>;
 /// Boxed click handler for sheet chips/steppers.
 type BoxedChipHandler = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
+/// Which view the left sidebar shows; the rail tabs between them.
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarView {
+    Git,
+    Files,
+}
+
 /// Sessions live in the directory SHARED with the Tauri app (contract rev 2
 /// §6) — both apps read and write the same session files.
 pub fn sessions_dir() -> PathBuf {
@@ -123,6 +130,9 @@ pub struct Workspace {
     pending_shutdowns: Arc<Mutex<Vec<ShutdownHandle>>>,
     broadcast: Arc<BroadcastHub>,
     git_panel: Option<Entity<GitPanel>>,
+    files_panel: Option<Entity<crate::files_panel::FilesPanel>>,
+    sidebar_open: bool,
+    sidebar_view: SidebarView,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
@@ -201,6 +211,9 @@ impl Workspace {
             pending_shutdowns: Arc::new(Mutex::new(Vec::new())),
             broadcast: Arc::new(BroadcastHub::default()),
             git_panel: None,
+            files_panel: None,
+            sidebar_open: false,
+            sidebar_view: SidebarView::Git,
             theme_action_note: None,
             buddy_note: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -840,11 +853,56 @@ impl Workspace {
         }
     }
 
-    /// The left sidebar: a slim activity rail plus the active view. Only
-    /// git lives here today; future views join the rail and tab between.
+    /// The left sidebar: a slim activity rail plus the active view.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let panel = self.git_panel.clone()?;
+        if !self.sidebar_open {
+            return None;
+        }
         let theme = self.theme;
+        let view = self.sidebar_view;
+        let rail_item = |ws: &Self,
+                         id: &'static str,
+                         label: &'static str,
+                         item: SidebarView,
+                         cx: &mut Context<Self>| {
+            let active = view == item;
+            div()
+                .id(SharedString::from(id))
+                .cursor_pointer()
+                .px(px(4.0))
+                .py(px(3.0))
+                .rounded(px(3.0))
+                .text_size(px(9.0))
+                .text_color(rgb(if active {
+                    theme.ui_accent
+                } else {
+                    ws.theme.ui_text_muted
+                }))
+                .when(active, |d| d.bg(rgb(theme.ui_background)))
+                .hover(|style| style.bg(rgb(theme.ui_border)))
+                .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |ws, _, window, cx| {
+                        if ws.sidebar_view == item && ws.sidebar_open {
+                            ws.close_sidebar(cx);
+                        } else {
+                            ws.open_sidebar(item, cx);
+                        }
+                        ws.focus_active_pane(window, cx);
+                    }),
+                )
+        };
+        let active_view: gpui::AnyElement = match self.sidebar_view {
+            SidebarView::Git => self
+                .git_panel
+                .clone()
+                .map(|panel| panel.into_any_element())?,
+            SidebarView::Files => self
+                .files_panel
+                .clone()
+                .map(|panel| panel.into_any_element())?,
+        };
         Some(
             div()
                 .flex_none()
@@ -864,47 +922,64 @@ impl Workspace {
                         .items_center()
                         .pt(px(6.0))
                         .gap(px(4.0))
-                        .child(
-                            div()
-                                .id("rail-git")
-                                .cursor_pointer()
-                                .px(px(4.0))
-                                .py(px(3.0))
-                                .rounded(px(3.0))
-                                .text_size(px(9.0))
-                                .text_color(rgb(theme.ui_accent))
-                                .bg(rgb(theme.ui_background))
-                                .hover(|style| style.bg(rgb(theme.ui_border)))
-                                .child("git")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|ws, _, window, cx| {
-                                        ws.toggle_git_panel(cx);
-                                        ws.focus_active_pane(window, cx);
-                                    }),
-                                ),
-                        ),
+                        .child(rail_item(self, "rail-git", "git", SidebarView::Git, cx))
+                        .child(rail_item(
+                            self,
+                            "rail-files",
+                            "files",
+                            SidebarView::Files,
+                            cx,
+                        )),
                 )
-                .child(panel),
+                .child(active_view),
         )
     }
 
-    fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
-        if self.git_panel.take().is_none() {
-            let theme = self.theme;
-            let panel = cx.new(|panel_cx| GitPanel::new(theme, panel_cx));
-            cx.subscribe(
-                &panel,
-                |ws, _panel, _event: &crate::git_panel::PanelClosed, cx| {
-                    ws.git_panel = None;
-                    cx.notify();
-                },
-            )
-            .detach();
-            self.git_panel = Some(panel);
-            self.push_git_cwd(cx);
+    fn open_sidebar(&mut self, view: SidebarView, cx: &mut Context<Self>) {
+        self.sidebar_open = true;
+        self.sidebar_view = view;
+        match view {
+            SidebarView::Git => {
+                if self.git_panel.is_none() {
+                    let theme = self.theme;
+                    let panel = cx.new(|panel_cx| GitPanel::new(theme, panel_cx));
+                    cx.subscribe(
+                        &panel,
+                        |ws, _panel, _event: &crate::git_panel::PanelClosed, cx| {
+                            ws.close_sidebar(cx);
+                        },
+                    )
+                    .detach();
+                    self.git_panel = Some(panel);
+                }
+            }
+            SidebarView::Files => {
+                if self.files_panel.is_none() {
+                    let theme = self.theme;
+                    self.files_panel = Some(
+                        cx.new(|panel_cx| crate::files_panel::FilesPanel::new(theme, panel_cx)),
+                    );
+                }
+            }
         }
+        self.push_git_cwd(cx);
         cx.notify();
+    }
+
+    /// Dropping the entities ends their poll loops until reopened.
+    fn close_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = false;
+        self.git_panel = None;
+        self.files_panel = None;
+        cx.notify();
+    }
+
+    fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_open && self.sidebar_view == SidebarView::Git {
+            self.close_sidebar(cx);
+        } else {
+            self.open_sidebar(SidebarView::Git, cx);
+        }
     }
 
     /// Pick a directory and open a new tab there (the bar's cwd control).
@@ -939,15 +1014,19 @@ impl Workspace {
 
     /// Keep the git panel pointed at the focused terminal's directory.
     fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.git_panel.clone() else {
-            return;
-        };
         let cwd = self
             .focused_terminal
             .as_ref()
             .and_then(|id| self.panes.get(id))
             .and_then(|pane| pane.read(cx).cwd());
-        panel.update(cx, |panel, panel_cx| panel.set_target_cwd(cwd, panel_cx));
+        if let Some(panel) = self.git_panel.clone() {
+            panel.update(cx, |panel, panel_cx| {
+                panel.set_target_cwd(cwd.clone(), panel_cx)
+            });
+        }
+        if let Some(panel) = self.files_panel.clone() {
+            panel.update(cx, |panel, panel_cx| panel.set_root(cwd, panel_cx));
+        }
     }
 
     fn import_theme(&mut self, cx: &mut Context<Self>) {
