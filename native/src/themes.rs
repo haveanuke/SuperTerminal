@@ -613,9 +613,55 @@ pub fn ansi_256(index: u8, theme: &Theme) -> u32 {
     }
 }
 
+/// Push `fg` a few shades away from `bg` when their perceived luminance is
+/// too close to read — toward white on dark backgrounds, black on light.
+/// Colors that already contrast pass through unchanged.
+pub fn contrast_boost(fg: u32, bg: u32) -> u32 {
+    fn luminance(color: u32) -> f32 {
+        let r = ((color >> 16) & 0xff) as f32;
+        let g = ((color >> 8) & 0xff) as f32;
+        let b = (color & 0xff) as f32;
+        0.299 * r + 0.587 * g + 0.114 * b
+    }
+    let diff = (luminance(fg) - luminance(bg)).abs();
+    const MIN_DIFF: f32 = 80.0;
+    if diff >= MIN_DIFF {
+        return fg;
+    }
+    let target = if luminance(bg) < 128.0 { 255.0 } else { 0.0 };
+    let t = ((MIN_DIFF - diff) / MIN_DIFF) * 0.7;
+    let blend = |channel: u32| -> u32 {
+        let v = channel as f32;
+        (v + (target - v) * t).round().clamp(0.0, 255.0) as u32
+    };
+    (blend((fg >> 16) & 0xff) << 16) | (blend((fg >> 8) & 0xff) << 8) | blend(fg & 0xff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrast_boost_leaves_readable_pairs_alone() {
+        assert_eq!(contrast_boost(0xffffff, 0x000000), 0xffffff);
+        assert_eq!(contrast_boost(0x1a1b26, 0xc0caf5), 0x1a1b26);
+    }
+
+    #[test]
+    fn contrast_boost_lightens_on_dark_and_darkens_on_light() {
+        fn luminance(color: u32) -> f32 {
+            let r = ((color >> 16) & 0xff) as f32;
+            let g = ((color >> 8) & 0xff) as f32;
+            let b = (color & 0xff) as f32;
+            0.299 * r + 0.587 * g + 0.114 * b
+        }
+        // Muted gray on near-black must come out brighter.
+        let boosted = contrast_boost(0x333333, 0x1a1a1a);
+        assert!(luminance(boosted) > luminance(0x333333));
+        // Pale gray on white must come out darker.
+        let dimmed = contrast_boost(0xdddddd, 0xffffff);
+        assert!(luminance(dimmed) < luminance(0xdddddd));
+    }
 
     #[test]
     fn preset_count_matches_ts_file() {

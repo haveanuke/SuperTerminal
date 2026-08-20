@@ -1901,7 +1901,13 @@ impl Workspace {
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(preset.foreground))
+                                    // Some themes have muted foregrounds that
+                                    // vanish on their own background; nudge
+                                    // the label away from the chip color.
+                                    .text_color(rgb(themes::contrast_boost(
+                                        preset.foreground,
+                                        preset.background,
+                                    )))
                                     .child(SharedString::from(name)),
                             )
                             .on_mouse_down(
@@ -2728,11 +2734,21 @@ impl Render for Workspace {
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
             .child(
+                // Content row: the terminal tree, with the git panel docked
+                // on the right when open.
                 div()
                     .flex_grow()
                     .overflow_hidden()
-                    .relative()
-                    .child(content),
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .flex_grow()
+                            .overflow_hidden()
+                            .relative()
+                            .child(content),
+                    )
+                    .children(self.git_panel.clone()),
             )
             .child(self.render_bar(cx))
             .children(self.render_pet(window, cx))
