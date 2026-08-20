@@ -216,8 +216,8 @@ impl Workspace {
             broadcast: Arc::new(BroadcastHub::default()),
             git_panel: None,
             files_panel: None,
-            sidebar_open: false,
-            sidebar_view: SidebarView::Git,
+            sidebar_open: true,
+            sidebar_view: SidebarView::Projects,
             sidebar_cwd_cache: HashMap::new(),
             theme_action_note: None,
             buddy_note: None,
@@ -985,6 +985,23 @@ impl Workspace {
             let terminal_ids = collect_terminal_ids(&tab.pane);
             let count = terminal_ids.len();
             let project_tab_id = tab.id.clone();
+            let close_tab_id = tab.id.clone();
+            let label_element = if let Some((_, field)) = self
+                .rename_field
+                .as_ref()
+                .filter(|(rename_index, _)| *rename_index == tab_index)
+            {
+                div().w(px(140.0)).child(field.clone()).into_any_element()
+            } else {
+                div()
+                    .text_color(rgb(if active_tab {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_text
+                    }))
+                    .child(SharedString::from(tab.label.clone()))
+                    .into_any_element()
+            };
             rows.push(
                 div()
                     .id(SharedString::from(format!("project-{}", tab.id)))
@@ -997,15 +1014,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active_tab, |d| d.bg(rgb(theme.ui_surface)))
                     .hover(|style| style.bg(rgb(theme.ui_surface)))
-                    .child(
-                        div()
-                            .text_color(rgb(if active_tab {
-                                theme.ui_accent
-                            } else {
-                                theme.ui_text
-                            }))
-                            .child(SharedString::from(tab.label.clone())),
-                    )
+                    .child(label_element)
                     .child(
                         div()
                             .text_size(px(9.0))
@@ -1015,13 +1024,50 @@ impl Workspace {
                                 if count == 1 { "" } else { "s" }
                             ))),
                     )
+                    .child(div().flex_grow())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("project-close-{}", tab.id)))
+                            .cursor_pointer()
+                            .px(px(3.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .hover(|style| style.text_color(rgb(theme.red)))
+                            .child("x")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(index) =
+                                        ws.tabs.iter().position(|t| t.id == close_tab_id)
+                                    {
+                                        ws.close_tab(index, cx);
+                                        ws.focus_active_pane(window, cx);
+                                    }
+                                }),
+                            ),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |ws, _, window, cx| {
+                        cx.listener(move |ws, event: &gpui::MouseDownEvent, window, cx| {
+                            if ws.rename_field.as_ref().is_some_and(|(rename_index, _)| {
+                                ws.tabs
+                                    .get(*rename_index)
+                                    .is_some_and(|t| t.id == project_tab_id)
+                            }) {
+                                return; // typing into the rename field
+                            }
                             // Resolve the STABLE tab id at click time — a
                             // captured index goes stale if tabs close.
-                            if let Some(index) = ws.tabs.iter().position(|t| t.id == project_tab_id)
-                            {
+                            let Some(index) = ws.tabs.iter().position(|t| t.id == project_tab_id)
+                            else {
+                                return;
+                            };
+                            if event.click_count >= 2 {
+                                ws.start_tab_rename(index, window, cx);
+                                // Keep focus on the rename field past the
+                                // root's click-to-focus (see tab rename).
+                                window.prevent_default();
+                            } else {
                                 ws.select_tab(index, cx);
                                 ws.focus_active_pane(window, cx);
                             }
@@ -1122,13 +1168,42 @@ impl Workspace {
             .text_color(rgb(theme.ui_text))
             .child(
                 div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
                     .px(px(8.0))
                     .py(px(6.0))
                     .border_b_1()
                     .border_color(rgb(theme.ui_border))
-                    .text_size(px(9.0))
-                    .text_color(rgb(theme.ui_text_muted))
-                    .child("PROJECTS"),
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("PROJECTS"),
+                    )
+                    .child(div().flex_grow())
+                    .child(
+                        div()
+                            .id("projects-new")
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(rgb(theme.ui_border))
+                            .bg(rgb(theme.ui_surface))
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text))
+                            .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                            .child("+ new")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|ws, _, window, cx| {
+                                    ws.add_tab(None, cx);
+                                    ws.focus_active_pane(window, cx);
+                                }),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -2269,91 +2344,6 @@ impl Workspace {
 
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let mut segments = Vec::new();
-        for (index, tab) in self.tabs.iter().enumerate() {
-            let active = index == self.active_tab;
-            segments.push(
-                div()
-                    .id(SharedString::from(format!("tab-seg-{index}")))
-                    .cursor_pointer()
-                    .px(px(10.0))
-                    .py(px(2.0))
-                    .rounded(px(3.0))
-                    .bg(rgb(if active {
-                        theme.ui_accent
-                    } else {
-                        theme.ui_surface
-                    }))
-                    .text_color(rgb(if active {
-                        theme.ui_background
-                    } else {
-                        theme.ui_text_muted
-                    }))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(5.0))
-                    .child(
-                        if let Some((rename_index, field)) = self
-                            .rename_field
-                            .as_ref()
-                            .filter(|(rename_index, _)| *rename_index == index)
-                        {
-                            let _ = rename_index;
-                            div().w(px(120.0)).child(field.clone()).into_any_element()
-                        } else {
-                            div()
-                                .child(SharedString::from(tab.label.clone()))
-                                .into_any_element()
-                        },
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("tab-close-{index}")))
-                            .cursor_pointer()
-                            .px(px(2.0))
-                            .text_color(rgb(if active {
-                                theme.ui_background
-                            } else {
-                                theme.ui_text_muted
-                            }))
-                            .hover(|style| style.text_color(rgb(theme.red)))
-                            .child("x")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |ws, _, window, cx| {
-                                    cx.stop_propagation();
-                                    ws.close_tab(index, cx);
-                                    ws.focus_active_pane(window, cx);
-                                }),
-                            ),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |ws, event: &gpui::MouseDownEvent, window, cx| {
-                            if ws
-                                .rename_field
-                                .as_ref()
-                                .is_some_and(|(rename_index, _)| *rename_index == index)
-                            {
-                                return; // typing into the rename field
-                            }
-                            if event.click_count >= 2 {
-                                ws.start_tab_rename(index, window, cx);
-                                // The workspace root tracks focus and would
-                                // re-focus itself at the end of dispatch,
-                                // stealing focus from the rename field —
-                                // gpui suppresses that via prevent_default.
-                                window.prevent_default();
-                            } else {
-                                ws.select_tab(index, cx);
-                                ws.focus_active_pane(window, cx);
-                            }
-                        }),
-                    ),
-            );
-        }
-
         div()
             .flex_none()
             .flex()
@@ -2366,15 +2356,6 @@ impl Workspace {
             .border_t_1()
             .border_color(rgb(theme.ui_border))
             .text_size(px(11.0))
-            .children(segments)
-            .child(self.overlay_button(
-                "+",
-                |ws, window, cx| {
-                    ws.add_tab(None, cx);
-                    ws.focus_active_pane(window, cx);
-                },
-                cx,
-            ))
             .child(div().flex_grow())
             .children(
                 self.buddy_note
