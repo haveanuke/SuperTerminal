@@ -1902,10 +1902,10 @@ impl Workspace {
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |ws, _, window, cx| {
+                                cx.listener(move |ws, _, _window, cx| {
+                                    // Apply live but keep the sheet open so
+                                    // themes can be browsed; esc closes.
                                     ws.apply_theme(name, cx);
-                                    ws.overlay = Overlay::None;
-                                    ws.focus_active_pane(window, cx);
                                 }),
                             )
                     })
