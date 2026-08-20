@@ -2431,7 +2431,7 @@ impl Workspace {
         &self,
         title: &'static str,
         hint: &'static str,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         div()
@@ -2471,6 +2471,24 @@ impl Workspace {
                             .text_size(px(10.0))
                             .text_color(rgb(theme.ui_text_muted))
                             .child(SharedString::from(hint)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("sheet-close-{title}")))
+                            .cursor_pointer()
+                            .ml(px(8.0))
+                            .px(px(5.0))
+                            .rounded(px(3.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .hover(|style| style.text_color(rgb(theme.red)))
+                            .child("x")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.close_overlay(window, cx);
+                                }),
+                            ),
                     ),
             )
     }
