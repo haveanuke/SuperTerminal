@@ -858,6 +858,35 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Pick a directory and open a new tab there (the bar's cwd control).
+    fn open_folder(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |ws, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("/usr/bin/osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose folder with prompt \"Open folder in a new tab\")",
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .filter(|path| !path.is_empty())
+                })
+                .await;
+            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                if let Some(path) = picked {
+                    ws.add_tab(Some(PathBuf::from(path)), cx);
+                    cx.notify();
+                }
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
     /// Keep the git panel pointed at the focused terminal's directory.
     fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.git_panel.clone() else {
@@ -1378,25 +1407,35 @@ impl Workspace {
                 .px(px(6.0))
                 .text_color(rgb(theme.ui_text_muted))
                 .child(SharedString::from(title))
-                .children(cwd.map(|cwd| {
-                    let display = cwd.replace(&std::env::var("HOME").unwrap_or_default(), "~");
-                    let reveal = cwd.clone();
+                .child({
+                    // Directory control: shows the focused terminal's cwd and
+                    // opens a folder picker (new tab at the chosen folder).
+                    let display: SharedString = match &cwd {
+                        Some(cwd) => cwd
+                            .replace(&std::env::var("HOME").unwrap_or_default(), "~")
+                            .into(),
+                        None => "choose folder".into(),
+                    };
                     div()
                         .id("bar-cwd")
                         .cursor_pointer()
                         .max_w(px(280.0))
+                        .px(px(6.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(theme.ui_border))
+                        .bg(rgb(theme.ui_surface))
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
                         .text_color(rgb(theme.ui_accent))
-                        .child(SharedString::from(display))
-                        .on_mouse_down(MouseButton::Left, move |_, _, _| {
-                            let _ = std::process::Command::new("/usr/bin/open")
-                                .arg("-R")
-                                .arg(&reveal)
-                                .spawn();
-                        })
-                }))
+                        .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                        .child(SharedString::from(format!("dir: {display}")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _, _, cx| ws.open_folder(cx)),
+                        )
+                })
                 .children(self.swap_source.is_some().then(|| {
                     div()
                         .text_size(px(10.0))

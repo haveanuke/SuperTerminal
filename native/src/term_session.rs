@@ -329,6 +329,10 @@ impl TermSession {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
+        // App bundles launch with cwd "/" — a shell must never start there.
+        // No explicit directory means the user's home.
+        let working_directory =
+            working_directory.or_else(|| std::env::var_os("HOME").map(PathBuf::from));
         let options = tty::Options {
             shell,
             working_directory,

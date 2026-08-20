@@ -405,9 +405,16 @@ impl TerminalPane {
                     .width,
             )
         };
+        // Several homogeneous probes at a tight tolerance: 'M'-vs-'i' alone
+        // admits both proportional coincidences and small per-glyph errors
+        // that accumulate across an 80-column row.
         let wide = shape("MMMMMMMMMM");
-        let narrow = shape("iiiiiiiiii");
-        wide > 0.0 && ((wide - narrow).abs() / wide) < 0.02
+        if wide <= 0.0 {
+            return false;
+        }
+        ["iiiiiiiiii", "0000000000", "          ", "()[]{};:.,"]
+            .into_iter()
+            .all(|probe| ((wide - shape(probe)).abs() / wide) < 0.005)
     }
 
     fn grid_size_for(&self, bounds_w: Pixels, bounds_h: Pixels) -> (usize, usize) {
