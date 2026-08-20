@@ -22,8 +22,8 @@ use gpui::{
 };
 
 use workspace::{
-    CloseFocused, CloseTab, NewTab, SaveSessionAs, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
-    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitRight,
+    CloseFocused, CloseTab, NewTab, NewWindow, SaveSessionAs, SelectTab1, SelectTab2, SelectTab3,
+    SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitRight,
     ToggleGitPanel, ToggleSearch, ToggleSessions, ToggleThemePicker, Workspace,
 };
 
@@ -50,6 +50,7 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-n", NewWindow, None),
             KeyBinding::new("cmd-w", CloseFocused, None),
             KeyBinding::new("cmd-shift-w", CloseTab, None),
             KeyBinding::new("cmd-d", SplitRight, None),

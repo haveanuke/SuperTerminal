@@ -33,6 +33,7 @@ gpui::actions!(
     superterminal,
     [
         NewTab,
+        NewWindow,
         CloseFocused,
         CloseTab,
         SplitRight,
@@ -502,7 +503,9 @@ impl Workspace {
                 if let Some(source) = self.swap_source.take() {
                     if source != pane_id {
                         for tab in &mut self.tabs {
-                            tab.pane = crate::layout::swap_terminals(&tab.pane, &source, &pane_id);
+                            let swapped =
+                                crate::layout::swap_terminals(tab.active_pane(), &source, &pane_id);
+                            *tab.active_pane_mut() = swapped;
                         }
                     }
                 }
@@ -528,16 +531,33 @@ impl Workspace {
         }
     }
 
+    /// A new full-pane WINDOW inside a project — no split, one shows at a
+    /// time; the sidebar lists and switches them.
+    fn new_window(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+        let terminal_id = self.fresh_id();
+        self.spawn_pane(terminal_id.clone(), None, cx);
+        let tab = &mut self.tabs[tab_index];
+        tab.windows.push(PaneNode::terminal(&terminal_id));
+        tab.active_window = tab.windows.len() - 1;
+        self.active_tab = tab_index;
+        self.focused_terminal = Some(terminal_id);
+        self.push_git_cwd(cx);
+        cx.notify();
+    }
+
     fn add_tab(&mut self, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
         let terminal_id = self.fresh_id();
         self.spawn_pane(terminal_id.clone(), cwd, cx);
         let tab_id = format!("tab-{}", self.next_id);
         self.next_id += 1;
-        self.tabs.push(Tab {
-            id: tab_id,
-            label: "terminal".to_string(),
-            pane: PaneNode::terminal(&terminal_id),
-        });
+        self.tabs.push(Tab::single(
+            tab_id,
+            "terminal",
+            PaneNode::terminal(&terminal_id),
+        ));
         self.active_tab = self.tabs.len() - 1;
         self.focused_terminal = Some(terminal_id);
         cx.notify();
@@ -550,7 +570,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
-        if !collect_terminal_ids(&tab.pane).contains(&target) {
+        if !collect_terminal_ids(tab.active_pane()).contains(&target) {
             return;
         }
         // Split inherits the source pane's live working directory.
@@ -562,7 +582,8 @@ impl Workspace {
         let new_id = self.fresh_id();
         self.spawn_pane(new_id.clone(), cwd, cx);
         let tab = &mut self.tabs[self.active_tab];
-        tab.pane = insert_split(&tab.pane, &target, direction, &new_id);
+        let split = insert_split(tab.active_pane(), &target, direction, &new_id);
+        *tab.active_pane_mut() = split;
         self.focused_terminal = Some(new_id);
         cx.notify();
     }
@@ -593,17 +614,37 @@ impl Workspace {
         let Some(tab_index) = self
             .tabs
             .iter()
-            .position(|t| collect_terminal_ids(&t.pane).contains(&terminal_id.to_string()))
+            .position(|t| t.window_of(terminal_id).is_some())
         else {
             return;
         };
-        match remove_terminal(&self.tabs[tab_index].pane, terminal_id) {
+        let window_index = self.tabs[tab_index]
+            .window_of(terminal_id)
+            .expect("position() just found it");
+        match remove_terminal(&self.tabs[tab_index].windows[window_index], terminal_id) {
             Some(rest) => {
-                self.tabs[tab_index].pane = rest;
+                self.tabs[tab_index].windows[window_index] = rest;
                 if self.focused_terminal.as_deref() == Some(terminal_id) {
-                    self.focused_terminal = collect_terminal_ids(&self.tabs[tab_index].pane)
+                    let tab = &self.tabs[tab_index];
+                    self.focused_terminal = collect_terminal_ids(&tab.windows[window_index])
                         .into_iter()
                         .next();
+                }
+            }
+            None if self.tabs[tab_index].windows.len() > 1 => {
+                // The emptied WINDOW closes; the project lives on.
+                let was_focused = self.focused_terminal.as_deref() == Some(terminal_id);
+                let tab = &mut self.tabs[tab_index];
+                tab.windows.remove(window_index);
+                if window_index < tab.active_window {
+                    tab.active_window -= 1;
+                }
+                tab.active_window = tab.active_window.min(tab.windows.len() - 1);
+                if was_focused {
+                    self.focused_terminal =
+                        collect_terminal_ids(self.tabs[tab_index].active_pane())
+                            .into_iter()
+                            .next();
                 }
             }
             None => {
@@ -623,7 +664,7 @@ impl Workspace {
                     self.active_tab = self.active_tab.min(self.tabs.len() - 1);
                     if was_active {
                         self.focused_terminal =
-                            collect_terminal_ids(&self.tabs[self.active_tab].pane)
+                            collect_terminal_ids(self.tabs[self.active_tab].active_pane())
                                 .into_iter()
                                 .next();
                     }
@@ -639,7 +680,7 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
-        let ids = collect_terminal_ids(&tab.pane);
+        let ids = tab.all_terminal_ids();
         let was_active = index == self.active_tab
             || self
                 .focused_terminal
@@ -666,9 +707,10 @@ impl Workspace {
             }
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
             if was_active {
-                self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
-                    .into_iter()
-                    .next();
+                self.focused_terminal =
+                    collect_terminal_ids(self.tabs[self.active_tab].active_pane())
+                        .into_iter()
+                        .next();
             }
         }
         cx.notify();
@@ -722,7 +764,7 @@ impl Workspace {
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.active_tab = index;
-            self.focused_terminal = collect_terminal_ids(&self.tabs[index].pane)
+            self.focused_terminal = collect_terminal_ids(self.tabs[index].active_pane())
                 .into_iter()
                 .next();
             self.push_git_cwd(cx);
@@ -998,7 +1040,7 @@ impl Workspace {
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             let active_tab = tab_index == self.active_tab;
-            let terminal_ids = collect_terminal_ids(&tab.pane);
+            let terminal_ids = tab.all_terminal_ids();
             let count = terminal_ids.len();
             let project_tab_id = tab.id.clone();
             let close_tab_id = tab.id.clone();
@@ -1041,6 +1083,30 @@ impl Workspace {
                             ))),
                     )
                     .child(div().flex_grow())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("project-new-win-{}", tab.id)))
+                            .cursor_pointer()
+                            .px(px(3.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .hover(|style| style.text_color(rgb(theme.ui_accent)))
+                            .child("+")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let new_win_tab_id = tab.id.clone();
+                                    move |ws, _, window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(index) =
+                                            ws.tabs.iter().position(|t| t.id == new_win_tab_id)
+                                        {
+                                            ws.new_window(index, cx);
+                                            ws.focus_active_pane(window, cx);
+                                        }
+                                    }
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("project-close-{}", tab.id)))
@@ -1091,84 +1157,127 @@ impl Workspace {
                     )
                     .into_any_element(),
             );
-            for terminal_id in terminal_ids {
-                let Some(pane) = self.panes.get(&terminal_id) else {
-                    continue;
-                };
-                let pane_ref = pane.read(cx);
-                let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
-                let active_recently =
-                    pane_ref.last_activity.elapsed() < std::time::Duration::from_secs(3);
-                let title = pane_ref.title();
-                let cwd: SharedString = self
-                    .sidebar_cwd_cache
-                    .get(&terminal_id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into();
-                // Quick status dot: green = output within the last 3s,
-                // muted = idle. (Exited panes close themselves, so there is
-                // no dead state to show.)
-                let dot_color = if active_recently {
-                    theme.green
-                } else {
-                    theme.ui_border
-                };
-                let jump_id = terminal_id.clone();
-                rows.push(
-                    div()
-                        .id(SharedString::from(format!("project-term-{terminal_id}")))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .h(px(20.0))
-                        .pl(px(20.0))
-                        .pr(px(8.0))
-                        .cursor_pointer()
-                        .when(focused, |d| d.bg(rgb(theme.ui_surface)))
-                        .hover(|style| style.bg(rgb(theme.ui_surface)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(6.0))
-                                .h(px(6.0))
-                                .rounded(px(3.0))
-                                .bg(rgb(dot_color)),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .max_w(px(120.0))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(px(10.0))
-                                .text_color(rgb(if focused {
-                                    theme.ui_accent
-                                } else {
-                                    theme.ui_text
-                                }))
-                                .child(SharedString::from(title)),
-                        )
-                        .child(
-                            div()
-                                .flex_grow()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .text_size(px(9.0))
-                                .text_color(rgb(theme.ui_text_muted))
-                                .child(cwd),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |ws, _, window, cx| {
-                                ws.focus_terminal_by_id(&jump_id, window, cx);
-                            }),
-                        )
-                        .into_any_element(),
-                );
+            let multi_window = tab.windows.len() > 1;
+            let window_groups: Vec<(usize, Vec<String>)> = tab
+                .windows
+                .iter()
+                .enumerate()
+                .map(|(window_index, tree)| (window_index, collect_terminal_ids(tree)))
+                .collect();
+            for (window_index, window_terminals) in window_groups {
+                if multi_window {
+                    let window_active = window_index == tab.active_window && active_tab;
+                    let first_terminal = window_terminals.first().cloned();
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!(
+                                "project-win-{}-{window_index}",
+                                tab.id
+                            )))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(16.0))
+                            .pl(px(16.0))
+                            .cursor_pointer()
+                            .text_size(px(8.0))
+                            .text_color(rgb(if window_active {
+                                theme.ui_accent
+                            } else {
+                                theme.ui_text_muted
+                            }))
+                            .hover(|style| style.bg(rgb(theme.ui_surface)))
+                            .child(SharedString::from(format!("window {}", window_index + 1)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    if let Some(id) = &first_terminal {
+                                        ws.focus_terminal_by_id(id, window, cx);
+                                    }
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                for terminal_id in window_terminals {
+                    let Some(pane) = self.panes.get(&terminal_id) else {
+                        continue;
+                    };
+                    let pane_ref = pane.read(cx);
+                    let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
+                    let active_recently =
+                        pane_ref.last_activity.elapsed() < std::time::Duration::from_secs(3);
+                    let title = pane_ref.title();
+                    let cwd: SharedString = self
+                        .sidebar_cwd_cache
+                        .get(&terminal_id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into();
+                    // Quick status dot: green = output within the last 3s,
+                    // muted = idle. (Exited panes close themselves, so there is
+                    // no dead state to show.)
+                    let dot_color = if active_recently {
+                        theme.green
+                    } else {
+                        theme.ui_border
+                    };
+                    let jump_id = terminal_id.clone();
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!("project-term-{terminal_id}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .h(px(20.0))
+                            .pl(px(20.0))
+                            .pr(px(8.0))
+                            .cursor_pointer()
+                            .when(focused, |d| d.bg(rgb(theme.ui_surface)))
+                            .hover(|style| style.bg(rgb(theme.ui_surface)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(rgb(dot_color)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(120.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if focused {
+                                        theme.ui_accent
+                                    } else {
+                                        theme.ui_text
+                                    }))
+                                    .child(SharedString::from(title)),
+                            )
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child(cwd),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, window, cx| {
+                                    ws.focus_terminal_by_id(&jump_id, window, cx);
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
         }
         div()
@@ -1245,10 +1354,13 @@ impl Workspace {
         let Some(tab_index) = self
             .tabs
             .iter()
-            .position(|tab| collect_terminal_ids(&tab.pane).contains(&terminal_id.to_string()))
+            .position(|tab| tab.window_of(terminal_id).is_some())
         else {
             return;
         };
+        if let Some(window_index) = self.tabs[tab_index].window_of(terminal_id) {
+            self.tabs[tab_index].active_window = window_index;
+        }
         self.active_tab = tab_index;
         self.focused_terminal = Some(terminal_id.to_string());
         self.push_git_cwd(cx);
@@ -1496,16 +1608,22 @@ impl Workspace {
         self.tabs.clear();
         for tab in layout.tabs {
             let mut mapping = HashMap::new();
-            for old_id in collect_terminal_ids(&tab.pane) {
+            for old_id in tab.all_terminal_ids() {
                 let new_id = self.fresh_id();
                 self.spawn_pane(new_id.clone(), None, cx);
                 mapping.insert(old_id, new_id);
             }
-            let pane = remap_ids(&tab.pane, &mapping);
+            let windows: Vec<PaneNode> = tab
+                .windows
+                .iter()
+                .map(|window| remap_ids(window, &mapping))
+                .collect();
+            let active_window = tab.active_window.min(windows.len() - 1);
             self.tabs.push(Tab {
                 id: tab.id,
                 label: tab.label,
-                pane,
+                windows,
+                active_window,
             });
         }
         if self.tabs.is_empty() {
@@ -1513,7 +1631,7 @@ impl Workspace {
         } else {
             let wanted = layout.active_tab_id;
             self.active_tab = self.tabs.iter().position(|t| t.id == wanted).unwrap_or(0);
-            self.focused_terminal = collect_terminal_ids(&self.tabs[self.active_tab].pane)
+            self.focused_terminal = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
                 .into_iter()
                 .next();
         }
@@ -1864,7 +1982,7 @@ impl Workspace {
             }
         }
         if let Some(tab) = self.tabs.get_mut(tab_index) {
-            walk(&mut tab.pane, path, sizes);
+            walk(tab.active_pane_mut(), path, sizes);
         }
     }
 
@@ -3158,7 +3276,10 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let active_tree = self.tabs.get(self.active_tab).map(|tab| tab.pane.clone());
+        let active_tree = self
+            .tabs
+            .get(self.active_tab)
+            .map(|tab| tab.active_pane().clone());
 
         let content = match active_tree {
             Some(tree) => self.render_tree(&tree, self.active_tab, Vec::new(), cx),
@@ -3216,6 +3337,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
                 ws.add_tab(None, cx);
+                ws.focus_active_pane(window, cx);
+            }))
+            .on_action(cx.listener(|ws, _: &NewWindow, window, cx| {
+                let index = ws.active_tab;
+                ws.new_window(index, cx);
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &CloseTab, window, cx| {

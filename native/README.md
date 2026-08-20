@@ -52,9 +52,11 @@ Two pitfalls this sequence avoids:
 
 ## Layout
 
-The left activity rail tabs between sidebar views: **projects** (tabs live
-here — new/close/rename, plus per-terminal quick status; there is no bottom
-tab strip), **git** (VS Code-style source control: stage/unstage/discard
+The left activity rail tabs between sidebar views: **projects** (tabs live here —
+new/close/rename, plus per-terminal quick status; there is no bottom tab
+strip. A project can hold multiple WINDOWS — full-pane terminals without
+splitting, one visible at a time: '+' on the project row or Cmd+N adds one,
+and the sidebar's window rows switch between them), **git** (VS Code-style source control: stage/unstage/discard
 with confirm, commit, sync, inline file diffs, commit history with painted
 branch lines and per-commit file expansion), and **files** (lazy tree over
 the focused terminal's directory with inline previews). The bottom bar keeps
@@ -63,7 +65,8 @@ sessions/theme, and the focused terminal's title.
 
 ## Keys
 
-Cmd+T new tab, Cmd+W close pane, Cmd+Shift+W close tab, Cmd+1..9 switch
+Cmd+T new project, Cmd+N new window in the current project, Cmd+W close
+pane, Cmd+Shift+W close project, Cmd+1..9 switch
 tab, Cmd+D / Cmd+Shift+D split right/down, Cmd+O sessions, Cmd+S save
 session, Cmd+, theme picker, Cmd+F search scrollback, Cmd+Shift+G git
 sidebar. Terminal line editing: the same Cmd/Alt chords as the Tauri app;

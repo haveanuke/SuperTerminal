@@ -165,11 +165,99 @@ pub fn collect_terminal_ids(pane: &PaneNode) -> Vec<String> {
     }
 }
 
+/// A project: one or more full-pane WINDOWS (each its own split tree), with
+/// exactly one showing at a time.
+///
+/// Serialization stays compatible with the shared session schema: `pane`
+/// carries the active window (what the Tauri app understands), and the full
+/// window list rides alongside in `windows`/`activeWindow` (ignored by old
+/// readers, defaulted by this one).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TabDto", into = "TabDto")]
 pub struct Tab {
     pub id: String,
     pub label: String,
-    pub pane: PaneNode,
+    pub windows: Vec<PaneNode>,
+    pub active_window: usize,
+}
+
+impl Tab {
+    pub fn single(id: impl Into<String>, label: impl Into<String>, pane: PaneNode) -> Tab {
+        Tab {
+            id: id.into(),
+            label: label.into(),
+            windows: vec![pane],
+            active_window: 0,
+        }
+    }
+
+    /// The window currently shown.
+    pub fn active_pane(&self) -> &PaneNode {
+        &self.windows[self.active_window.min(self.windows.len() - 1)]
+    }
+
+    pub fn active_pane_mut(&mut self) -> &mut PaneNode {
+        let index = self.active_window.min(self.windows.len() - 1);
+        &mut self.windows[index]
+    }
+
+    /// Every terminal in every window of this project.
+    pub fn all_terminal_ids(&self) -> Vec<String> {
+        self.windows.iter().flat_map(collect_terminal_ids).collect()
+    }
+
+    /// Index of the window containing `terminal_id`.
+    pub fn window_of(&self, terminal_id: &str) -> Option<usize> {
+        self.windows
+            .iter()
+            .position(|window| collect_terminal_ids(window).contains(&terminal_id.to_string()))
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TabDto {
+    id: String,
+    label: String,
+    /// Legacy single-tree field; always written as the ACTIVE window so
+    /// old readers show something sensible.
+    #[serde(default)]
+    pane: Option<PaneNode>,
+    #[serde(default)]
+    windows: Option<Vec<PaneNode>>,
+    #[serde(default)]
+    active_window: usize,
+}
+
+impl From<TabDto> for Tab {
+    fn from(dto: TabDto) -> Tab {
+        let windows = match dto.windows {
+            Some(windows) if !windows.is_empty() => windows,
+            _ => match dto.pane {
+                Some(pane) => vec![pane],
+                None => vec![PaneNode::terminal("orphan")],
+            },
+        };
+        let active_window = dto.active_window.min(windows.len() - 1);
+        Tab {
+            id: dto.id,
+            label: dto.label,
+            windows,
+            active_window,
+        }
+    }
+}
+
+impl From<Tab> for TabDto {
+    fn from(tab: Tab) -> TabDto {
+        TabDto {
+            pane: Some(tab.active_pane().clone()),
+            active_window: tab.active_window,
+            windows: Some(tab.windows),
+            id: tab.id,
+            label: tab.label,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -181,7 +269,7 @@ pub struct Layout {
 
 impl Layout {
     /// Serialize to the session-file layout schema
-    /// (`{"tabs":[{"id","label","pane"}],"activeTabId":..}`).
+    /// (`{"tabs":[{"id","label","pane","windows","activeWindow"}],"activeTabId":..}`).
     pub fn to_session_json(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("layout serialization cannot fail")
     }
@@ -190,7 +278,11 @@ impl Layout {
     /// schema (including any split without exactly two children).
     pub fn from_session_json(value: &serde_json::Value) -> Option<Layout> {
         let layout: Layout = Layout::deserialize(value).ok()?;
-        if layout.tabs.iter().all(|tab| tab.pane.is_valid()) {
+        let valid = layout
+            .tabs
+            .iter()
+            .all(|tab| !tab.windows.is_empty() && tab.windows.iter().all(PaneNode::is_valid));
+        if valid {
             Some(layout)
         } else {
             None
@@ -415,23 +507,52 @@ mod tests {
         let layout = Layout::from_session_json(&value).expect("valid session layout");
         assert_eq!(layout.active_tab_id, "tab-1");
         assert_eq!(layout.tabs.len(), 2);
-        assert_eq!(layout.tabs[1].pane, term("t4"));
+        assert_eq!(*layout.tabs[1].active_pane(), term("t4"));
         assert_eq!(
-            collect_terminal_ids(&layout.tabs[0].pane),
+            collect_terminal_ids(layout.tabs[0].active_pane()),
             vec!["t1", "t2", "t3"]
         );
 
-        assert_eq!(layout.to_session_json(), value);
+        // The new schema is a superset: re-serializing keeps the legacy
+        // `pane` field (as the active window) and round-trips losslessly.
+        let reserialized = layout.to_session_json();
+        assert_eq!(
+            reserialized["tabs"][1]["pane"], value["tabs"][1]["pane"],
+            "legacy pane field must mirror the active window"
+        );
+        assert_eq!(Layout::from_session_json(&reserialized), Some(layout));
+    }
+
+    #[test]
+    fn multi_window_tabs_round_trip_and_degrade_gracefully() {
+        let mut tab = Tab::single("tab-1", "proj", term("t1"));
+        tab.windows.push(term("t2"));
+        tab.active_window = 1;
+        let layout = Layout {
+            tabs: vec![tab],
+            active_tab_id: "tab-1".into(),
+        };
+        let json = layout.to_session_json();
+        // Old readers see the ACTIVE window in `pane`.
+        assert_eq!(json["tabs"][0]["pane"]["terminalId"], "t2");
+        let back = Layout::from_session_json(&json).expect("round trip");
+        assert_eq!(back, layout);
+
+        // An out-of-range activeWindow clamps instead of panicking.
+        let mut clamped = json.clone();
+        clamped["tabs"][0]["activeWindow"] = serde_json::json!(9);
+        let loaded = Layout::from_session_json(&clamped).expect("clamped load");
+        assert_eq!(loaded.tabs[0].active_window, 1);
     }
 
     #[test]
     fn serialized_json_uses_exact_field_casing() {
         let layout = Layout {
-            tabs: vec![Tab {
-                id: "tab-1".into(),
-                label: "Terminal".into(),
-                pane: split(SplitDirection::Horizontal, term("t1"), term("t2")),
-            }],
+            tabs: vec![Tab::single(
+                "tab-1",
+                "Terminal",
+                split(SplitDirection::Horizontal, term("t1"), term("t2")),
+            )],
             active_tab_id: "tab-1".into(),
         };
         let text = serde_json::to_string(&layout.to_session_json()).unwrap();
@@ -440,6 +561,8 @@ mod tests {
         assert!(text.contains("\"type\":\"split\""));
         assert!(text.contains("\"direction\":\"horizontal\""));
         assert!(text.contains("\"activeTabId\":\"tab-1\""));
+        assert!(text.contains("\"windows\""));
+        assert!(text.contains("\"activeWindow\""));
         // sizes: None is omitted entirely, matching the optional schema field.
         assert!(!text.contains("sizes"));
     }
