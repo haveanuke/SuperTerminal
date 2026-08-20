@@ -436,6 +436,11 @@ impl TermSession {
 
     /// Current working directory of the foreground process in this terminal
     /// (falls back to the shell process; best-effort).
+    /// True once the shell process has exited.
+    pub fn is_exited(&self) -> bool {
+        self.exited.is_some()
+    }
+
     /// One ioctl for both answers: (cwd, foreground-job-owns-terminal).
     /// A failed tcgetpgrp reads as "no job" (ready) — indistinguishable
     /// from the prompt without shell integration.

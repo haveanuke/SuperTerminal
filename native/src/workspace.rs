@@ -1523,11 +1523,16 @@ impl Workspace {
                     .and_then(|id| ws.panes.get(id))
                     .cloned();
                 match focused {
-                    Some(pane) if !pane.read(cx).status().1 => {
-                        // Shell at its prompt: a plain cd, single-quoted
-                        // with the POSIX '\'' escape for safety.
+                    Some(pane) if pane.read(cx).has_live_shell() && !pane.read(cx).status().1 => {
+                        // Shell at its prompt: Ctrl+U first, so any
+                        // half-typed input is cleared instead of being
+                        // SUBMITTED with the cd appended; then a plain cd,
+                        // single-quoted with the POSIX '\'' escape.
+                        // Best-effort: a job starting between the busy probe
+                        // and this write can still receive the text — full
+                        // certainty needs shell integration.
                         let quoted = path.replace('\'', "'\\''");
-                        pane.read(cx).send_text(&format!("cd '{quoted}'\r"));
+                        pane.read(cx).send_text(&format!("\u{15}cd '{quoted}'\r"));
                         ws.focus_active_pane(window, cx);
                     }
                     _ => {

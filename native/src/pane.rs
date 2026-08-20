@@ -259,6 +259,11 @@ impl TerminalPane {
         self.write_self(text.as_bytes().to_vec());
     }
 
+    /// A live shell is attached (spawned successfully and not exited).
+    pub fn has_live_shell(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| !s.is_exited())
+    }
+
     /// (cwd, foreground-job-running) in one probe.
     pub fn status(&self) -> (Option<String>, bool) {
         self.session
