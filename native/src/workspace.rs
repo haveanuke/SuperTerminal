@@ -17,6 +17,7 @@ use gpui::{
 
 use superterminal_core::session::SessionManager;
 
+use crate::git_panel::GitPanel;
 use crate::layout::{
     collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
 };
@@ -38,6 +39,7 @@ gpui::actions!(
         ToggleSessions,
         SaveSessionAs,
         ToggleSearch,
+        ToggleGitPanel,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -104,6 +106,7 @@ pub struct Workspace {
     /// Shutdown handles for panes being torn down; joined on app quit.
     pending_shutdowns: Arc<Mutex<Vec<ShutdownHandle>>>,
     broadcast: Arc<BroadcastHub>,
+    git_panel: Option<Entity<GitPanel>>,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
 }
@@ -135,6 +138,7 @@ impl Workspace {
             next_id: 1,
             pending_shutdowns: Arc::new(Mutex::new(Vec::new())),
             broadcast: Arc::new(BroadcastHub::default()),
+            git_panel: None,
             swap_source: None,
         };
         this.add_tab(None, cx);
@@ -206,6 +210,7 @@ impl Workspace {
                     }
                 }
                 self.focused_terminal = Some(pane_id);
+                self.push_git_cwd(cx);
                 cx.notify();
             }
             PaneEvent::TitleChanged => cx.notify(),
@@ -393,6 +398,9 @@ impl Workspace {
                 pane.set_appearance(theme, &family, size, translucent, pane_cx)
             });
         }
+        if let Some(panel) = self.git_panel.clone() {
+            panel.update(cx, |panel, panel_cx| panel.set_theme(theme, panel_cx));
+        }
         cx.notify();
     }
 
@@ -474,6 +482,37 @@ impl Workspace {
         }
         self.overlay = Overlay::None;
         cx.notify();
+    }
+
+    fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
+        if self.git_panel.take().is_none() {
+            let theme = self.theme;
+            let panel = cx.new(|panel_cx| GitPanel::new(theme, panel_cx));
+            cx.subscribe(
+                &panel,
+                |ws, _panel, _event: &crate::git_panel::PanelClosed, cx| {
+                    ws.git_panel = None;
+                    cx.notify();
+                },
+            )
+            .detach();
+            self.git_panel = Some(panel);
+            self.push_git_cwd(cx);
+        }
+        cx.notify();
+    }
+
+    /// Keep the git panel pointed at the focused terminal's directory.
+    fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.git_panel.clone() else {
+            return;
+        };
+        let cwd = self
+            .focused_terminal
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+            .and_then(|pane| pane.read(cx).cwd());
+        panel.update(cx, |panel, panel_cx| panel.set_target_cwd(cwd, panel_cx));
     }
 
     fn refresh_sessions(&mut self) {
@@ -1081,6 +1120,7 @@ impl Workspace {
                         }),
                     )
             })
+            .child(self.overlay_button("git", |ws, _window, cx| ws.toggle_git_panel(cx), cx))
             .child(self.overlay_button(
                 "search",
                 |ws, _window, cx| {
