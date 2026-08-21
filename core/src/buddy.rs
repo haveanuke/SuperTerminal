@@ -11,7 +11,7 @@ use crate::shell_env;
 // metacharacters in args can't escape.
 const MAX_ARGS: usize = 16;
 const MAX_ARG_LEN: usize = 4096;
-const MAX_TEXT_LEN: usize = 280;
+const MAX_TEXT_LEN: usize = 2000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,21 +64,12 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// First meaningful block of stdout: ANSI-stripped, first paragraph,
-/// whitespace collapsed, capped at 280 chars.
+/// The whole response as one flowing line: ANSI-stripped, whitespace
+/// (including paragraph breaks) collapsed, capped at 2000 chars — a
+/// runaway guard, not a summary cut; the UI scrolls/copies the rest.
 pub fn clean_output(stdout: &str) -> String {
     let cleaned = strip_ansi(stdout);
-    let trimmed = cleaned.trim();
-    // First block = up to the first blank (whitespace-only) line.
-    let mut first_block_lines: Vec<&str> = Vec::new();
-    for line in trimmed.lines() {
-        if line.trim().is_empty() {
-            break;
-        }
-        first_block_lines.push(line);
-    }
-    let joined = first_block_lines.join(" ");
-    let collapsed: String = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() > MAX_TEXT_LEN {
         let truncated: String = collapsed.chars().take(MAX_TEXT_LEN - 3).collect();
         format!("{truncated}...")
@@ -189,12 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn clean_output_takes_first_block_collapses_ws_and_caps() {
-        assert_eq!(clean_output("hello  world\n\nsecond block"), "hello world");
-        let long = "x".repeat(400);
+    fn clean_output_keeps_all_blocks_collapses_ws_and_caps() {
+        assert_eq!(
+            clean_output("hello  world\n\nsecond block"),
+            "hello world second block"
+        );
+        let long = "x".repeat(2400);
         let cleaned = clean_output(&long);
-        assert_eq!(cleaned.chars().count(), 280);
+        assert_eq!(cleaned.chars().count(), 2000);
         assert!(cleaned.ends_with("..."));
+        // Under the cap survives untouched.
+        let mid = "y".repeat(400);
+        assert_eq!(clean_output(&mid), mid);
     }
 
     #[test]

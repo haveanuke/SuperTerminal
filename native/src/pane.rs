@@ -217,7 +217,7 @@ impl TerminalPane {
                         if let (Some((drag_x, drag_y)), Some((_, height))) =
                             (pane.drag_position, pane.measured_size)
                         {
-                            if pane.drag_scroll_tick % 4 == 0 {
+                            if pane.drag_scroll_tick.is_multiple_of(4) {
                                 let top = f32::from(pane.origin.1) + PADDING;
                                 let bottom = f32::from(pane.origin.1) + f32::from(height) - PADDING;
                                 let lines = drag_scroll_lines(f32::from(drag_y), top, bottom);
@@ -395,7 +395,7 @@ impl TerminalPane {
         }
     }
 
-    fn write(&self, bytes: Vec<u8>) {
+    pub fn write(&self, bytes: Vec<u8>) {
         if self.broadcast.is_enabled() && self.broadcast.is_member(&self.id) {
             for (on, sender) in self.broadcast.members.lock().unwrap().values() {
                 if *on {

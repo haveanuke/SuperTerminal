@@ -27,6 +27,8 @@ pub struct Settings {
     pub buddy_pet_pos: Option<(f32, f32)>,
     /// Audio cue when a terminal finishes working / awaits input.
     pub audio_cues: bool,
+    /// Hold the Mac awake automatically while any terminal runs a job.
+    pub auto_caffeinate: bool,
     /// Speak buddy review notes aloud (macOS `say`).
     pub buddy_tts: bool,
     /// TTS voice name (None = system default), rate in words/min, and an
@@ -55,6 +57,7 @@ impl Default for Settings {
             buddy_pet_visible: true,
             buddy_pet_pos: None,
             audio_cues: true,
+            auto_caffeinate: false,
             buddy_tts: false,
             buddy_tts_voice: None,
             buddy_tts_rate: 175,
@@ -154,6 +157,7 @@ mod tests {
             buddy_pet_visible: false,
             buddy_pet_pos: Some((120.0, 240.0)),
             audio_cues: false,
+            auto_caffeinate: true,
             buddy_tts: true,
             buddy_tts_voice: Some("Samantha".into()),
             buddy_tts_rate: 200,
@@ -162,6 +166,15 @@ mod tests {
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn written_json_includes_auto_caffeinate_off_by_default() {
+        let path = tmp("autocaf").join("settings.json");
+        Settings::default().save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"autoCaffeinate\": false"), "got: {text}");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

@@ -12,6 +12,8 @@ pub enum Icon {
     GitBranch,
     /// Folder with a tab.
     Files,
+    /// Cup with handle and steam; filled body = keep-awake is holding.
+    Coffee { filled: bool },
 }
 
 pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
@@ -54,6 +56,24 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                 Icon::Files => {
                     quad(window, 2.0, 4.0, 6.0, 2.0);
                     quad(window, 2.0, 6.0, 12.0, 7.0);
+                }
+                Icon::Coffee { filled } => {
+                    // Steam.
+                    line(window, 5.5, 1.5, 5.5, 4.0);
+                    line(window, 8.5, 1.5, 8.5, 4.0);
+                    // Cup body: outline strokes, or a solid fill when held.
+                    if filled {
+                        quad(window, 3.0, 6.0, 8.0, 7.5);
+                    } else {
+                        line(window, 3.0, 6.0, 3.0, 13.5);
+                        line(window, 3.0, 13.5, 11.0, 13.5);
+                        line(window, 11.0, 6.0, 11.0, 13.5);
+                        line(window, 3.0, 6.0, 11.0, 6.0);
+                    }
+                    // Handle loop on the right.
+                    line(window, 11.0, 7.5, 13.5, 8.25);
+                    line(window, 13.5, 8.25, 13.5, 10.75);
+                    line(window, 13.5, 10.75, 11.0, 11.5);
                 }
             }
         },

@@ -205,8 +205,10 @@ pub struct Workspace {
     cue_track: HashMap<String, CueState>,
     /// The currently speaking `say` process (killed before a new note).
     tts_child: Option<std::process::Child>,
-    /// Keep-awake `caffeinate -dimsu` child; Some = the bar toggle is on.
+    /// Keep-awake `caffeinate -dimsu` child; Some = a hold is active.
     caffeinate_child: Option<std::process::Child>,
+    /// Who wants the Mac awake: manual rail toggle and/or busy terminals.
+    awake: crate::awake::AwakeHold,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
     /// Installed `say` voices, loaded lazily for the alerts row.
@@ -219,6 +221,8 @@ pub struct Workspace {
     theme_action_note: Option<String>,
     /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
     buddy_note: Option<String>,
+    /// The terminal the current note reviewed — "insert" targets it.
+    buddy_source_pane: Option<String>,
     buddy_busy: Arc<std::sync::atomic::AtomicBool>,
     buddy_last_hash: u64,
     /// After a failed run, hold off retries until this instant so a broken
@@ -306,6 +310,7 @@ impl Workspace {
             cue_track: HashMap::new(),
             tts_child: None,
             caffeinate_child: None,
+            awake: crate::awake::AwakeHold::default(),
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
@@ -313,6 +318,7 @@ impl Workspace {
             settings_section: SettingsSection::Themes,
             theme_action_note: None,
             buddy_note: None,
+            buddy_source_pane: None,
             buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             buddy_last_hash: 0,
             buddy_backoff_until: None,
@@ -478,21 +484,31 @@ impl Workspace {
         self.tts_child = command.arg(spoken).spawn().ok();
     }
 
-    /// Toggle the keep-awake hold: spawn or kill `caffeinate -dimsu`
+    /// Flip the manual keep-awake hold (the rail coffee toggle). While the
+    /// auto hold is also active, releasing manual won't kill caffeinate —
+    /// it lets go on its own once the terminals go quiet.
+    fn toggle_manual_awake(&mut self) {
+        self.awake.toggle_manual();
+        self.sync_caffeinate();
+    }
+
+    /// Make the `caffeinate -dimsu` child match the hold state
     /// (idle/display/disk/system sleep prevented, user-active asserted).
     /// `-w` ties it to our pid so a crash or force-quit that skips
     /// shutdown_all can never leave the Mac held awake.
-    fn toggle_caffeinate(&mut self) {
-        if let Some(mut child) = self.caffeinate_child.take() {
+    fn sync_caffeinate(&mut self) {
+        if self.awake.held() {
+            if self.caffeinate_child.is_none() {
+                self.caffeinate_child = std::process::Command::new("/usr/bin/caffeinate")
+                    .arg("-dimsu")
+                    .arg("-w")
+                    .arg(std::process::id().to_string())
+                    .spawn()
+                    .ok();
+            }
+        } else if let Some(mut child) = self.caffeinate_child.take() {
             let _ = child.kill();
             let _ = child.wait(); // reap
-        } else {
-            self.caffeinate_child = std::process::Command::new("/usr/bin/caffeinate")
-                .arg("-dimsu")
-                .arg("-w")
-                .arg(std::process::id().to_string())
-                .spawn()
-                .ok();
         }
     }
 
@@ -556,6 +572,30 @@ impl Workspace {
         if let Some(child) = &mut self.caffeinate_child {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 self.caffeinate_child = None;
+                // Manual-only hold: honor the kill. With the auto hold
+                // active the child respawns right away regardless, so
+                // keep the manual latch instead of silently losing it.
+                if !self.awake.auto_held() {
+                    self.awake.clear_manual();
+                }
+                self.sync_caffeinate();
+                cx.notify();
+            }
+        }
+        // Auto keep-awake: probe on the ~900ms cadence (one ioctl per pane,
+        // skipped entirely while the setting is off). The hold machine keeps
+        // a 10s idle grace so back-to-back commands don't flap caffeinate.
+        if self.pet_tick_count.is_multiple_of(3) {
+            let any_busy = self.settings.auto_caffeinate
+                && self.panes.values().any(|pane| pane.read(cx).foreground_busy());
+            let was_held = self.caffeinate_child.is_some();
+            self.awake.tick(
+                self.settings.auto_caffeinate,
+                any_busy,
+                std::time::Instant::now(),
+            );
+            self.sync_caffeinate();
+            if was_held != self.caffeinate_child.is_some() {
                 cx.notify();
             }
         }
@@ -664,6 +704,7 @@ impl Workspace {
             }
         }
         let cwd = pane_ref.cwd();
+        let source_pane = self.focused_terminal.clone();
         let command = self.settings.buddy_command.clone();
         let args = self.settings.buddy_args.clone();
         let busy = Arc::clone(&self.buddy_busy);
@@ -721,6 +762,7 @@ impl Workspace {
                     ws.buddy_last_hash = hash;
                     ws.buddy_backoff_until = None;
                     ws.buddy_note = Some(result.text.clone());
+                    ws.buddy_source_pane = source_pane;
                     if ws.settings.buddy_tts {
                         ws.speak_note(&result.text);
                     }
@@ -1323,6 +1365,7 @@ impl Workspace {
                         .flex_col()
                         .items_center()
                         .pt(px(6.0))
+                        .pb(px(6.0))
                         .gap(px(4.0))
                         .child(rail_item(
                             self,
@@ -1338,7 +1381,39 @@ impl Workspace {
                             "files",
                             SidebarView::Files,
                             cx,
-                        )),
+                        ))
+                        .child(div().flex_grow())
+                        .child({
+                            // Keep-awake: outline cup = released, filled =
+                            // caffeinate holding (manual or auto). Click
+                            // flips only the manual hold.
+                            let held = self.caffeinate_child.is_some();
+                            div()
+                                .id("rail-awake")
+                                .cursor_pointer()
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .rounded(px(5.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .hover(|style| style.bg(rgb(theme.ui_border)))
+                                .child(crate::icons::icon(
+                                    crate::icons::Icon::Coffee { filled: held },
+                                    if held {
+                                        theme.ui_accent
+                                    } else {
+                                        theme.ui_text_muted
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|ws, _, _window, cx| {
+                                        ws.toggle_manual_awake();
+                                        cx.notify();
+                                    }),
+                                )
+                        }),
                 )
                 .children(active_view),
         )
@@ -2833,6 +2908,33 @@ impl Workspace {
                             .child("terminal done: Glass - awaiting input: Ping"),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("awake"))
+                    .child(self.chip_button(
+                        if self.settings.auto_caffeinate {
+                            "auto: on"
+                        } else {
+                            "auto: off"
+                        },
+                        self.settings.auto_caffeinate,
+                        |ws, _window, cx| {
+                            ws.settings.auto_caffeinate = !ws.settings.auto_caffeinate;
+                            let _ = ws.settings.save();
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .child("hold the Mac awake while a terminal is working"),
+                    ),
+            )
             .children(voice_line)
             .children(self.render_voice_list(cx))
     }
@@ -3048,6 +3150,35 @@ impl Workspace {
     /// The pet's speech bubble as its own absolute element, clamped to the
     /// viewport: it tracks the pet's right edge but never crosses the left
     /// margin, grows upward when there's headroom and flips below otherwise.
+    /// Copy the full buddy note (the surfaces show it truncated/ellipsized).
+    fn copy_buddy_note(&self, cx: &mut Context<Self>) {
+        if let Some(note) = self.buddy_note.clone() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(note));
+        }
+    }
+
+    /// Stage the buddy note as input in the terminal it reviewed (or the
+    /// focused one if that pane is gone) — no trailing newline, the user
+    /// edits and submits. Same raw-bytes path as Cmd+V paste.
+    fn insert_buddy_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.buddy_note.clone() else {
+            return;
+        };
+        let Some(id) = self
+            .buddy_source_pane
+            .clone()
+            .filter(|id| self.panes.contains_key(id))
+            .or_else(|| self.focused_terminal.clone())
+        else {
+            return;
+        };
+        let Some(pane) = self.panes.get(&id) else {
+            return;
+        };
+        pane.read(cx).write(note.into_bytes());
+        self.focus_terminal_by_id(&id, window, cx);
+    }
+
     fn render_pet_bubble(
         &mut self,
         window: &mut Window,
@@ -3093,19 +3224,48 @@ impl Workspace {
             .text_size(px(11.0))
             .text_color(rgb(theme.ui_text))
             .overflow_hidden()
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|ws, _, _, cx| {
-                    cx.stop_propagation();
-                    // Click a note to copy it; the bubble closes.
-                    if let Some((text, _)) = ws.pet_bubble.take() {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                    }
-                    cx.notify();
-                }),
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                // Long notes scroll within the bubble's height budget
+                // (the chip row below keeps a fixed slice of it).
+                div()
+                    .id("buddy-bubble-text")
+                    .max_h(px((space - 34.0).max(16.0)))
+                    .overflow_y_scroll()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, _, cx| {
+                            cx.stop_propagation();
+                            // Click a note to copy it; the bubble closes.
+                            if let Some((text, _)) = ws.pet_bubble.take() {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(SharedString::from(text)),
             )
-            .child(SharedString::from(text));
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(4.0))
+                    .child(self.chip_button(
+                        "copy",
+                        false,
+                        |ws, _window, cx| ws.copy_buddy_note(cx),
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        "insert",
+                        false,
+                        |ws, window, cx| ws.insert_buddy_note(window, cx),
+                        cx,
+                    )),
+            );
         Some(if above {
             bubble
                 .bottom(px(vh - y + 6.0))
@@ -3140,45 +3300,36 @@ impl Workspace {
                     .filter(|_| !self.settings.buddy_pet_visible)
                     .map(|note| {
                         div()
-                            .id("buddy-note")
-                            .max_w(px(420.0))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_size(px(10.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child(SharedString::from(note))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .id("buddy-note")
+                                    .max_w(px(420.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child(SharedString::from(note)),
+                            )
+                            .child(self.chip_button(
+                                "copy",
+                                false,
+                                |ws, _window, cx| ws.copy_buddy_note(cx),
+                                cx,
+                            ))
+                            .child(self.chip_button(
+                                "insert",
+                                false,
+                                |ws, window, cx| ws.insert_buddy_note(window, cx),
+                                cx,
+                            ))
                     }),
             )
             .children(self.render_focused_controls(cx))
-            .child({
-                let enabled = self.caffeinate_child.is_some();
-                let theme = self.theme;
-                div()
-                    .id("awake-toggle")
-                    .cursor_pointer()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(3.0))
-                    .bg(rgb(if enabled {
-                        theme.ui_accent
-                    } else {
-                        theme.ui_surface
-                    }))
-                    .text_color(rgb(if enabled {
-                        theme.ui_background
-                    } else {
-                        theme.ui_text_muted
-                    }))
-                    .child("awake")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|ws, _, _window, cx| {
-                            ws.toggle_caffeinate();
-                            cx.notify();
-                        }),
-                    )
-            })
             .child({
                 let enabled = self.broadcast.is_enabled();
                 let theme = self.theme;
