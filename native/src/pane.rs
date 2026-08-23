@@ -94,6 +94,16 @@ pub struct TerminalPane {
     auto_run_tick: u32,
     /// Last time PTY output arrived (drives the buddy quiet-detection).
     pub last_activity: std::time::Instant,
+    /// Last time the user sent input to this pane (typing without echo —
+    /// password prompts — produces no output; this keeps the buddy quiet
+    /// gate honest there).
+    pub last_input: std::time::Instant,
+    /// "User is looking at this pane" (pane focused AND window active),
+    /// cached each render so bell handling can judge attention AT ARRIVAL
+    /// rather than ~a second later on the cue tick.
+    attended: bool,
+    /// An unattended bell arrived since the cue tick last drained it.
+    bell_pending: bool,
     /// Pane origin in window coordinates (for mouse cell math), updated from
     /// the measuring canvas via `pending_bounds` on each pump tick.
     origin: (Pixels, Pixels),
@@ -309,6 +319,9 @@ impl TerminalPane {
             auto_run: None,
             auto_run_tick: 0,
             last_activity: std::time::Instant::now(),
+            last_input: std::time::Instant::now(),
+            attended: false,
+            bell_pending: false,
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             resize_candidate: None,
@@ -390,12 +403,26 @@ impl TerminalPane {
                 SessionEvent::Exited(_) => {
                     cx.emit(PaneEvent::Exited);
                 }
-                SessionEvent::Bell => {}
+                SessionEvent::Bell => {
+                    // Attention judged at arrival: a bell in the pane the
+                    // user is watching is theirs (readline beeps, less at
+                    // EOF) — only unattended bells become cues.
+                    if !self.attended {
+                        self.bell_pending = true;
+                    }
+                }
             }
         }
     }
 
-    pub fn write(&self, bytes: Vec<u8>) {
+    /// Drain the pending-bell flag (cue tick). Callers discard the value
+    /// when audio cues are off — bells are never queued for later.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_pending)
+    }
+
+    pub fn write(&mut self, bytes: Vec<u8>) {
+        self.last_input = std::time::Instant::now();
         if self.broadcast.is_enabled() && self.broadcast.is_member(&self.id) {
             for (on, sender) in self.broadcast.members.lock().unwrap().values() {
                 if *on {
@@ -817,6 +844,7 @@ impl Render for TerminalPane {
 
         let theme = self.theme;
         let focused = self.focus_handle.is_focused(window);
+        self.attended = focused && window.is_window_active();
         let snapshot = &self.snapshot;
         let cell_w = self.cell_width;
         let line_h = self.line_height;

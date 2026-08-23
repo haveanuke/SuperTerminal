@@ -100,3 +100,59 @@ fn pty_roundtrip_lands_in_grid() {
         "SPIKE_OK never appeared in the terminal grid.\nFinal grid:\n{last_grid}"
     );
 }
+
+/// Pin the dependency behavior the bell-driven cue rests on: a BEL byte
+/// written by a program in the PTY must surface as `Event::Bell` from
+/// alacritty's parser (term_session forwards it as `SessionEvent::Bell`).
+#[test]
+fn bel_byte_surfaces_as_bell_event() {
+    const COLS: usize = 80;
+    const LINES: usize = 24;
+
+    #[derive(Clone)]
+    struct BellProxy(Arc<AtomicBool>);
+    impl EventListener for BellProxy {
+        fn send_event(&self, event: Event) {
+            if matches!(event, Event::Bell) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    let rang = Arc::new(AtomicBool::new(false));
+    let proxy = BellProxy(rang.clone());
+    let term = Arc::new(FairMutex::new(Term::new(
+        Config::default(),
+        &TermSize::new(COLS, LINES),
+        proxy.clone(),
+    )));
+    let options = tty::Options {
+        shell: Some(tty::Shell::new("/bin/sh".into(), Vec::new())),
+        env: std::collections::HashMap::from([("TERM".to_string(), "dumb".to_string())]),
+        ..Default::default()
+    };
+    let window_size = WindowSize {
+        num_lines: LINES as u16,
+        num_cols: COLS as u16,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let pty = tty::new(&options, window_size, 0).expect("failed to open PTY");
+    let event_loop =
+        EventLoop::new(term.clone(), proxy, pty, false, false).expect("failed to build event loop");
+    let sender = event_loop.channel();
+    let _pty_thread = event_loop.spawn();
+    let notifier = Notifier(sender.clone());
+
+    notifier.notify(b"printf '\\a'\r".to_vec());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !rang.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = sender.send(Msg::Shutdown);
+    assert!(
+        rang.load(Ordering::Acquire),
+        "BEL written to the PTY never surfaced as Event::Bell"
+    );
+}

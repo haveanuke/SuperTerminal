@@ -1,0 +1,7 @@
+#!/bin/sh
+# Ring the controlling terminal's bell. Quiet no-op when there is no
+# controlling tty (setsid, detached daemons) — never break the caller's
+# notify hook over a missing bell.
+# stderr is silenced BEFORE the tty open so a failed open can't leak a
+# diagnostic to the caller's stderr.
+printf '\a' 2>/dev/null > /dev/tty || :

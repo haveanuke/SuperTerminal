@@ -40,6 +40,34 @@ extern "C" {
 }
 const SIGKILL: c_int = 9;
 
+/// Whether newly spawned shells get the tool-adapter shims on PATH. Written
+/// by the workspace from settings; a process-wide flag because sessions are
+/// spawned deep in pane construction. Toggling affects NEW terminals only.
+static TOOL_ADAPTERS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_tool_adapters(enabled: bool) {
+    TOOL_ADAPTERS.store(enabled, Ordering::Relaxed);
+}
+
+fn adapters_enabled() -> bool {
+    TOOL_ADAPTERS.load(Ordering::Relaxed)
+}
+
+/// The bundled adapter shims: Resources/adapters in the .app, with a source
+/// checkout fallback for `cargo run` dev builds.
+fn adapters_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(contents) = exe.parent().and_then(|macos| macos.parent()) {
+            let bundled = contents.join("Resources/adapters");
+            if bundled.is_dir() {
+                return Some(bundled);
+            }
+        }
+    }
+    let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/adapters"));
+    dev.is_dir().then_some(dev)
+}
+
 /// Standard xterm color for OSC 4/10/11 queries (0-15 classic, cube, gray).
 fn default_palette_color(index: usize) -> alacritty_terminal::vte::ansi::Rgb {
     use alacritty_terminal::vte::ansi::Rgb;
@@ -329,6 +357,18 @@ impl TermSession {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "SuperTerminal".to_string());
+        // Tool adapters: shims that make claude/codex ring the terminal bell
+        // with zero user setup. The pre-shim PATH rides along so an adapter
+        // resolves the REAL binary and can never recurse into itself. New
+        // sessions only — an already-running shell keeps its PATH.
+        if adapters_enabled() {
+            if let Some(dir) = adapters_dir() {
+                let orig = env.get("PATH").cloned().unwrap_or_default();
+                env.insert("ST_ORIG_PATH".to_string(), orig.clone());
+                env.insert("PATH".to_string(), format!("{}:{orig}", dir.display()));
+            }
+        }
         // App bundles launch with cwd "/" — a shell must never start there.
         // No explicit directory means the user's home.
         let working_directory =

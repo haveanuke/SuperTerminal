@@ -5,6 +5,9 @@
 //! UI-framework dependencies.
 
 pub mod buddy;
+pub mod buddy_gate;
+pub mod buddy_probe;
+pub mod cue;
 pub mod git;
 pub mod proc_cwd;
 pub mod session;

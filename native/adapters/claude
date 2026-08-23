@@ -1,0 +1,20 @@
+#!/bin/sh
+# SuperTerminal adapter: run the real claude with terminal-bell notifications
+# so the app's audio cue fires when claude finishes or needs attention.
+# Resolution uses ST_ORIG_PATH (the PATH before this shim dir was prepended)
+# so the adapter can never find itself. If the user passes their own
+# --settings, pass through untouched — never fight an explicit choice.
+real="$(PATH="${ST_ORIG_PATH:-$PATH}" command -v claude)" || {
+    echo "superterminal adapter: claude not found on PATH" >&2
+    exit 127
+}
+[ "$real" = "$0" ] && {
+    echo "superterminal adapter: refusing to recurse into itself" >&2
+    exit 127
+}
+for arg in "$@"; do
+    case "$arg" in
+        --settings|--settings=*) exec "$real" "$@" ;;
+    esac
+done
+exec "$real" --settings '{"preferredNotifChannel":"terminal_bell"}' "$@"

@@ -27,6 +27,9 @@ pub struct Settings {
     pub buddy_pet_pos: Option<(f32, f32)>,
     /// Audio cue when a terminal finishes working / awaits input.
     pub audio_cues: bool,
+    /// Prepend the bundled tool-adapter shims (claude/codex ring the bell
+    /// with zero user setup) to PATH in newly spawned terminals.
+    pub tool_adapters: bool,
     /// Hold the Mac awake automatically while any terminal runs a job.
     pub auto_caffeinate: bool,
     /// Speak buddy review notes aloud (macOS `say`).
@@ -57,6 +60,7 @@ impl Default for Settings {
             buddy_pet_visible: true,
             buddy_pet_pos: None,
             audio_cues: true,
+            tool_adapters: true,
             auto_caffeinate: false,
             buddy_tts: false,
             buddy_tts_voice: None,
@@ -157,6 +161,7 @@ mod tests {
             buddy_pet_visible: false,
             buddy_pet_pos: Some((120.0, 240.0)),
             audio_cues: false,
+            tool_adapters: false,
             auto_caffeinate: true,
             buddy_tts: true,
             buddy_tts_voice: Some("Samantha".into()),

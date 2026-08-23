@@ -15,6 +15,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$ROOT/target/release/superterminal-native" "$APP/Contents/MacOS/superterminal-native"
 cp "$ROOT/src-tauri/icons/icon.icns" "$APP/Contents/Resources/icon.icns"
+# Tool-adapter shims (claude/codex bell integration) — must stay executable.
+mkdir -p "$APP/Contents/Resources/adapters"
+cp "$ROOT/native/adapters/"* "$APP/Contents/Resources/adapters/"
+chmod +x "$APP/Contents/Resources/adapters/"*
 
 cat > "$APP/Contents/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

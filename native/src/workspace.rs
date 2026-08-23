@@ -108,18 +108,10 @@ struct PetDrag {
     moved: bool,
 }
 
-/// Busy history for one terminal, driving the "done working" cues.
-struct CueState {
-    busy: bool,
-    busy_since: Option<std::time::Instant>,
-    /// Whether the running job had already gone output-quiet (cued).
-    quiet_cued: bool,
-    /// Start of the current continuous-output streak. Idle TUIs (claude's
-    /// spinner) emit sparse blips; only a SUSTAINED streak re-arms the
-    /// awaiting-input cue, so blips can't ping repeatedly.
-    active_since: Option<std::time::Instant>,
-    last_cue: Option<std::time::Instant>,
-}
+// Cue decisions live in `superterminal_core::cue` (pure, unit-tested): Ping
+// fires only on a real terminal bell, Glass on the tcgetpgrp busy→prompt
+// transition. The old output-timing heuristic is gone — it mistook idle-TUI
+// redraw blips for work and pinged repeatedly.
 
 /// One line of `say -v ?`: name (may contain spaces and suffixes like
 /// "(Enhanced)"), then a locale token, then "# sample". The name is
@@ -143,6 +135,34 @@ fn parse_voice_name(line: &str) -> Option<String> {
         .unwrap_or(before_hash);
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The buddy's voice: a named character, substance first, personality as
+/// seasoning (Tomas's 40% feedback / 60% character calibration). Reviews
+/// (change present) must land one concrete observation; reactions stay
+/// grounded in what actually happened. Notes are spoken by TTS, so exactly
+/// one short speakable line, no emoji (rendered UI never uses them).
+fn buddy_prompt(name: &str, tail: &str, change: Option<(&str, &str)>) -> String {
+    let identity = format!(
+        "You are {name}, a dry-witted senior engineer who lives in this \
+         terminal as its resident pet. Reply with exactly ONE short, \
+         speakable line. No preamble, no markdown, no emoji."
+    );
+    match change {
+        Some((label, patch)) => format!(
+            "{identity} Review the change below against the recent terminal \
+             output: deliver one concrete, actionable observation (a bug, a \
+             risk, or the next step). Personality is welcome, but the \
+             finding always comes first — never a quip instead of substance.\
+             \n\nTERMINAL OUTPUT:\n{tail}\n\n{label}:\n{patch}"
+        ),
+        None => format!(
+            "{identity} A job just finished in the terminal; its output is \
+             below. React in character to what ACTUALLY happened — ground \
+             every word in the output and never invent events. If something \
+             failed, point at the likely cause.\n\nTERMINAL OUTPUT:\n{tail}"
+        ),
+    }
 }
 
 /// Spawn a system sound; the caller keeps the child for reaping.
@@ -201,8 +221,8 @@ pub struct Workspace {
     sidebar_status_cache: HashMap<String, (String, bool)>,
     /// Projects collapsed in the sidebar (by tab id).
     collapsed_projects: std::collections::HashSet<String>,
-    /// Per-terminal busy tracking for audio cues.
-    cue_track: HashMap<String, CueState>,
+    /// Per-terminal cue gates (bell → Ping, long-job finish → Glass).
+    cue_gates: HashMap<String, superterminal_core::cue::CueGate>,
     /// The currently speaking `say` process (killed before a new note).
     tts_child: Option<std::process::Child>,
     /// Keep-awake `caffeinate -dimsu` child; Some = a hold is active.
@@ -219,19 +239,20 @@ pub struct Workspace {
     settings_section: SettingsSection,
     /// Transient status line for the theme sheet (import/export results).
     theme_action_note: Option<String>,
-    /// Buddy reviewer: latest note, in-flight flag, last reviewed content hash.
+    /// Buddy reviewer: latest note.
     buddy_note: Option<String>,
     /// The terminal the current note reviewed — "insert" targets it.
     buddy_source_pane: Option<String>,
-    buddy_busy: Arc<std::sync::atomic::AtomicBool>,
-    buddy_last_hash: u64,
+    /// When the buddy speaks (diff stability, commits, reactions) — pure
+    /// state machine in core; this file only wires probes and dispatches.
+    buddy_gate: superterminal_core::buddy_gate::BuddyGate,
+    /// The pane the gate's observations describe. A focus move invalidates
+    /// location-bound gate state SYNCHRONOUSLY — otherwise a candidate from
+    /// the old repo could dispatch with the new pane's terminal context.
+    buddy_observed_pane: Option<String>,
     /// After a failed run, hold off retries until this instant so a broken
     /// command doesn't respawn every tick.
     buddy_backoff_until: Option<std::time::Instant>,
-    /// Candidate content awaiting stability: idle-TUI blips (clocks,
-    /// spinners) change the hash constantly; only content unchanged for
-    /// two ticks gets reviewed.
-    buddy_pending_hash: Option<(u64, std::time::Instant)>,
     /// The pet: visual personality only — its bubble text is reviewer output.
     companion: Companion,
     pet_frame: usize,
@@ -266,6 +287,8 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let settings = Settings::load();
+        // Before any pane spawns a shell: adapters ride the spawn env.
+        crate::term_session::set_tool_adapters(settings.tool_adapters);
         for custom in &settings.custom_themes {
             let _ = themes::import_custom(custom);
         }
@@ -307,7 +330,7 @@ impl Workspace {
             sidebar_view: SidebarView::Projects,
             sidebar_status_cache: HashMap::new(),
             collapsed_projects: std::collections::HashSet::new(),
-            cue_track: HashMap::new(),
+            cue_gates: HashMap::new(),
             tts_child: None,
             caffeinate_child: None,
             awake: crate::awake::AwakeHold::default(),
@@ -319,10 +342,9 @@ impl Workspace {
             theme_action_note: None,
             buddy_note: None,
             buddy_source_pane: None,
-            buddy_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            buddy_last_hash: 0,
+            buddy_gate: superterminal_core::buddy_gate::BuddyGate::new(),
+            buddy_observed_pane: None,
             buddy_backoff_until: None,
-            buddy_pending_hash: None,
             companion,
             pet_frame: 0,
             pet_blink: false,
@@ -375,83 +397,50 @@ impl Workspace {
         let _ = self.settings.save();
     }
 
-    /// Detect "done working" transitions and chime: a terminal that was
-    /// busy 5s+ returning to the prompt plays Glass; an interactive job
-    /// going output-quiet (awaiting input, e.g. claude finishing) plays
-    /// Ping. Quick commands never ding; per-terminal cues are spaced 5s.
-    fn audio_cue_tick(&mut self, cx: &mut Context<Self>) {
-        const MIN_BUSY: Duration = Duration::from_secs(5);
-        const MIN_GAP: Duration = Duration::from_secs(5);
-        const QUIET: Duration = Duration::from_secs(3);
+    /// Sample every pane's cue gate (~900ms): a bell from an unattended pane
+    /// plays Ping, a job that worked 5s+ returning to the prompt plays Glass.
+    /// Runs with audio cues OFF too — bells are then drained and discarded
+    /// (never queued into stale dings) and the focused pane's long-job
+    /// finishes still feed the buddy's reaction trigger.
+    fn cue_tick(&mut self, cx: &mut Context<Self>) {
+        use superterminal_core::cue::CueKind;
         let now = std::time::Instant::now();
         // Reap finished sound players so they never linger as zombies.
         self.audio_children
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
+        let audio_on = self.settings.audio_cues;
         let mut cue_kinds: Vec<&'static str> = Vec::new();
+        let mut focused_long_job = false;
         for (id, pane) in &self.panes {
-            let pane_ref = pane.read(cx);
-            let busy = pane_ref.foreground_busy();
-            let quiet = pane_ref.last_activity.elapsed() >= QUIET;
-            let state = self.cue_track.entry(id.clone()).or_insert(CueState {
-                busy,
-                busy_since: busy.then_some(now),
-                quiet_cued: false,
-                active_since: None,
-                last_cue: None,
-            });
-            let worked_long_enough = state
-                .busy_since
-                .is_some_and(|since| now.duration_since(since) >= MIN_BUSY);
-            let gap_ok = state
-                .last_cue
-                .is_none_or(|last| now.duration_since(last) >= MIN_GAP);
-            if state.busy && !busy {
-                // Job finished, back at the prompt.
-                if worked_long_enough && gap_ok {
-                    cue_kinds.push("Glass");
-                    state.last_cue = Some(now);
-                }
-                state.busy_since = None;
-                state.quiet_cued = false;
-            } else if !state.busy && busy {
-                state.busy_since = Some(now);
-                state.quiet_cued = false;
-            } else if busy && quiet {
-                // ANY quiet moment ends the output streak — a stale streak
-                // timestamp must never survive a quiet gap and later re-arm
-                // the cue off a single blip.
-                state.active_since = None;
-                if !state.quiet_cued && worked_long_enough && gap_ok {
-                    // Interactive job stopped producing output: awaiting
-                    // input. Latch ONLY when the cue actually fires.
-                    cue_kinds.push("Ping");
-                    state.last_cue = Some(now);
-                    state.quiet_cued = true;
-                }
-            } else if busy && !quiet {
-                // Re-arm only after 5s of CONTINUOUS output — a spinner
-                // blip is not "working again".
-                match state.active_since {
-                    None => state.active_since = Some(now),
-                    Some(since) if now.duration_since(since) >= Duration::from_secs(5) => {
-                        state.quiet_cued = false;
-                    }
-                    Some(_) => {}
+            let (busy, bell) =
+                pane.update(cx, |pane, _| (pane.foreground_busy(), pane.take_bell()));
+            let gate = self.cue_gates.entry(id.clone()).or_default();
+            let outcome = gate.tick(now, busy, bell && audio_on);
+            if outcome.long_job_finished && self.focused_terminal.as_ref() == Some(id) {
+                focused_long_job = true;
+            }
+            if audio_on {
+                if let Some(kind) = outcome.cue {
+                    cue_kinds.push(match kind {
+                        CueKind::Ping => "Ping",
+                        CueKind::Glass => "Glass",
+                    });
                 }
             }
-            state.busy = busy;
         }
         let live: std::collections::HashSet<&String> = self.panes.keys().collect();
-        self.cue_track.retain(|id, _| live.contains(id));
+        self.cue_gates.retain(|id, _| live.contains(id));
         // Each DISTINCT chime kind plays once, so every cued terminal's
         // sound is really heard even when several finish together.
-        cue_kinds.dedup();
         cue_kinds.sort_unstable();
         cue_kinds.dedup();
         for kind in cue_kinds {
             if let Some(child) = play_sound(kind) {
                 self.audio_children.push(child);
             }
+        }
+        if focused_long_job {
+            self.buddy_gate.job_finished(now);
         }
     }
 
@@ -587,7 +576,10 @@ impl Workspace {
         // a 10s idle grace so back-to-back commands don't flap caffeinate.
         if self.pet_tick_count.is_multiple_of(3) {
             let any_busy = self.settings.auto_caffeinate
-                && self.panes.values().any(|pane| pane.read(cx).foreground_busy());
+                && self
+                    .panes
+                    .values()
+                    .any(|pane| pane.read(cx).foreground_busy());
             let was_held = self.caffeinate_child.is_some();
             self.awake.tick(
                 self.settings.auto_caffeinate,
@@ -602,8 +594,8 @@ impl Workspace {
         // Keep the sidebar following the focused terminal's cwd (a `cd`
         // changes it without any focus event) — INDEPENDENT of pet
         // visibility. The panels dedupe unchanged paths, so this is cheap.
-        if self.pet_tick_count.is_multiple_of(3) && self.settings.audio_cues {
-            self.audio_cue_tick(cx);
+        if self.pet_tick_count.is_multiple_of(3) {
+            self.cue_tick(cx);
         }
         if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
             self.push_git_cwd(cx);
@@ -643,49 +635,65 @@ impl Workspace {
         }
     }
 
-    /// Buddy-as-reviewer: after a burst of terminal activity settles, send
-    /// the visible output plus the repo's working-tree diff to the configured
-    /// agent CLI and surface its one-line note in the bar.
+    /// Buddy-as-reviewer/companion: observe the focused pane's repo every
+    /// tick (single-flight background probes feeding the pure gate in core),
+    /// and dispatch at most one utterance at a time — a review of a settled
+    /// working diff, a review of a fresh commit, or an in-character reaction
+    /// to a finished job.
     fn buddy_tick(&mut self, cx: &mut Context<Self>) {
-        use std::hash::{Hash, Hasher};
-        if !self.settings.buddy_enabled
-            || self.settings.buddy_command.trim().is_empty()
-            || self.buddy_busy.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        use superterminal_core::buddy_gate::{ProbeResult, Trigger, Utterance};
+        if !self.settings.buddy_enabled || self.settings.buddy_command.trim().is_empty() {
             return;
         }
-        let Some(pane) = self
-            .focused_terminal
-            .as_ref()
-            .and_then(|id| self.panes.get(id))
-        else {
+        let focused_id = self.focused_terminal.clone();
+        if self.buddy_observed_pane != focused_id {
+            self.buddy_gate.focus_changed();
+            self.buddy_observed_pane = focused_id.clone();
+        }
+        let Some(pane) = focused_id.as_ref().and_then(|id| self.panes.get(id)) else {
             return;
         };
-        let pane_ref = pane.read(cx);
-        let quiet = pane_ref.last_activity.elapsed() >= Duration::from_secs(3);
-        if !quiet {
-            return;
-        }
-        let text = pane_ref.visible_text();
-        if text.trim().len() < 80 {
-            return;
-        }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
-        let hash = hasher.finish();
-        // Maintain the stability candidate BEFORE any gate, so it can
-        // never carry a stale timestamp across content that changed away
-        // and back while a gate was rejecting.
-        let now = std::time::Instant::now();
-        let fresh_candidate = match self.buddy_pending_hash {
-            Some((pending, _)) if pending == hash => false,
-            _ => {
-                self.buddy_pending_hash = Some((hash, now));
-                true
+        let (quiet, cwd, text) = {
+            let pane_ref = pane.read(cx);
+            // Quiet = no PTY output AND no keystrokes for 3s. The input clock
+            // covers echo-less typing (password prompts) that the output
+            // clock cannot see.
+            let quiet = pane_ref.last_activity.elapsed() >= Duration::from_secs(3)
+                && pane_ref.last_input.elapsed() >= Duration::from_secs(3);
+            (quiet, pane_ref.cwd(), pane_ref.visible_text())
+        };
+        // Observation never stops for an in-flight utterance; probes are
+        // single-flight on their own (one can outlive several ticks on a
+        // slow repo; the gate drops stale generations).
+        if quiet {
+            if let Some(generation) = self.buddy_gate.want_probe() {
+                cx.spawn(async move |ws, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            match cwd {
+                                Some(cwd) => superterminal_core::buddy_probe::observe(
+                                    std::path::Path::new(&cwd),
+                                ),
+                                None => ProbeResult {
+                                    repo_root: None,
+                                    head: None,
+                                    head_committed: false,
+                                    snapshot_hash: None,
+                                },
+                            }
+                        })
+                        .await;
+                    let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                        ws.buddy_gate
+                            .probe_done(generation, result, std::time::Instant::now());
+                        // Composing state may have changed.
+                        cx.notify();
+                    });
+                    Ok::<(), ()>(())
+                })
+                .detach();
             }
-        };
-        if hash == self.buddy_last_hash {
-            return;
         }
         if self
             .buddy_backoff_until
@@ -693,58 +701,138 @@ impl Workspace {
         {
             return;
         }
-        // Content must hold still for ~8s (two ticks) before a review — a
-        // changing hash means the screen is still animating.
-        if fresh_candidate {
+        let Some(utterance) = self.buddy_gate.take_dispatch(std::time::Instant::now()) else {
             return;
-        }
-        if let Some((_, since)) = self.buddy_pending_hash {
-            if now.duration_since(since) < Duration::from_secs(8) {
-                return;
-            }
-        }
-        let cwd = pane_ref.cwd();
+        };
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let name = self
+            .settings
+            .buddy_companion
+            .as_ref()
+            .map(|companion| companion.name.clone())
+            .unwrap_or_else(|| "Buddy".to_string());
         let source_pane = self.focused_terminal.clone();
         let command = self.settings.buddy_command.clone();
         let args = self.settings.buddy_args.clone();
-        let busy = Arc::clone(&self.buddy_busy);
-        busy.store(true, std::sync::atomic::Ordering::Relaxed);
         cx.spawn(async move |ws, cx| {
+            enum Prepared {
+                Review {
+                    root: String,
+                    committed: bool,
+                    patch: String,
+                    hash: u64,
+                },
+                Reaction,
+                /// Nothing to show (clean tree, merge commit, unreadable).
+                Cancel,
+                /// The tree moved between approval and the git read — the
+                /// materialized patch is NOT the approved snapshot.
+                Stale,
+            }
+            // Stage 1 (background): materialize the utterance's content.
+            let prepared = cx
+                .background_executor()
+                .spawn(async move {
+                    match utterance {
+                        Utterance::Review(root, trigger) => {
+                            let committed = matches!(trigger, Trigger::Commit(_));
+                            let patch = match &trigger {
+                                Trigger::WorkingDiff(_) => {
+                                    superterminal_core::buddy_probe::working_patch(
+                                        std::path::Path::new(&root),
+                                    )
+                                }
+                                Trigger::Commit(oid) => {
+                                    superterminal_core::buddy_probe::commit_patch(
+                                        std::path::Path::new(&root),
+                                        oid,
+                                    )
+                                }
+                            };
+                            // TOCTOU guard: the patch was read from the LIVE
+                            // tree. Re-observe and require it to still be the
+                            // approved snapshot — editing may have resumed
+                            // between 7s-stability approval and the git read.
+                            if let Trigger::WorkingDiff(approved) = &trigger {
+                                let fresh = superterminal_core::buddy_probe::observe(
+                                    std::path::Path::new(&root),
+                                );
+                                if fresh.snapshot_hash != Some(*approved) {
+                                    return Prepared::Stale;
+                                }
+                            }
+                            match patch {
+                                Some((patch, hash)) => Prepared::Review {
+                                    root,
+                                    committed,
+                                    patch,
+                                    hash,
+                                },
+                                None => Prepared::Cancel,
+                            }
+                        }
+                        Utterance::Reaction => Prepared::Reaction,
+                    }
+                })
+                .await;
+            // Stage 2 (main): dedupe — a commit of the just-reviewed diff
+            // (or vice versa) must not be reviewed twice.
+            let proceed = ws.update(cx, |ws: &mut Workspace, _| match &prepared {
+                Prepared::Review { root, hash, .. } => {
+                    if ws.buddy_gate.already_reviewed(root, *hash) {
+                        ws.buddy_gate.utterance_cancelled();
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Prepared::Reaction => true,
+                Prepared::Cancel => {
+                    ws.buddy_gate.utterance_cancelled();
+                    false
+                }
+                Prepared::Stale => {
+                    // Un-consume WITHOUT backoff: once the tree holds still
+                    // again, the normal stability path re-candidates it.
+                    ws.buddy_gate.utterance_failed();
+                    false
+                }
+            });
+            if !matches!(proceed, Ok(true)) {
+                return Ok(());
+            }
+            let (prompt, reviewed) = match prepared {
+                Prepared::Review {
+                    root,
+                    committed,
+                    patch,
+                    hash,
+                } => {
+                    let excerpt: String = patch.chars().take(6000).collect();
+                    let label = if committed {
+                        "JUST-COMMITTED CHANGE"
+                    } else {
+                        "WORKING DIFF"
+                    };
+                    (
+                        buddy_prompt(&name, &tail, Some((label, &excerpt))),
+                        Some((root, hash)),
+                    )
+                }
+                Prepared::Reaction => (buddy_prompt(&name, &tail, None), None),
+                Prepared::Cancel | Prepared::Stale => unreachable!("cancelled above"),
+            };
+            // Stage 3 (background): run the agent CLI.
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    // Working-tree diff of the enclosing repo, capped.
-                    let diff = cwd
-                        .and_then(|cwd| {
-                            superterminal_core::git::process::run_git(
-                                Some(std::path::Path::new(&cwd)),
-                                &["diff", "--stat", "--patch", "--no-color"],
-                                false,
-                            )
-                            .ok()
-                        })
-                        .map(|out| {
-                            String::from_utf8_lossy(&out.stdout)
-                                .chars()
-                                .take(6000)
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default();
-                    // The buddy reviews CHANGES; with nothing in the working
-                    // tree there is nothing to say — stay silent (the
-                    // failure path's backoff retries once changes exist).
-                    if diff.trim().is_empty() {
-                        return superterminal_core::buddy::BuddyResult {
-                            ok: false,
-                            text: String::new(),
-                            error: None,
-                        };
-                    }
-                    let tail: String = text.chars().rev().take(2000).collect::<String>()
-                        .chars().rev().collect();
-                    let prompt = format!(
-                        "You are a terse code reviewer embedded in a terminal. Given recent terminal output and the current working-tree git diff, reply with ONE short actionable observation (a bug, risk, or next step). No preamble.\n\nTERMINAL OUTPUT:\n{tail}\n\nWORKING DIFF:\n{diff}"
-                    );
                     superterminal_core::buddy::run(superterminal_core::buddy::BuddyRequest {
                         command,
                         args,
@@ -753,13 +841,10 @@ impl Workspace {
                     })
                 })
                 .await;
+            // Stage 4 (main): surface the note or back off.
             let _ = ws.update(cx, |ws: &mut Workspace, cx| {
-                ws.buddy_busy
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 if result.ok {
-                    // Only a successful review consumes the content hash: a
-                    // timeout or launch failure retries once the backoff ends.
-                    ws.buddy_last_hash = hash;
+                    ws.buddy_gate.utterance_succeeded(reviewed);
                     ws.buddy_backoff_until = None;
                     ws.buddy_note = Some(result.text.clone());
                     ws.buddy_source_pane = source_pane;
@@ -767,11 +852,15 @@ impl Workspace {
                         ws.speak_note(&result.text);
                     }
                     ws.pet_bubble = Some((result.text, std::time::Instant::now()));
-                    cx.notify();
                 } else {
+                    // A timeout or launch failure requeues the review (only
+                    // success consumes content) and holds off retries so a
+                    // broken command can't respawn every tick.
+                    ws.buddy_gate.utterance_failed();
                     ws.buddy_backoff_until =
                         Some(std::time::Instant::now() + Duration::from_secs(30));
                 }
+                cx.notify();
             });
             Ok::<(), ()>(())
         })
@@ -2870,14 +2959,30 @@ impl Workspace {
                         |ws, _window, cx| {
                             ws.settings.audio_cues = !ws.settings.audio_cues;
                             let _ = ws.settings.save();
+                            // Gates keep sampling while cues are off (bells
+                            // are drained and discarded), so re-enabling can
+                            // never chime retroactively — just confirm.
                             if ws.settings.audio_cues {
-                                // Resnapshot so transitions that happened
-                                // while disabled don't chime retroactively.
-                                ws.cue_track.clear();
                                 if let Some(child) = play_sound("Glass") {
                                     ws.audio_children.push(child);
                                 }
                             }
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        if self.settings.tool_adapters {
+                            "tool adapters: on"
+                        } else {
+                            "tool adapters: off"
+                        },
+                        self.settings.tool_adapters,
+                        |ws, _window, cx| {
+                            ws.settings.tool_adapters = !ws.settings.tool_adapters;
+                            let _ = ws.settings.save();
+                            // New terminals only — a live shell keeps its PATH.
+                            crate::term_session::set_tool_adapters(ws.settings.tool_adapters);
                             cx.notify();
                         },
                         cx,
@@ -3175,7 +3280,7 @@ impl Workspace {
         let Some(pane) = self.panes.get(&id) else {
             return;
         };
-        pane.read(cx).write(note.into_bytes());
+        pane.update(cx, |pane, _| pane.write(note.into_bytes()));
         self.focus_terminal_by_id(&id, window, cx);
     }
 
@@ -3187,7 +3292,12 @@ impl Workspace {
         if !self.settings.buddy_pet_visible {
             return None;
         }
-        let text = self.pet_bubble.as_ref().map(|(text, _)| text.clone())?;
+        let note = self.pet_bubble.as_ref().map(|(text, _)| text.clone());
+        let composing =
+            note.is_none() && self.settings.buddy_enabled && self.buddy_gate.is_composing();
+        if note.is_none() && !composing {
+            return None;
+        }
         const PET_W: f32 = 110.0;
         const PET_H: f32 = 100.0;
         let theme = self.theme;
@@ -3210,6 +3320,32 @@ impl Workspace {
         if space < 16.0 {
             return None;
         }
+        if note.is_none() {
+            // Composing: the buddy has seen changes and a note is on the
+            // way — animated dots stepping on the pet tick. Note and dots
+            // share one bubble surface, so the note replaces them in place.
+            let dots = ".".repeat(1 + ((self.pet_tick_count / 2) % 3) as usize);
+            let bubble = div()
+                .id("buddy-bubble")
+                .absolute()
+                .right(px(vw - right_edge))
+                .max_w(px(max_w))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .bg(rgb(theme.ui_surface))
+                .border_1()
+                .border_color(rgb(theme.ui_border))
+                .text_size(px(11.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child(SharedString::from(dots));
+            return Some(if above {
+                bubble.bottom(px(vh - y + 6.0)).into_any_element()
+            } else {
+                bubble.top(px(y + PET_H + 6.0)).into_any_element()
+            });
+        }
+        let text = note.expect("note present past the composing branch");
         let bubble = div()
             .id("buddy-bubble")
             .absolute()
