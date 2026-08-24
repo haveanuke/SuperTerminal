@@ -82,6 +82,17 @@ pub struct TerminalPane {
     /// glyphs whose advance matches their grid span. Cleared when metrics
     /// change.
     advance_cache: std::collections::HashMap<(char, bool, bool), f32>,
+    /// Cell metrics are valid for the current family + size; render skips
+    /// the per-frame probe shaping until appearance changes invalidate it.
+    metrics_measured: bool,
+    /// The terminal grid may differ from `snapshot`: PTY output arrived
+    /// (pump sets this on dirty) or search state was mutated directly.
+    /// Together with `has_pending_ops` this is the ONLY reason render
+    /// re-syncs — blink/focus frames reuse the snapshot untouched.
+    snapshot_stale: bool,
+    /// The snapshot changed (or metrics did) since the last glyph-advance
+    /// scan; blink/selection frames skip the full-grid walk.
+    advance_scan_pending: bool,
     selecting: bool,
     /// Live pointer position (window coords) during a selection drag; the
     /// pump auto-scrolls while it sits past the pane's vertical edge.
@@ -275,6 +286,7 @@ impl TerminalPane {
                     let dirty = pane.session.as_ref().is_some_and(|s| s.take_dirty());
                     if dirty {
                         pane.last_activity = std::time::Instant::now();
+                        pane.snapshot_stale = true;
                         pane.process_events(cx);
                         cx.notify();
                     }
@@ -288,6 +300,8 @@ impl TerminalPane {
                                 let (display, live) = session.sync_and_snapshot_with_live();
                                 pane.snapshot = display;
                                 pane.snapshot_fresh = true;
+                                pane.snapshot_stale = false;
+                                pane.advance_scan_pending = true;
                                 // The phone mirrors the LIVE screen, never
                                 // the Mac's scrollback viewport.
                                 let published = live.unwrap_or_else(|| pane.snapshot.clone());
@@ -341,6 +355,9 @@ impl TerminalPane {
             cell_width,
             line_height,
             advance_cache: std::collections::HashMap::new(),
+            metrics_measured: false,
+            advance_scan_pending: true,
+            snapshot_stale: true,
             selecting: false,
             drag_position: None,
             drag_scroll_tick: 0,
@@ -380,6 +397,8 @@ impl TerminalPane {
         self.resolved_family = None; // re-resolve on next render
         self.font_size = font_size;
         self.advance_cache.clear();
+        self.metrics_measured = false;
+        self.advance_scan_pending = true;
         cx.notify();
     }
 
@@ -498,6 +517,9 @@ impl TerminalPane {
         if let Some(session) = self.session.as_mut() {
             session.set_search(needle);
         }
+        // Search mutates the session directly (no queued op); the next
+        // render must re-sync to surface the new matches.
+        self.snapshot_stale = true;
         cx.notify();
     }
 
@@ -505,6 +527,7 @@ impl TerminalPane {
         if let Some(session) = self.session.as_mut() {
             session.search_jump_next();
         }
+        self.snapshot_stale = true;
         cx.notify();
     }
 
@@ -537,6 +560,11 @@ impl TerminalPane {
     }
 
     fn measure_cell(&mut self, window: &mut Window, cx: &mut App) {
+        // Metrics only move when appearance does; shaping the probe every
+        // frame (render runs on each blink/output notify) is pure waste.
+        if self.metrics_measured && self.resolved_family.is_some() {
+            return;
+        }
         // Pick the first INSTALLED family from the fallback chain that is
         // actually MONOSPACE, then measure by shaping through the same
         // pipeline that renders rows — measuring a different font than the
@@ -575,8 +603,12 @@ impl TerminalPane {
             let measured = shaped.width / 10.0;
             if measured != self.cell_width {
                 self.advance_cache.clear();
+                self.advance_scan_pending = true;
             }
             self.cell_width = measured;
+            // Only a positive measurement is worth caching — a zero-width
+            // probe (text system not ready) must retry next frame.
+            self.metrics_measured = true;
         }
         self.line_height = px((self.font_size * 1.4).round());
         let _ = cx;
@@ -983,10 +1015,16 @@ impl Render for TerminalPane {
             // With the companion publishing, the pump may have synced this
             // frame already; re-syncing is only needed for queued UI ops
             // (resize/scroll/selection must apply before paint).
-            if !self.snapshot_fresh || session.has_pending_ops() {
+            // Queued UI ops always force a sync (they may arrive after the
+            // pump's publish). Otherwise sync only when the grid actually
+            // changed since the snapshot was taken — blink and focus frames
+            // reuse it, skipping the full grid copy AND the advance scan.
+            if session.has_pending_ops() || (!self.snapshot_fresh && self.snapshot_stale) {
                 self.snapshot = session.sync_and_snapshot();
+                self.advance_scan_pending = true;
             }
             self.snapshot_fresh = false;
+            self.snapshot_stale = false;
         }
 
         let theme = self.theme;
@@ -995,16 +1033,21 @@ impl Render for TerminalPane {
         // Measure any new non-ASCII glyphs on screen against the resolved
         // family: the coalescer only trusts a glyph whose shaped advance
         // matches its grid span, so fallback glyphs pin to their own column.
+        // Only when the snapshot (or metrics) changed — blink and selection
+        // frames must not pay for a full-grid walk.
         let mut unmeasured: std::collections::HashSet<(char, bool, bool)> =
             std::collections::HashSet::new();
-        for row in &self.snapshot.rows {
-            for cell in row {
-                let key = (cell.ch, cell.style.bold, cell.style.italic);
-                if !cell.ch.is_ascii()
-                    && !cell.wide_spacer
-                    && !self.advance_cache.contains_key(&key)
-                {
-                    unmeasured.insert(key);
+        if self.advance_scan_pending {
+            self.advance_scan_pending = false;
+            for row in &self.snapshot.rows {
+                for cell in row {
+                    let key = (cell.ch, cell.style.bold, cell.style.italic);
+                    if !cell.ch.is_ascii()
+                        && !cell.wide_spacer
+                        && !self.advance_cache.contains_key(&key)
+                    {
+                        unmeasured.insert(key);
+                    }
                 }
             }
         }

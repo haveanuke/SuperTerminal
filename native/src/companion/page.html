@@ -194,22 +194,50 @@
     }
   }
 
+  // Row-level DOM patching: one absolutely-positioned container per grid
+  // row, rebuilt only when that row's runs changed (compared by their JSON
+  // signature). A streaming frame usually touches a handful of rows; the
+  // rest keep their DOM nodes. Shape changes (cols/lines/font) reset all.
+  var rowEls = [], rowSigs = [], gridShape = "", cursorEl = null;
+  function resetGrid(snap) {
+    var grid = $("grid");
+    grid.textContent = "";
+    rowEls = []; rowSigs = [];
+    // Cursor first: spans paint over the outline, as before.
+    cursorEl = document.createElement("div");
+    cursorEl.id = "cursor";
+    cursorEl.className = "hidden";
+    grid.appendChild(cursorEl);
+    for (var r = 0; r < snap.rows.length; r++) {
+      var rowEl = document.createElement("div");
+      rowEl.style.position = "absolute";
+      rowEl.style.left = "0";
+      rowEl.style.top = r * lh + "px";
+      rowEl.style.height = lh + "px";
+      grid.appendChild(rowEl);
+      rowEls.push(rowEl); rowSigs.push("");
+    }
+  }
   function render(snap) {
     lastSnap = snap;
     var grid = $("grid");
-    grid.textContent = "";
-    var cursor = document.createElement("div"); cursor.id = "cursor"; cursor.className = "hidden";
-    grid.appendChild(cursor);
     if (snap.cols !== fitFor || !cw) applyFit(snap.cols);
+    if (snap.error) { grid.textContent = snap.error; gridShape = ""; return; }
     grid.style.width = snap.cols * cw + "px";
     grid.style.height = snap.lines * lh + "px";
-    if (snap.error) { grid.textContent = snap.error; return; }
+    var shape = snap.cols + "x" + snap.rows.length + "@" + lastSize;
+    if (shape !== gridShape) { gridShape = shape; resetGrid(snap); }
     snap.rows.forEach(function (runs, row) {
+      var sig = JSON.stringify(runs);
+      if (sig === rowSigs[row]) return;
+      rowSigs[row] = sig;
+      var rowEl = rowEls[row];
+      rowEl.textContent = "";
       runs.forEach(function (run) {
         var span = document.createElement("span");
         span.textContent = run.text;
         span.style.left = run.col * cw + "px";
-        span.style.top = row * lh + "px";
+        span.style.top = "0px";
         span.style.width = run.width * cw + "px";
         span.style.overflow = "hidden";
         span.style.color = run.fg;
@@ -217,22 +245,26 @@
         if (run.b) span.style.fontWeight = "700";
         if (run.i) span.style.fontStyle = "italic";
         if (run.u) span.style.textDecoration = "underline";
-        grid.appendChild(span);
+        rowEl.appendChild(span);
       });
     });
     if (snap.cursor) {
-      cursor.classList.remove("hidden");
-      cursor.style.left = snap.cursor.col * cw + "px";
-      cursor.style.top = snap.cursor.row * lh + "px";
-      cursor.style.width = cw + "px";
-      cursor.style.height = lh + "px";
+      cursorEl.classList.remove("hidden");
+      cursorEl.style.left = snap.cursor.col * cw + "px";
+      cursorEl.style.top = snap.cursor.row * lh + "px";
+      cursorEl.style.width = cw + "px";
+      cursorEl.style.height = lh + "px";
+    } else {
+      cursorEl.classList.add("hidden");
     }
     follow();
   }
 
+  var lastFrame = "";
   function open(session) {
     current = session;
     fitFor = 0; // re-fit: viewport may have rotated since the last view
+    lastFrame = "";
     $("termtitle").textContent = session.label;
     $("list").classList.add("hidden");
     $("term").classList.remove("hidden");
@@ -251,7 +283,11 @@
         }
       }).catch(function () {});
     };
-    source.onmessage = function (event) { try { render(JSON.parse(event.data)); } catch (e) {} };
+    source.onmessage = function (event) {
+      if (event.data === lastFrame) return; // reconnect can replay a frame
+      lastFrame = event.data;
+      try { render(JSON.parse(event.data)); } catch (e) {}
+    };
   }
 
   function close() {
