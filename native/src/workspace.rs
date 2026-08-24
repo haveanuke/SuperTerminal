@@ -237,6 +237,14 @@ pub struct Workspace {
     /// on the tick (no Window), so render — which has one — completes the
     /// focus, keeping keyboard focus consistent with the visible tab.
     companion_pending_focus: Option<String>,
+    /// Phone-link flyout anchored to the rail icon.
+    companion_flyout: bool,
+    /// Transient "copied" confirmation on the flyout's copy chip. The
+    /// generation ties each clear-timer to its own copy, and advances when
+    /// the link is revoked — a stale "copied" must never vouch for a URL
+    /// that no longer works.
+    companion_copied: bool,
+    companion_copy_gen: u64,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
     /// Installed `say` voices, loaded lazily for the alerts row.
@@ -346,6 +354,9 @@ impl Workspace {
             companion_server: None,
             companion_error: None,
             companion_pending_focus: None,
+            companion_flyout: false,
+            companion_copied: false,
+            companion_copy_gen: 0,
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
@@ -960,6 +971,34 @@ impl Workspace {
         Some(format!("{}#{token}", handle.url))
     }
 
+    /// Copy the full URL (with token) for the one-time phone bookmark,
+    /// flipping the copy chip to "copied" for a beat so the click visibly
+    /// landed.
+    fn copy_companion_url(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self.companion_url() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+        self.companion_copied = true;
+        self.companion_copy_gen += 1;
+        let generation = self.companion_copy_gen;
+        cx.notify();
+        cx.spawn(async move |ws, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                // Only clear our own copy's confirmation: a newer copy (or a
+                // revocation) already moved the generation on.
+                if ws.companion_copy_gen == generation {
+                    ws.companion_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn toggle_companion(&mut self, cx: &mut Context<Self>) {
         use crate::companion::{net, server};
         if self.companion_server.is_some() {
@@ -1034,6 +1073,10 @@ impl Workspace {
     /// pane teardown that follows); the joins happen off the UI thread (a
     /// worker mid-read can take its full deadline; the UI must not wait).
     fn stop_companion(&mut self, cx: &mut Context<Self>) {
+        // The link this state vouched for is dying (stop, or a regenerate
+        // that revokes the token) — "copied" must not outlive it.
+        self.companion_copied = false;
+        self.companion_copy_gen += 1;
         for pane in self.panes.values() {
             pane.update(cx, |pane, _| pane.set_companion(None));
         }
@@ -1675,6 +1718,41 @@ impl Workspace {
                             cx,
                         ))
                         .child(div().flex_grow())
+                        .child({
+                            // Phone link: outline handset = off, filled =
+                            // companion serving. Click opens the flyout with
+                            // the link and controls; red tint = it died.
+                            let running = self.companion_server.is_some();
+                            let errored = self.companion_error.is_some();
+                            div()
+                                .id("rail-phone")
+                                .cursor_pointer()
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .rounded(px(5.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(self.companion_flyout, |d| d.bg(rgb(theme.ui_background)))
+                                .hover(|style| style.bg(rgb(theme.ui_border)))
+                                .child(crate::icons::icon(
+                                    crate::icons::Icon::Phone { filled: running },
+                                    if running {
+                                        theme.ui_accent
+                                    } else if errored {
+                                        theme.red
+                                    } else {
+                                        theme.ui_text_muted
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|ws, _, _window, cx| {
+                                        ws.companion_flyout = !ws.companion_flyout;
+                                        cx.notify();
+                                    }),
+                                )
+                        })
                         .child({
                             // Keep-awake: outline cup = released, filled =
                             // caffeinate holding (manual or auto). Click
@@ -3618,6 +3696,121 @@ impl Workspace {
         })
     }
 
+    /// Phone-link flyout, anchored next to the rail's phone icon. Gives the
+    /// link room to show in full, with an explicit copy chip — the old bar
+    /// crammed a truncated URL whose click-to-copy nobody could discover.
+    fn render_companion_flyout(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.companion_flyout {
+            return None;
+        }
+        let theme = self.theme;
+        let running = self.companion_server.is_some();
+        let copied = self.companion_copied;
+        Some(
+            div()
+                .absolute()
+                .left(px(40.0))
+                .bottom(px(34.0))
+                .w(px(320.0))
+                .p(px(10.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(theme.ui_border))
+                .bg(rgb(theme.ui_surface))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(div().text_color(rgb(theme.ui_text)).child("Phone link"))
+                        .child(div().flex_grow())
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(if running {
+                                    theme.ui_accent
+                                } else {
+                                    theme.ui_text_muted
+                                }))
+                                .child(if running { "serving" } else { "off" }),
+                        ),
+                )
+                .children(self.companion_error.clone().map(|error| {
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.red))
+                        .child(SharedString::from(error))
+                }))
+                .children(self.companion_url().map(|url| {
+                    div()
+                        .id("companion-url")
+                        .cursor_pointer()
+                        .p(px(6.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(if copied {
+                            theme.ui_accent
+                        } else {
+                            theme.ui_border
+                        }))
+                        .bg(rgb(theme.ui_background))
+                        .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.ui_text))
+                        .child(SharedString::from(url))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|ws, _, _window, cx| {
+                                ws.copy_companion_url(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                }))
+                .children(running.then(|| {
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.ui_text_muted))
+                        .child("Open on your phone (same tailnet); bookmark it once.")
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .children(running.then(|| {
+                            self.chip_button(
+                                if copied { "copied" } else { "copy link" },
+                                copied,
+                                |ws, _window, cx| ws.copy_companion_url(cx),
+                                cx,
+                            )
+                        }))
+                        .children(running.then(|| {
+                            self.chip_button(
+                                "new link",
+                                false,
+                                |ws, _window, cx| ws.regenerate_companion_token(cx),
+                                cx,
+                            )
+                        }))
+                        .child(div().flex_grow())
+                        .child(self.chip_button(
+                            if running { "stop" } else { "start" },
+                            false,
+                            |ws, _window, cx| ws.toggle_companion(cx),
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         div()
@@ -3669,68 +3862,6 @@ impl Workspace {
                     }),
             )
             .children(self.render_focused_controls(cx))
-            .children(self.companion_error.clone().map(|error| {
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(theme.ui_text_muted))
-                    .child(SharedString::from(error))
-            }))
-            .children(self.companion_server.as_ref().map(|_| {
-                self.chip_button(
-                    "new link",
-                    false,
-                    |ws, _window, cx| ws.regenerate_companion_token(cx),
-                    cx,
-                )
-            }))
-            .children(self.companion_url().map(|url| {
-                div()
-                    .id("companion-url")
-                    .cursor_pointer()
-                    .max_w(px(260.0))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_size(px(10.0))
-                    .text_color(rgb(theme.ui_text_muted))
-                    .child(SharedString::from(url.clone()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_ws, _, _window, cx| {
-                            // Click copies the full URL (with token) for the
-                            // one-time phone bookmark.
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
-                            cx.stop_propagation();
-                        }),
-                    )
-            }))
-            .child({
-                let enabled = self.companion_server.is_some();
-                let theme = self.theme;
-                div()
-                    .id("companion-toggle")
-                    .cursor_pointer()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(3.0))
-                    .bg(rgb(if enabled {
-                        theme.ui_accent
-                    } else {
-                        theme.ui_surface
-                    }))
-                    .text_color(rgb(if enabled {
-                        theme.ui_background
-                    } else {
-                        theme.ui_text_muted
-                    }))
-                    .child("phone")
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|ws, _, _window, cx| {
-                            ws.toggle_companion(cx);
-                        }),
-                    )
-            })
             .child({
                 let enabled = self.broadcast.is_enabled();
                 let theme = self.theme;
@@ -4623,8 +4754,13 @@ impl Render for Workspace {
             .children(background_layer)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|ws, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" && ws.overlay != Overlay::None {
-                    ws.close_overlay(window, cx);
+                if event.keystroke.key == "escape" {
+                    if ws.overlay != Overlay::None {
+                        ws.close_overlay(window, cx);
+                    } else if ws.companion_flyout {
+                        ws.companion_flyout = false;
+                        cx.notify();
+                    }
                 }
             }))
             .on_action(cx.listener(|ws, _: &NewTab, window, cx| {
@@ -4813,6 +4949,7 @@ impl Render for Workspace {
                     .children(self.file_viewer.clone()),
             )
             .child(self.render_bar(cx))
+            .children(self.render_companion_flyout(cx))
             .children(self.render_pet(window, cx))
             .children(self.render_pet_bubble(window, cx))
             .children(self.render_overlay(window, cx))

@@ -14,6 +14,8 @@ pub enum Icon {
     Files,
     /// Cup with handle and steam; filled body = keep-awake is holding.
     Coffee { filled: bool },
+    /// Handset outline with a home strip; filled body = companion serving.
+    Phone { filled: bool },
 }
 
 pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
@@ -74,6 +76,18 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                     line(window, 11.0, 7.5, 13.5, 8.25);
                     line(window, 13.5, 8.25, 13.5, 10.75);
                     line(window, 13.5, 10.75, 11.0, 11.5);
+                }
+                Icon::Phone { filled } => {
+                    if filled {
+                        quad(window, 4.0, 2.0, 8.0, 12.0);
+                    } else {
+                        line(window, 4.0, 2.0, 4.0, 14.0);
+                        line(window, 12.0, 2.0, 12.0, 14.0);
+                        line(window, 4.0, 2.0, 12.0, 2.0);
+                        line(window, 4.0, 14.0, 12.0, 14.0);
+                        // Home strip near the bottom edge.
+                        line(window, 6.5, 12.0, 9.5, 12.0);
+                    }
                 }
             }
         },
