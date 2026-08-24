@@ -171,6 +171,8 @@ pub struct RenderableSnapshot {
     /// Cells covered by the active selection, as (col, viewport_row) pairs.
     pub selection: Vec<(usize, usize)>,
     pub app_cursor_mode: bool,
+    /// DECSET 2004: the foreground app wants pastes framed in ESC[200~/201~.
+    pub bracketed_paste: bool,
     pub mouse_tracking: bool,
     /// True while the alternate screen buffer is active (vim, htop, ...).
     pub alt_screen: bool,
@@ -671,6 +673,7 @@ impl TermSession {
                 display_offset,
                 selection: selection_cells,
                 app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
+                bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
                 mouse_tracking: mode.intersects(TermMode::MOUSE_MODE),
                 alt_screen: mode.contains(TermMode::ALT_SCREEN),
                 focused_title: self.title.clone(),
@@ -736,6 +739,7 @@ impl TermSession {
                     display_offset: 0,
                     selection: Vec::new(),
                     app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
+                    bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
                     mouse_tracking: mode.intersects(TermMode::MOUSE_MODE),
                     alt_screen: mode.contains(TermMode::ALT_SCREEN),
                     focused_title: self.title.clone(),

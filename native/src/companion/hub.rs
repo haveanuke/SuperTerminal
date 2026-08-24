@@ -180,6 +180,17 @@ impl<S: Clone> CompanionHub<S> {
             .unwrap_or(false)
     }
 
+    /// Latest snapshot's bracketed-paste mode (text framing).
+    pub fn bracketed_paste(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|e| e.snapshot.as_ref())
+            .map(|s| s.bracketed_paste)
+            .unwrap_or(false)
+    }
+
     /// Queue one phone-requested terminal spawn; false when the pending cap
     /// is reached (the server answers 429).
     pub fn request_spawn(&self) -> bool {
@@ -249,6 +260,7 @@ mod tests {
             display_offset: 0,
             selection: Vec::new(),
             app_cursor_mode: false,
+            bracketed_paste: false,
             mouse_tracking: false,
             alt_screen: false,
             focused_title: None,
@@ -362,5 +374,15 @@ mod tests {
         snap.app_cursor_mode = true;
         hub.publish_snapshot("t1", Arc::new(snap));
         assert!(hub.app_cursor("t1"));
+    }
+
+    #[test]
+    fn bracketed_paste_follows_latest_snapshot() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert!(!hub.bracketed_paste("t1"));
+        let mut snap = (*snapshot("a")).clone();
+        snap.bracketed_paste = true;
+        hub.publish_snapshot("t1", Arc::new(snap));
+        assert!(hub.bracketed_paste("t1"));
     }
 }

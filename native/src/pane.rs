@@ -330,6 +330,7 @@ impl TerminalPane {
             display_offset: 0,
             selection: Vec::new(),
             app_cursor_mode: false,
+            bracketed_paste: false,
             mouse_tracking: false,
             alt_screen: false,
             focused_title: None,

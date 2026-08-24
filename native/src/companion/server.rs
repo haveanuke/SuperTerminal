@@ -23,7 +23,7 @@ use crate::themes::Theme;
 use super::auth::token_matches;
 use super::http::{parse_request, Method, ParseError, Request};
 use super::hub::CompanionHub;
-use super::input::{parse_body, symbolic_bytes, InputMsg};
+use super::input::{parse_body, symbolic_bytes, text_bytes, InputMsg};
 
 pub const MAX_CONNS: usize = 8;
 pub const MAX_SSE: usize = 4;
@@ -308,7 +308,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 return;
             };
             let bytes = match message {
-                InputMsg::Text(text) => text.into_bytes(),
+                InputMsg::Text(text) => text_bytes(&text, shared.hub.bracketed_paste(&id)),
                 InputMsg::Key(key) => match symbolic_bytes(&key, shared.hub.app_cursor(&id)) {
                     Some(bytes) => bytes,
                     None => {
@@ -467,6 +467,11 @@ mod tests {
         let hub = Arc::new(TestHub::new());
         let (tx, rx) = mpsc::channel();
         hub.register("t1", "work", tx);
+        hub.publish_snapshot("t1", Arc::new(seeded_snapshot(app_cursor)));
+        (hub, rx)
+    }
+
+    fn seeded_snapshot(app_cursor: bool) -> crate::term_session::RenderableSnapshot {
         let mut snapshot = crate::term_session::RenderableSnapshot {
             cols: 5,
             lines: 1,
@@ -495,6 +500,7 @@ mod tests {
             display_offset: 0,
             selection: Vec::new(),
             app_cursor_mode: app_cursor,
+            bracketed_paste: false,
             mouse_tracking: false,
             alt_screen: false,
             focused_title: None,
@@ -506,8 +512,7 @@ mod tests {
         snapshot.rows[0][2].ch = 'l';
         snapshot.rows[0][3].ch = 'l';
         snapshot.rows[0][4].ch = 'o';
-        hub.publish_snapshot("t1", Arc::new(snapshot));
-        (hub, rx)
+        snapshot
     }
 
     #[test]
@@ -613,6 +618,23 @@ mod tests {
     }
 
     #[test]
+    fn text_is_paste_bracketed_when_the_session_mode_is_on() {
+        let (hub, rx) = seeded_hub(false);
+        let mut snap = seeded_snapshot(false);
+        snap.bracketed_paste = true;
+        hub.publish_snapshot("t1", Arc::new(snap));
+        let handle = boot(Arc::clone(&hub));
+        let host = host_of(&handle);
+        let ok = post_input(&host, "t1", r#"{"text":"hi\r"}"#, INPUT_CONTENT_TYPE, None);
+        assert!(ok.starts_with("HTTP/1.1 204"), "{ok}");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"\x1b[200~hi\x1b[201~\r".to_vec()
+        );
+        handle.stop();
+    }
+
+    #[test]
     fn spawn_queues_with_guards_and_caps() {
         let (hub, _rx) = seeded_hub(false);
         let handle = boot(Arc::clone(&hub));
@@ -711,6 +733,7 @@ mod tests {
             display_offset: 0,
             selection: Vec::new(),
             app_cursor_mode: false,
+            bracketed_paste: false,
             mouse_tracking: false,
             alt_screen: false,
             focused_title: None,
