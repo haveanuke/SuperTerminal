@@ -426,7 +426,9 @@ impl TerminalPane {
     /// Begin teardown; the returned handle must be joined off the UI thread.
     pub fn shutdown(&mut self) -> Option<ShutdownHandle> {
         if let Some(hub) = self.companion.take() {
-            hub.unregister(&self.id);
+            // 410 for in-flight phone input; the workspace sweep removes
+            // the entry (and ends streams) on its next tick.
+            hub.retire(&self.id);
         }
         self.broadcast.members.lock().unwrap().remove(&self.id);
         self.session.take().map(TermSession::shutdown)

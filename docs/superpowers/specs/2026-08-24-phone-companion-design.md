@@ -100,6 +100,24 @@ Hand-rolled HTTP/1.1 on `std::net::TcpListener`, zero new dependencies.
 - If the bound tailnet address disappears (interface loss), the server stops
   and the toggle reflects it with a reason — never "on" while unreachable.
 
+## Amendments (implementation review, 2026-08-24)
+
+- **Selection and search highlighting stay OFF the wire** (supersedes the
+  earlier "selection resolved host-side" condition): the host's local text
+  selection is UI state of the Mac, not terminal content — mirroring it to
+  the phone adds noise and forces republish-on-mouse-move. Cells are
+  resolved for inverse/dim/hidden only; a unit test pins selection's
+  absence. Corollary: render-time-only changes (selection, host scrollback
+  browsing via display_offset) are not republished — the companion mirrors
+  live PTY output, not the host's viewport browsing.
+- **Pane closure semantics:** pane shutdown RETIRES its hub entry
+  (alive=false → input answers 410); the workspace's ~900ms sweep then
+  unregisters entries with no live pane, which ends their streams and turns
+  further input into 404.
+- **Gate order:** capability token is validated first (constant-time, 404)
+  on all protected routes; exact-Host validation second; the static page is
+  the only tokenless route and is Host-checked.
+
 ## Wire format (native, serde JSON)
 
 - `Snapshot { cols, lines, cursor: {col, row, visible}, app_cursor: bool,

@@ -71,13 +71,15 @@ struct Resolved {
 fn resolve(style: &CellStyle, theme: &Theme) -> (Resolved, bool) {
     let mut fg = resolve_color(style.fg, theme).unwrap_or(theme.foreground);
     let mut bg = resolve_color(style.bg, theme);
-    if style.dim {
-        fg = halve_channels(fg);
-    }
+    // Inverse BEFORE dim, matching the native renderer — a dim+inverse cell
+    // must dim the swapped foreground, not the original one.
     if style.inverse {
         let old_fg = fg;
         fg = bg.unwrap_or(theme.background);
         bg = Some(old_fg);
+    }
+    if style.dim {
+        fg = halve_channels(fg);
     }
     let mut blank = false;
     if style.hidden {
@@ -114,7 +116,12 @@ pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireS
                 continue;
             }
             let (resolved, blank) = resolve(&cell.style, theme);
-            let ch = if blank { ' ' } else { cell.ch };
+            // NUL cells render as spaces, exactly like the native renderer.
+            let ch = if blank || cell.ch == '\0' {
+                ' '
+            } else {
+                cell.ch
+            };
             match current.as_mut() {
                 Some((style, _, text, width)) if *style == resolved => {
                     text.push(ch);
@@ -262,6 +269,29 @@ mod tests {
         // Hidden: blank text, fg equals resolved background.
         assert_eq!(runs[1].text, " ");
         assert_eq!(runs[1].fg, hex(theme().background));
+    }
+
+    #[test]
+    fn dim_plus_inverse_dims_the_swapped_foreground() {
+        // Native order (pane.rs): inverse first, THEN dim — the dim applies
+        // to the swapped foreground (old background), not the original.
+        let mut both = style();
+        both.inverse = true;
+        both.dim = true;
+        let s = snap(vec![vec![cell('x', both)]]);
+        let wire = serialize_snapshot(&s, theme());
+        let run = &wire.rows[0][0];
+        let f = theme().background;
+        let halved = ((f >> 16 & 0xff) / 2) << 16 | ((f >> 8 & 0xff) / 2) << 8 | ((f & 0xff) / 2);
+        assert_eq!(run.fg, hex(halved));
+        assert_eq!(run.bg, Some(hex(theme().foreground)));
+    }
+
+    #[test]
+    fn nul_cells_render_as_spaces() {
+        let s = snap(vec![vec![cell('\0', style()), cell('b', style())]]);
+        let wire = serialize_snapshot(&s, theme());
+        assert_eq!(wire.rows[0][0].text, " b");
     }
 
     #[test]

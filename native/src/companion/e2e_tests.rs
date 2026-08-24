@@ -117,10 +117,23 @@ fn phone_input_round_trips_to_sse_snapshot() {
     }
     assert!(seen, "E2E_OK never arrived over SSE");
 
-    // A dead session answers 410.
-    hub.set_meta("t1", "e2e", false, false);
+    // Pane closure path: retire flips input to 410 while the entry lives...
+    hub.retire("t1");
     let gone = post_text(&host, "t1", "x");
     assert!(gone.starts_with("HTTP/1.1 410"), "{gone}");
+    // ...and the workspace sweep's unregister ends the live stream: the SSE
+    // reader thread sees EOF and drops its channel sender.
+    hub.unregister("t1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match frames_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(_) => continue, // drain frames already in flight
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                assert!(Instant::now() < deadline, "stream never terminated");
+            }
+        }
+    }
 
     handle.stop();
     session

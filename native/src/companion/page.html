@@ -82,7 +82,12 @@
 
   function refreshSessions() {
     fetch(api("/sessions"), { headers: { "X-Companion-Token": token } })
-      .then(function (r) { if (!r.ok) throw 0; $("listdot").classList.add("on"); return r.json(); })
+      .then(function (r) {
+        if (r.status === 404) { $("badlink").classList.remove("hidden"); $("list").classList.add("hidden"); throw 0; }
+        if (!r.ok) throw 0;
+        $("listdot").classList.add("on");
+        return r.json();
+      })
       .then(function (sessions) {
         var list = $("sessions"); list.textContent = "";
         $("empty").classList.toggle("hidden", sessions.length > 0);
@@ -127,6 +132,8 @@
         span.textContent = run.text;
         span.style.left = run.col * cw + "px";
         span.style.top = row * lh + "px";
+        span.style.width = run.width * cw + "px";
+        span.style.overflow = "hidden";
         span.style.color = run.fg;
         if (run.bg) { span.style.background = run.bg; span.style.height = lh + "px"; }
         if (run.b) span.style.fontWeight = "700";

@@ -76,6 +76,20 @@ impl<S: Clone> CompanionHub<S> {
         );
     }
 
+    /// Pane closed: flip alive=false so input answers 410 (Gone), keeping
+    /// the entry until the workspace's next metadata sweep removes it.
+    pub fn retire(&self, id: &str) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
+            entry.info.alive = false;
+        }
+    }
+
+    /// All registered ids (the workspace sweep prunes ones whose pane is
+    /// gone).
+    pub fn ids(&self) -> Vec<String> {
+        self.inner.lock().unwrap().keys().cloned().collect()
+    }
+
     pub fn unregister(&self, id: &str) {
         self.inner.lock().unwrap().remove(id);
         self.cache.lock().unwrap().remove(id);

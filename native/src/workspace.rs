@@ -626,6 +626,13 @@ impl Workspace {
                     let busy = pane.read(cx).foreground_busy();
                     hub.set_meta(id, &label, true, busy);
                 }
+                // Prune entries whose pane is gone: their streams end and
+                // further input turns 404 (they answered 410 since retire).
+                for id in hub.ids() {
+                    if !self.panes.contains_key(&id) {
+                        hub.unregister(&id);
+                    }
+                }
                 // The bound address disappearing (Tailscale off) must never
                 // leave the toggle claiming "on".
                 let bound_ip = handle
@@ -1007,16 +1014,33 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Detach panes, then cancel+join the server OFF the UI thread (a worker
-    /// mid-read can take its full deadline; the UI must not wait on it).
+    /// Cancellation is flipped SYNCHRONOUSLY (streams start dying before any
+    /// pane teardown that follows); the joins happen off the UI thread (a
+    /// worker mid-read can take its full deadline; the UI must not wait).
     fn stop_companion(&mut self, cx: &mut Context<Self>) {
         for pane in self.panes.values() {
             pane.update(cx, |pane, _| pane.set_companion(None));
         }
         self.companion_hub = None;
         if let Some(handle) = self.companion_server.take() {
+            handle.cancel();
             std::thread::spawn(move || handle.stop());
         }
+    }
+
+    /// Regenerate the capability token: old bookmarks die, the server
+    /// restarts with the new link.
+    fn regenerate_companion_token(&mut self, cx: &mut Context<Self>) {
+        let was_running = self.companion_server.is_some();
+        if was_running {
+            self.stop_companion(cx);
+        }
+        self.settings.companion_token = Some(crate::companion::auth::generate_token());
+        let _ = self.settings.save();
+        if was_running {
+            self.toggle_companion(cx);
+        }
+        cx.notify();
     }
 
     /// Collect shutdown handles for every live pane plus any pending ones.
@@ -3634,6 +3658,14 @@ impl Workspace {
                     .text_size(px(10.0))
                     .text_color(rgb(theme.ui_text_muted))
                     .child(SharedString::from(error))
+            }))
+            .children(self.companion_server.as_ref().map(|_| {
+                self.chip_button(
+                    "new link",
+                    false,
+                    |ws, _window, cx| ws.regenerate_companion_token(cx),
+                    cx,
+                )
             }))
             .children(self.companion_url().map(|url| {
                 div()

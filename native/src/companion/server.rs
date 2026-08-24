@@ -63,6 +63,14 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Flip cancellation and unblock the acceptor WITHOUT joining — cheap
+    /// enough for the UI thread, so streams start dying before pane
+    /// teardown even though the joins happen elsewhere.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+    }
+
     /// Stop accepting, cancel streams, join everything. Bounded: SSE loops
     /// observe the flag within one poll; readers hit their deadlines.
     pub fn stop(mut self) {
@@ -200,12 +208,21 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             return;
         }
     };
-    // Exact Host first: a rebound DNS name never gets further.
-    if request.header("host") != Some(shared.host.as_str()) {
+    let path = request.path.clone();
+    let host_ok = request.header("host") == Some(shared.host.as_str());
+    // Token FIRST on protected routes (constant-time; a bad token learns
+    // nothing, not even that the Host was wrong), then exact Host closes
+    // DNS rebinding. The static page is the one tokenless route.
+    if !(request.method == Method::Get && path == "/")
+        && !token_matches(&shared.token, token_of(&request))
+    {
+        let _ = respond(&stream, "404 Not Found", &[], b"");
+        return;
+    }
+    if !host_ok {
         let _ = respond(&stream, "400 Bad Request", &[], b"");
         return;
     }
-    let path = request.path.clone();
     match (request.method, path.as_str()) {
         (Method::Get, "/") => {
             let _ = respond(
@@ -216,10 +233,6 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             );
         }
         (Method::Get, "/sessions") => {
-            if !token_matches(&shared.token, token_of(&request)) {
-                let _ = respond(&stream, "404 Not Found", &[], b"");
-                return;
-            }
             let sessions = shared.hub.sessions();
             let json = serde_json::to_string(
                 &sessions
@@ -240,28 +253,26 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             );
         }
         (Method::Get, _) if path.starts_with("/stream/") => {
-            if !token_matches(&shared.token, token_of(&request)) {
-                let _ = respond(&stream, "404 Not Found", &[], b"");
-                return;
-            }
             let id = path["/stream/".len()..].to_string();
             if shared.hub.revision(&id).is_none() {
                 let _ = respond(&stream, "404 Not Found", &[], b"");
                 return;
             }
-            if shared.sse.load(Ordering::Acquire) >= MAX_SSE {
+            // CAS admission: concurrent connects must not overshoot the cap.
+            let admitted = shared
+                .sse
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_SSE).then_some(n + 1)
+                })
+                .is_ok();
+            if !admitted {
                 let _ = respond(&stream, "503 Service Unavailable", &[], b"");
                 return;
             }
-            shared.sse.fetch_add(1, Ordering::AcqRel);
             serve_stream(shared, &stream, &id);
             shared.sse.fetch_sub(1, Ordering::AcqRel);
         }
         (Method::Post, _) if path.starts_with("/input/") => {
-            if !token_matches(&shared.token, token_of(&request)) {
-                let _ = respond(&stream, "404 Not Found", &[], b"");
-                return;
-            }
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
                 if origin != our_origin {
