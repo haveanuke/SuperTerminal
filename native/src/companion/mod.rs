@@ -7,5 +7,6 @@
 //! membership authenticates devices, the token authenticates the page.
 
 pub mod auth;
+pub mod http;
 pub mod net;
 pub mod wire;
