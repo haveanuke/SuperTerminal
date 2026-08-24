@@ -233,6 +233,10 @@ pub struct Workspace {
     companion_hub: Option<Arc<crate::companion::hub::Hub>>,
     companion_server: Option<crate::companion::server::ServerHandle>,
     companion_error: Option<String>,
+    /// Terminal awaiting a window-aware focus handoff: phone spawns happen
+    /// on the tick (no Window), so render — which has one — completes the
+    /// focus, keeping keyboard focus consistent with the visible tab.
+    companion_pending_focus: Option<String>,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
     /// Installed `say` voices, loaded lazily for the alerts row.
@@ -341,6 +345,7 @@ impl Workspace {
             companion_hub: None,
             companion_server: None,
             companion_error: None,
+            companion_pending_focus: None,
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
@@ -610,6 +615,9 @@ impl Workspace {
         if let Some(hub) = self.companion_hub.clone() {
             for _ in 0..hub.take_spawns() {
                 self.add_tab(None, cx);
+                // add_tab set the logical focus; the gpui FocusHandle needs
+                // a Window, which the next render supplies.
+                self.companion_pending_focus = self.focused_terminal.clone();
             }
         }
         if self.pet_tick_count.is_multiple_of(3) {
@@ -4556,6 +4564,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(id) = self.companion_pending_focus.take() {
+            self.focus_terminal_by_id(&id, window, cx);
+        }
         let theme = self.theme;
         let active_tree = self
             .tabs
