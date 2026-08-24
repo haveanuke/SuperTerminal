@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod http;
+pub mod hub;
 pub mod input;
 pub mod net;
 pub mod wire;

@@ -1,0 +1,316 @@
+//! The companion hub: shared observer state between panes (publishers), the
+//! workspace (metadata owner), and the server (reader).
+//!
+//! Lock discipline (binding): the `inner` mutex only guards map access and
+//! `Arc` swaps. Serialization happens OUTSIDE it (snapshot Arc + revision are
+//! cloned out first) and is memoized per revision under the separate `cache`
+//! mutex. Input senders are cloned out under the lock and used after release.
+//! Nothing here performs socket I/O or process probes.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::term_session::RenderableSnapshot;
+use crate::themes::Theme;
+
+use super::wire::serialize_snapshot;
+
+/// Serialized snapshots above this are replaced by an error event (the page
+/// shows "grid too large" instead of the stream stalling).
+pub const MAX_SERIALIZED: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfo {
+    pub id: String,
+    pub label: String,
+    pub alive: bool,
+    pub busy: bool,
+}
+
+struct Published<S> {
+    snapshot: Option<Arc<RenderableSnapshot>>,
+    revision: u64,
+    info: SessionInfo,
+    sender: S,
+}
+
+pub struct CompanionHub<S: Clone> {
+    inner: Mutex<HashMap<String, Published<S>>>,
+    /// Bumped when the server (re)starts: panes compare against their own
+    /// counter and publish even without fresh output, populating idle grids.
+    pub generation: AtomicU64,
+    cache: Mutex<HashMap<String, (u64, Arc<String>)>>,
+}
+
+impl<S: Clone> Default for CompanionHub<S> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(1),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<S: Clone> CompanionHub<S> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, id: &str, label: &str, sender: S) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.insert(
+            id.to_string(),
+            Published {
+                snapshot: None,
+                revision: 0,
+                info: SessionInfo {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    alive: true,
+                    busy: false,
+                },
+                sender,
+            },
+        );
+    }
+
+    pub fn unregister(&self, id: &str) {
+        self.inner.lock().unwrap().remove(id);
+        self.cache.lock().unwrap().remove(id);
+    }
+
+    pub fn publish_snapshot(&self, id: &str, snapshot: Arc<RenderableSnapshot>) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
+            entry.snapshot = Some(snapshot);
+            entry.revision += 1;
+        }
+    }
+
+    /// No-op for unknown ids (metadata refresh racing an unregister).
+    pub fn set_meta(&self, id: &str, label: &str, alive: bool, busy: bool) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
+            entry.info.label = label.to_string();
+            entry.info.alive = alive;
+            entry.info.busy = busy;
+        }
+    }
+
+    pub fn sessions(&self) -> Vec<SessionInfo> {
+        let mut list: Vec<SessionInfo> = self
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .map(|entry| entry.info.clone())
+            .collect();
+        list.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
+        list
+    }
+
+    pub fn revision(&self, id: &str) -> Option<u64> {
+        self.inner.lock().unwrap().get(id).map(|e| e.revision)
+    }
+
+    /// Latest serialized snapshot with its revision; memoized so N phones
+    /// never re-serialize the same grid. None until first publish.
+    pub fn snapshot_json(&self, id: &str, theme: &Theme) -> Option<(u64, Arc<String>)> {
+        let (snapshot, revision) = {
+            let inner = self.inner.lock().unwrap();
+            let entry = inner.get(id)?;
+            (entry.snapshot.clone()?, entry.revision)
+        };
+        if let Some((cached_rev, json)) = self.cache.lock().unwrap().get(id) {
+            if *cached_rev == revision {
+                return Some((revision, Arc::clone(json)));
+            }
+        }
+        let wire = serialize_snapshot(&snapshot, theme);
+        let json = serde_json::to_string(&wire).unwrap_or_default();
+        let json = if json.len() > MAX_SERIALIZED {
+            Arc::new(String::from(r#"{"error":"grid too large"}"#))
+        } else {
+            Arc::new(json)
+        };
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), (revision, Arc::clone(&json)));
+        Some((revision, json))
+    }
+
+    /// (alive, cloned sender) — callers send AFTER the lock is released.
+    pub fn input_sender(&self, id: &str) -> Option<(bool, S)> {
+        let inner = self.inner.lock().unwrap();
+        let entry = inner.get(id)?;
+        Some((entry.info.alive, entry.sender.clone()))
+    }
+
+    /// Latest snapshot's app-cursor mode (arrow translation).
+    pub fn app_cursor(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|e| e.snapshot.as_ref())
+            .map(|s| s.app_cursor_mode)
+            .unwrap_or(false)
+    }
+
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The concrete hub the app uses (panes hand their PTY input senders in).
+pub type Hub = CompanionHub<alacritty_terminal::event_loop::EventLoopSender>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term_session::{CursorStyle, SnapshotCursor};
+
+    type TestHub = CompanionHub<std::sync::mpsc::Sender<Vec<u8>>>;
+
+    fn hub_with(id: &str, label: &str) -> (TestHub, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let hub = TestHub::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        hub.register(id, label, tx);
+        (hub, rx)
+    }
+
+    fn snapshot(text: &str) -> Arc<RenderableSnapshot> {
+        use crate::term_session::{CellColor, CellStyle, SnapshotCell};
+        let row = text
+            .chars()
+            .map(|ch| SnapshotCell {
+                ch,
+                style: CellStyle {
+                    fg: CellColor::Default,
+                    bg: CellColor::Default,
+                    bold: false,
+                    italic: false,
+                    dim: false,
+                    underline: false,
+                    inverse: false,
+                    hidden: false,
+                },
+                wide_spacer: false,
+            })
+            .collect::<Vec<_>>();
+        Arc::new(RenderableSnapshot {
+            cols: text.chars().count(),
+            lines: 1,
+            rows: vec![row],
+            cursor: SnapshotCursor {
+                col: 0,
+                row: Some(0),
+                style: CursorStyle::Block,
+            },
+            display_offset: 0,
+            selection: Vec::new(),
+            app_cursor_mode: false,
+            mouse_tracking: false,
+            alt_screen: false,
+            focused_title: None,
+            exited: None,
+            selection_text: None,
+            search_matches: Vec::new(),
+        })
+    }
+
+    fn theme() -> &'static Theme {
+        crate::themes::default_theme()
+    }
+
+    #[test]
+    fn publish_bumps_revision() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert_eq!(hub.revision("t1"), Some(0));
+        hub.publish_snapshot("t1", snapshot("a"));
+        assert_eq!(hub.revision("t1"), Some(1));
+        hub.publish_snapshot("t1", snapshot("b"));
+        assert_eq!(hub.revision("t1"), Some(2));
+    }
+
+    #[test]
+    fn snapshot_json_memoizes_by_revision() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert!(hub.snapshot_json("t1", theme()).is_none(), "no publish yet");
+        hub.publish_snapshot("t1", snapshot("hello"));
+        let (rev_a, json_a) = hub.snapshot_json("t1", theme()).unwrap();
+        let (rev_b, json_b) = hub.snapshot_json("t1", theme()).unwrap();
+        assert_eq!(rev_a, rev_b);
+        assert!(
+            Arc::ptr_eq(&json_a, &json_b),
+            "same revision reuses the Arc"
+        );
+        hub.publish_snapshot("t1", snapshot("world"));
+        let (rev_c, json_c) = hub.snapshot_json("t1", theme()).unwrap();
+        assert_ne!(rev_a, rev_c);
+        assert!(json_c.contains("world"));
+    }
+
+    #[test]
+    fn unregister_removes_session_and_cache() {
+        let (hub, _rx) = hub_with("t1", "work");
+        hub.publish_snapshot("t1", snapshot("x"));
+        let _ = hub.snapshot_json("t1", theme());
+        hub.unregister("t1");
+        assert!(hub.sessions().is_empty());
+        assert!(hub.snapshot_json("t1", theme()).is_none());
+        assert!(hub.input_sender("t1").is_none());
+    }
+
+    #[test]
+    fn set_meta_on_missing_id_is_noop() {
+        let hub = TestHub::new();
+        hub.set_meta("ghost", "label", true, true);
+        assert!(hub.sessions().is_empty());
+    }
+
+    #[test]
+    fn sessions_sorted_by_label_then_id() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register("t2", "beta", tx.clone());
+        hub.register("t3", "alpha", tx.clone());
+        hub.register("t1", "beta", tx);
+        let order: Vec<(String, String)> = hub
+            .sessions()
+            .into_iter()
+            .map(|s| (s.label, s.id))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("alpha".to_string(), "t3".to_string()),
+                ("beta".to_string(), "t1".to_string()),
+                ("beta".to_string(), "t2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn input_sender_reflects_alive_and_delivers_after_release() {
+        let (hub, rx) = hub_with("t1", "work");
+        let (alive, sender) = hub.input_sender("t1").unwrap();
+        assert!(alive);
+        sender.send(b"hi".to_vec()).unwrap();
+        assert_eq!(rx.recv().unwrap(), b"hi");
+        hub.set_meta("t1", "work", false, false);
+        let (alive, _) = hub.input_sender("t1").unwrap();
+        assert!(!alive);
+    }
+
+    #[test]
+    fn app_cursor_follows_latest_snapshot() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert!(!hub.app_cursor("t1"));
+        let mut snap = (*snapshot("a")).clone();
+        snap.app_cursor_mode = true;
+        hub.publish_snapshot("t1", Arc::new(snap));
+        assert!(hub.app_cursor("t1"));
+    }
+}
