@@ -140,3 +140,61 @@ fn phone_input_round_trips_to_sse_snapshot() {
         .shutdown()
         .join_with_deadline(Duration::from_secs(5));
 }
+
+#[test]
+fn scrolled_back_host_still_publishes_the_live_screen() {
+    let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    // 200 tagged lines so the viewport is deep in scrollback territory.
+    session.write(b"printf 'L_%s\\n' $(seq 1 200)\r".to_vec());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut latest = None;
+    while Instant::now() < deadline {
+        if session.take_dirty() {
+            let snapshot = session.sync_and_snapshot();
+            let text: String = snapshot
+                .rows
+                .iter()
+                .flat_map(|row| row.iter().map(|cell| cell.ch))
+                .collect();
+            let done = text.contains("L_200");
+            latest = Some(text);
+            if done {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(
+        latest.as_deref().is_some_and(|text| text.contains("L_200")),
+        "output never arrived"
+    );
+
+    // Host scrolls back; the display shows history, the live copy must not.
+    session.queue_scroll(60);
+    let (display, live) = session.sync_and_snapshot_with_live();
+    assert!(display.display_offset > 0, "scrollback did not engage");
+    let display_text: String = display
+        .rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| cell.ch))
+        .collect();
+    assert!(
+        !display_text.contains("L_200"),
+        "display should be showing history"
+    );
+    let live = live.expect("scrolled-back sync must supply the live screen");
+    assert_eq!(live.display_offset, 0);
+    let live_text: String = live
+        .rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| cell.ch))
+        .collect();
+    assert!(
+        live_text.contains("L_200"),
+        "live screen must keep the latest output"
+    );
+
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}

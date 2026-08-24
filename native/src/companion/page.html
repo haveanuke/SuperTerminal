@@ -158,7 +158,19 @@
     $("term").classList.remove("hidden");
     source = new EventSource(api("/stream/" + encodeURIComponent(session.id)));
     source.onopen = function () { $("termdot").classList.add("on"); };
-    source.onerror = function () { $("termdot").classList.remove("on"); };
+    source.onerror = function () {
+      $("termdot").classList.remove("on");
+      // A revoked token ("new link") must not strand this view on stale
+      // output: probe the API and surface the bad-link state on 404.
+      fetch(api("/sessions"), { headers: { "X-Companion-Token": token } }).then(function (r) {
+        if (r.status === 404) {
+          if (source) { source.close(); source = null; }
+          $("term").classList.add("hidden");
+          $("list").classList.add("hidden");
+          $("badlink").classList.remove("hidden");
+        }
+      }).catch(function () {});
+    };
     source.onmessage = function (event) { try { render(JSON.parse(event.data)); } catch (e) {} };
   }
 

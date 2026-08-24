@@ -279,12 +279,13 @@ impl TerminalPane {
                         if dirty || generation != pane.companion_generation {
                             pane.companion_generation = generation;
                             if let Some(session) = pane.session.as_mut() {
-                                pane.snapshot = session.sync_and_snapshot();
+                                let (display, live) = session.sync_and_snapshot_with_live();
+                                pane.snapshot = display;
                                 pane.snapshot_fresh = true;
-                                hub.publish_snapshot(
-                                    &pane.id,
-                                    std::sync::Arc::new(pane.snapshot.clone()),
-                                );
+                                // The phone mirrors the LIVE screen, never
+                                // the Mac's scrollback viewport.
+                                let published = live.unwrap_or_else(|| pane.snapshot.clone());
+                                hub.publish_snapshot(&pane.id, std::sync::Arc::new(published));
                                 cx.notify();
                             }
                         }

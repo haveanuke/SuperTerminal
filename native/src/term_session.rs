@@ -519,6 +519,16 @@ impl TermSession {
 
     /// Apply all deferred ops and copy out a render snapshot under ONE lock.
     pub fn sync_and_snapshot(&mut self) -> RenderableSnapshot {
+        self.sync_and_snapshot_with_live().0
+    }
+
+    /// Same single per-frame lock as [`Self::sync_and_snapshot`]; the second
+    /// value is the LIVE screen (display offset ignored) whenever the host
+    /// is scrolled back — the phone companion publishes that, never the
+    /// Mac's scrollback viewport. None means the display IS live.
+    pub fn sync_and_snapshot_with_live(
+        &mut self,
+    ) -> (RenderableSnapshot, Option<RenderableSnapshot>) {
         let mut term = self.term.lock();
 
         for op in self.deferred.drain(..) {
@@ -610,6 +620,7 @@ impl TermSession {
                 }
             }
 
+            let cursor_raw_line = content.cursor.point.line.0;
             let cursor_line = content.cursor.point.line.0 + display_offset as i32;
             let cursor = SnapshotCursor {
                 col: content.cursor.point.column.0,
@@ -651,7 +662,8 @@ impl TermSession {
                 }
             }
 
-            RenderableSnapshot {
+            let live_cursor_style = cursor.style;
+            let display = RenderableSnapshot {
                 cols,
                 lines,
                 rows,
@@ -664,8 +676,75 @@ impl TermSession {
                 focused_title: self.title.clone(),
                 exited: self.exited,
                 selection_text,
-                search_matches,
-            }
+                search_matches: search_matches.clone(),
+            };
+            // Live screen for the companion: direct grid indexing (Line 0..
+            // lines are the live rows regardless of scrollback position).
+            let live = (display_offset > 0).then(|| {
+                let grid = term.grid();
+                let mut live_rows = vec![
+                    vec![
+                        SnapshotCell {
+                            ch: ' ',
+                            style: CellStyle {
+                                fg: CellColor::Default,
+                                bg: CellColor::Default,
+                                bold: false,
+                                italic: false,
+                                dim: false,
+                                underline: false,
+                                inverse: false,
+                                hidden: false,
+                            },
+                            wide_spacer: false,
+                        };
+                        cols
+                    ];
+                    lines
+                ];
+                for (line, live_row) in live_rows.iter_mut().enumerate() {
+                    let row = &grid[Line(line as i32)];
+                    for (col, out) in live_row.iter_mut().enumerate() {
+                        let cell = &row[Column(col)];
+                        let flags = cell.flags;
+                        *out = SnapshotCell {
+                            ch: cell.c,
+                            style: CellStyle {
+                                fg: convert_color(cell.fg),
+                                bg: convert_color(cell.bg),
+                                bold: flags.contains(Flags::BOLD),
+                                italic: flags.contains(Flags::ITALIC),
+                                dim: flags.contains(Flags::DIM),
+                                underline: flags.intersects(Flags::ALL_UNDERLINES),
+                                inverse: flags.contains(Flags::INVERSE),
+                                hidden: flags.contains(Flags::HIDDEN),
+                            },
+                            wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
+                        };
+                    }
+                }
+                RenderableSnapshot {
+                    cols,
+                    lines,
+                    rows: live_rows,
+                    cursor: SnapshotCursor {
+                        col: display.cursor.col,
+                        row: (cursor_raw_line >= 0 && (cursor_raw_line as usize) < lines)
+                            .then_some(cursor_raw_line as usize),
+                        style: live_cursor_style,
+                    },
+                    display_offset: 0,
+                    selection: Vec::new(),
+                    app_cursor_mode: mode.contains(TermMode::APP_CURSOR),
+                    mouse_tracking: mode.intersects(TermMode::MOUSE_MODE),
+                    alt_screen: mode.contains(TermMode::ALT_SCREEN),
+                    focused_title: self.title.clone(),
+                    exited: self.exited,
+                    selection_text: None,
+                    search_matches: Vec::new(),
+                }
+            });
+            (display, live)
         }
     }
 
