@@ -229,6 +229,10 @@ pub struct Workspace {
     caffeinate_child: Option<std::process::Child>,
     /// Who wants the Mac awake: manual rail toggle and/or busy terminals.
     awake: crate::awake::AwakeHold,
+    /// Phone companion: hub shared with panes while the server runs.
+    companion_hub: Option<Arc<crate::companion::hub::Hub>>,
+    companion_server: Option<crate::companion::server::ServerHandle>,
+    companion_error: Option<String>,
     /// Spawned afplay children, reaped on the poll (no zombies).
     audio_children: Vec<std::process::Child>,
     /// Installed `say` voices, loaded lazily for the alerts row.
@@ -334,6 +338,9 @@ impl Workspace {
             tts_child: None,
             caffeinate_child: None,
             awake: crate::awake::AwakeHold::default(),
+            companion_hub: None,
+            companion_server: None,
+            companion_error: None,
             audio_children: Vec::new(),
             tts_voices: None,
             tts_voices_loading: false,
@@ -596,6 +603,48 @@ impl Workspace {
         // visibility. The panels dedupe unchanged paths, so this is cheap.
         if self.pet_tick_count.is_multiple_of(3) {
             self.cue_tick(cx);
+        }
+        if self.pet_tick_count.is_multiple_of(3) {
+            if let (Some(hub), Some(handle)) = (&self.companion_hub, &self.companion_server) {
+                for (id, pane) in &self.panes {
+                    let label = {
+                        // Label lookup needs &self only.
+                        let mut found = id.clone();
+                        for tab in &self.tabs {
+                            let ids = tab.all_terminal_ids();
+                            if let Some(position) = ids.iter().position(|tid| tid == id) {
+                                found = if ids.len() == 1 {
+                                    tab.label.clone()
+                                } else {
+                                    format!("{} · {}", tab.label, position + 1)
+                                };
+                                break;
+                            }
+                        }
+                        found
+                    };
+                    let busy = pane.read(cx).foreground_busy();
+                    hub.set_meta(id, &label, true, busy);
+                }
+                // The bound address disappearing (Tailscale off) must never
+                // leave the toggle claiming "on".
+                let bound_ip = handle
+                    .url
+                    .trim_start_matches("http://")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let live = crate::companion::net::tailnet_ipv4()
+                    .map(|ip| ip.to_string() == bound_ip)
+                    .unwrap_or(false);
+                if !live {
+                    self.stop_companion(cx);
+                    self.companion_error =
+                        Some("Tailscale interface lost — companion stopped".to_string());
+                    cx.notify();
+                }
+            }
         }
         if self.sidebar_open && self.pet_tick_count.is_multiple_of(3) {
             self.push_git_cwd(cx);
@@ -867,9 +916,114 @@ impl Workspace {
         .detach();
     }
 
+    /// Tab label for a terminal id ("label · n" when the tab holds several).
+    fn companion_label_for(&self, terminal_id: &str) -> String {
+        for tab in &self.tabs {
+            let ids = tab.all_terminal_ids();
+            if let Some(position) = ids.iter().position(|id| id == terminal_id) {
+                return if ids.len() == 1 {
+                    tab.label.clone()
+                } else {
+                    format!("{} · {}", tab.label, position + 1)
+                };
+            }
+        }
+        terminal_id.to_string()
+    }
+
+    fn companion_url(&self) -> Option<String> {
+        let handle = self.companion_server.as_ref()?;
+        let token = self.settings.companion_token.as_deref()?;
+        Some(format!("{}#{token}", handle.url))
+    }
+
+    fn toggle_companion(&mut self, cx: &mut Context<Self>) {
+        use crate::companion::{net, server};
+        if self.companion_server.is_some() {
+            self.stop_companion(cx);
+            cx.notify();
+            return;
+        }
+        self.companion_error = None;
+        let token = match &self.settings.companion_token {
+            Some(token) => token.clone(),
+            None => {
+                let token = crate::companion::auth::generate_token();
+                self.settings.companion_token = Some(token.clone());
+                let _ = self.settings.save();
+                token
+            }
+        };
+        let Some(ip) = net::tailnet_ipv4() else {
+            self.companion_error =
+                Some("no Tailscale interface found — is Tailscale on?".to_string());
+            cx.notify();
+            return;
+        };
+        let hub = Arc::new(crate::companion::hub::Hub::new());
+        let ids: Vec<String> = self.panes.keys().cloned().collect();
+        for id in ids {
+            let label = self.companion_label_for(&id);
+            if let Some(pane) = self.panes.get(&id) {
+                pane.update(cx, |pane, _| {
+                    if let Some(sender) = pane.input_sender() {
+                        hub.register(&pane.id, &label, sender);
+                    }
+                    pane.set_companion(Some(Arc::clone(&hub)));
+                });
+            }
+        }
+        hub.bump_generation();
+        let mut started = None;
+        for port in 43110..43121u16 {
+            match server::start(
+                Arc::clone(&hub),
+                self.theme,
+                server::ServerConfig {
+                    bind: std::net::SocketAddr::from((ip, port)),
+                    token: token.clone(),
+                    page: include_str!("companion/page.html"),
+                },
+            ) {
+                Ok(handle) => {
+                    started = Some(handle);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        match started {
+            Some(handle) => {
+                self.companion_hub = Some(hub);
+                self.companion_server = Some(handle);
+            }
+            None => {
+                for pane in self.panes.values() {
+                    pane.update(cx, |pane, _| pane.set_companion(None));
+                }
+                self.companion_error = Some(format!("could not bind {ip} (ports 43110-43120)"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Detach panes, then cancel+join the server OFF the UI thread (a worker
+    /// mid-read can take its full deadline; the UI must not wait on it).
+    fn stop_companion(&mut self, cx: &mut Context<Self>) {
+        for pane in self.panes.values() {
+            pane.update(cx, |pane, _| pane.set_companion(None));
+        }
+        self.companion_hub = None;
+        if let Some(handle) = self.companion_server.take() {
+            std::thread::spawn(move || handle.stop());
+        }
+    }
+
     /// Collect shutdown handles for every live pane plus any pending ones.
     /// The caller joins them OFF the UI thread with a bounded deadline.
     pub fn shutdown_all(&mut self, cx: &mut Context<Self>) -> Vec<ShutdownHandle> {
+        // Companion first: cancel streams before their sessions die.
+        self.stop_companion(cx);
         // Flush a debounced pet-count save so quitting mid-pet loses nothing.
         if self.pet_save_at.take().is_some() {
             self.save_companion();
@@ -920,6 +1074,15 @@ impl Workspace {
             )
         });
         cx.subscribe(&pane, Self::on_pane_event).detach();
+        if let Some(hub) = &self.companion_hub {
+            let label = self.companion_label_for(&id);
+            pane.update(cx, |pane, _| {
+                if let Some(sender) = pane.input_sender() {
+                    hub.register(&pane.id, &label, sender);
+                }
+                pane.set_companion(Some(Arc::clone(hub)));
+            });
+        }
         self.panes.insert(id, pane.clone());
         pane
     }
@@ -3466,6 +3629,60 @@ impl Workspace {
                     }),
             )
             .children(self.render_focused_controls(cx))
+            .children(self.companion_error.clone().map(|error| {
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(error))
+            }))
+            .children(self.companion_url().map(|url| {
+                div()
+                    .id("companion-url")
+                    .cursor_pointer()
+                    .max_w(px(260.0))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(url.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_ws, _, _window, cx| {
+                            // Click copies the full URL (with token) for the
+                            // one-time phone bookmark.
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                            cx.stop_propagation();
+                        }),
+                    )
+            }))
+            .child({
+                let enabled = self.companion_server.is_some();
+                let theme = self.theme;
+                div()
+                    .id("companion-toggle")
+                    .cursor_pointer()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(if enabled {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_surface
+                    }))
+                    .text_color(rgb(if enabled {
+                        theme.ui_background
+                    } else {
+                        theme.ui_text_muted
+                    }))
+                    .child("phone")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, _window, cx| {
+                            ws.toggle_companion(cx);
+                        }),
+                    )
+            })
             .child({
                 let enabled = self.broadcast.is_enabled();
                 let theme = self.theme;
