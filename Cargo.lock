@@ -2106,6 +2106,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast_qr"
+version = "0.12.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16e326670ab63ef13c7699301dbb3441573ba3288e83c3bb9efaacc91a33fd01"
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6870,6 +6876,7 @@ name = "superterminal-native"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "fast_qr",
  "gpui",
  "serde",
  "serde_json",

@@ -3771,11 +3771,67 @@ impl Workspace {
                             }),
                         )
                 }))
+                .children(
+                    self.companion_url()
+                        .filter(|_| running)
+                        .and_then(|url| crate::companion::qr::matrix(&url))
+                        .map(|(modules, size)| {
+                            // Scan instead of typing a tailnet IP plus a
+                            // 32-hex token on a phone keyboard. Dark modules
+                            // are painted as quads in a single canvas over a
+                            // white card laid out as a (size + 8)-module
+                            // grid: the 4-module offset IS the spec-minimum
+                            // quiet zone, at every QR version.
+                            div().flex().justify_center().child(
+                                div()
+                                    .w(px(176.0))
+                                    .h(px(176.0))
+                                    .rounded(px(4.0))
+                                    .bg(gpui::white())
+                                    .child(
+                                        gpui::canvas(
+                                            |_, _, _| {},
+                                            move |bounds, _, window, _| {
+                                                let side = f32::from(bounds.size.width);
+                                                let cell = side / (size + 8) as f32;
+                                                let snap =
+                                                    |n: usize| ((n + 4) as f32 * cell).round();
+                                                for row in 0..size {
+                                                    for col in 0..size {
+                                                        if !modules[row * size + col] {
+                                                            continue;
+                                                        }
+                                                        let (x0, x1) =
+                                                            (snap(col), snap(col + 1));
+                                                        let (y0, y1) =
+                                                            (snap(row), snap(row + 1));
+                                                        window.paint_quad(gpui::fill(
+                                                            gpui::Bounds::new(
+                                                                gpui::point(
+                                                                    bounds.origin.x + px(x0),
+                                                                    bounds.origin.y + px(y0),
+                                                                ),
+                                                                gpui::size(
+                                                                    px(x1 - x0),
+                                                                    px(y1 - y0),
+                                                                ),
+                                                            ),
+                                                            gpui::black(),
+                                                        ));
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .size_full(),
+                                    ),
+                            )
+                        }),
+                )
                 .children(running.then(|| {
                     div()
                         .text_size(px(10.0))
                         .text_color(rgb(theme.ui_text_muted))
-                        .child("Open on your phone (same tailnet); bookmark it once.")
+                        .child("Scan with the phone camera, or open the link on the same tailnet; bookmark it once.")
                 }))
                 .child(
                     div()

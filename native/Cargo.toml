@@ -19,3 +19,7 @@ alacritty_terminal = "=0.26.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 superterminal-core = { path = "../core" }
+
+# QR matrix for the phone-link flyout. Zero-dependency, pure Rust; all
+# rendering features off — we draw the boolean module grid ourselves.
+fast_qr = { version = "0.12", default-features = false }

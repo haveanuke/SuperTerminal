@@ -12,5 +12,6 @@ pub mod http;
 pub mod hub;
 pub mod input;
 pub mod net;
+pub mod qr;
 pub mod server;
 pub mod wire;
