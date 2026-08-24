@@ -2,6 +2,7 @@
 
 mod awake;
 mod buddy_pet;
+mod companion;
 mod file_viewer;
 mod files_panel;
 mod git_panel;
