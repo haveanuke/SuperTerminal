@@ -30,6 +30,9 @@ pub struct Settings {
     /// Prepend the bundled tool-adapter shims (claude/codex ring the bell
     /// with zero user setup) to PATH in newly spawned terminals.
     pub tool_adapters: bool,
+    /// Phone-companion capability token (URL fragment auth). Generated on
+    /// first server start; regenerating invalidates old bookmarks.
+    pub companion_token: Option<String>,
     /// Hold the Mac awake automatically while any terminal runs a job.
     pub auto_caffeinate: bool,
     /// Speak buddy review notes aloud (macOS `say`).
@@ -61,6 +64,7 @@ impl Default for Settings {
             buddy_pet_pos: None,
             audio_cues: true,
             tool_adapters: true,
+            companion_token: None,
             auto_caffeinate: false,
             buddy_tts: false,
             buddy_tts_voice: None,
@@ -162,6 +166,7 @@ mod tests {
             buddy_pet_pos: Some((120.0, 240.0)),
             audio_cues: false,
             tool_adapters: false,
+            companion_token: Some("cafef00d".into()),
             auto_caffeinate: true,
             buddy_tts: true,
             buddy_tts_voice: Some("Samantha".into()),
