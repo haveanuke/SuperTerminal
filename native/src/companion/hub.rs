@@ -20,6 +20,10 @@ use super::wire::serialize_snapshot;
 /// shows "grid too large" instead of the stream stalling).
 pub const MAX_SERIALIZED: usize = 1024 * 1024;
 
+/// Phone-requested terminal spawns waiting for the main-thread tick; the cap
+/// keeps a misbehaving page from carpeting the Mac in tabs.
+pub const MAX_PENDING_SPAWNS: usize = 4;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInfo {
     pub id: String,
@@ -40,6 +44,9 @@ pub struct CompanionHub<S: Clone> {
     /// Bumped when the server (re)starts: panes compare against their own
     /// counter and publish even without fresh output, populating idle grids.
     pub generation: AtomicU64,
+    /// Terminals the phone asked for; drained by the workspace tick (PTY
+    /// spawn is main-thread-only).
+    pending_spawns: Mutex<usize>,
     cache: Mutex<HashMap<String, (u64, Arc<String>)>>,
 }
 
@@ -48,6 +55,7 @@ impl<S: Clone> Default for CompanionHub<S> {
         Self {
             inner: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
+            pending_spawns: Mutex::new(0),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -170,6 +178,22 @@ impl<S: Clone> CompanionHub<S> {
             .and_then(|e| e.snapshot.as_ref())
             .map(|s| s.app_cursor_mode)
             .unwrap_or(false)
+    }
+
+    /// Queue one phone-requested terminal spawn; false when the pending cap
+    /// is reached (the server answers 429).
+    pub fn request_spawn(&self) -> bool {
+        let mut pending = self.pending_spawns.lock().unwrap();
+        if *pending >= MAX_PENDING_SPAWNS {
+            return false;
+        }
+        *pending += 1;
+        true
+    }
+
+    /// Drain and return the number of queued spawns (main-thread tick).
+    pub fn take_spawns(&self) -> usize {
+        std::mem::take(&mut *self.pending_spawns.lock().unwrap())
     }
 
     pub fn bump_generation(&self) {
@@ -316,6 +340,18 @@ mod tests {
         hub.set_meta("t1", "work", false, false);
         let (alive, _) = hub.input_sender("t1").unwrap();
         assert!(!alive);
+    }
+
+    #[test]
+    fn spawn_queue_caps_and_drains() {
+        let hub = TestHub::new();
+        for _ in 0..MAX_PENDING_SPAWNS {
+            assert!(hub.request_spawn());
+        }
+        assert!(!hub.request_spawn(), "cap must refuse the fifth");
+        assert_eq!(hub.take_spawns(), MAX_PENDING_SPAWNS);
+        assert_eq!(hub.take_spawns(), 0, "drain resets");
+        assert!(hub.request_spawn(), "capacity returns after drain");
     }
 
     #[test]

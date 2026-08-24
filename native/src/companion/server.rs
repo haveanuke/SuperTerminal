@@ -272,6 +272,24 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             serve_stream(shared, &stream, &id);
             shared.sse.fetch_sub(1, Ordering::AcqRel);
         }
+        (Method::Post, "/spawn") => {
+            let our_origin = format!("http://{}", shared.host);
+            if let Some(origin) = request.header("origin") {
+                if origin != our_origin {
+                    let _ = respond(&stream, "403 Forbidden", &[], b"");
+                    return;
+                }
+            }
+            if request.header("content-type") != Some(INPUT_CONTENT_TYPE) {
+                let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
+                return;
+            }
+            if shared.hub.request_spawn() {
+                let _ = respond(&stream, "202 Accepted", &[], b"");
+            } else {
+                let _ = respond(&stream, "429 Too Many Requests", &[], b"");
+            }
+        }
         (Method::Post, _) if path.starts_with("/input/") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
@@ -592,6 +610,40 @@ mod tests {
             vec![0x1b, b'O', b'A']
         );
         handle2.stop();
+    }
+
+    #[test]
+    fn spawn_queues_with_guards_and_caps() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(Arc::clone(&hub));
+        let host = host_of(&handle);
+        let spawn = |content_type: &str, origin: Option<&str>| {
+            let origin_header = origin
+                .map(|o| format!("Origin: {o}\r\n"))
+                .unwrap_or_default();
+            roundtrip(
+                &host,
+                &format!(
+                    "POST /spawn HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\n{origin_header}Content-Type: {content_type}\r\nContent-Length: 2\r\n\r\n{{}}"
+                ),
+            )
+        };
+        // Guards mirror /input.
+        assert!(spawn("text/plain", None).starts_with("HTTP/1.1 415"));
+        assert!(spawn(INPUT_CONTENT_TYPE, Some("http://evil.example")).starts_with("HTTP/1.1 403"));
+        let no_token = roundtrip(
+            &host,
+            &format!("POST /spawn HTTP/1.1\r\nHost: {host}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 2\r\n\r\n{{}}"),
+        );
+        assert!(no_token.starts_with("HTTP/1.1 404"));
+        assert_eq!(hub.take_spawns(), 0, "no guard failure may queue a spawn");
+        // Queue until the cap answers 429.
+        for _ in 0..crate::companion::hub::MAX_PENDING_SPAWNS {
+            assert!(spawn(INPUT_CONTENT_TYPE, None).starts_with("HTTP/1.1 202"));
+        }
+        assert!(spawn(INPUT_CONTENT_TYPE, None).starts_with("HTTP/1.1 429"));
+        assert_eq!(hub.take_spawns(), crate::companion::hub::MAX_PENDING_SPAWNS);
+        handle.stop();
     }
 
     #[test]

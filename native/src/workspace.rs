@@ -604,6 +604,14 @@ impl Workspace {
         if self.pet_tick_count.is_multiple_of(3) {
             self.cue_tick(cx);
         }
+        // Phone-requested terminals: PTY spawn is main-thread-only, so the
+        // server queues and this tick materializes — same flow as the Mac's
+        // own "+" (new tab, focused).
+        if let Some(hub) = self.companion_hub.clone() {
+            for _ in 0..hub.take_spawns() {
+                self.add_tab(None, cx);
+            }
+        }
         if self.pet_tick_count.is_multiple_of(3) {
             if let (Some(hub), Some(handle)) = (&self.companion_hub, &self.companion_server) {
                 for (id, pane) in &self.panes {

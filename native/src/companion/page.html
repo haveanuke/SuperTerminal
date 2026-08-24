@@ -38,7 +38,13 @@
 <div id="badlink" class="notice hidden">This link is missing its access key. Open the full companion URL (with the part after #) from SuperTerminal's bottom bar.</div>
 
 <div id="list">
-  <header><div class="title">SuperTerminal</div><div id="listdot" class="dot"></div></header>
+  <header>
+    <div class="title">SuperTerminal</div>
+    <button class="back" id="newterm" aria-label="new terminal">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v10M3 8h10"/></svg>
+    </button>
+    <div id="listdot" class="dot"></div>
+  </header>
   <ul id="sessions"></ul>
   <div id="empty" class="notice hidden">No sessions.</div>
 </div>
@@ -192,6 +198,16 @@
   }
 
   $("back").addEventListener("click", close);
+  $("newterm").addEventListener("click", function () {
+    fetch("/spawn", {
+      method: "POST",
+      headers: { "X-Companion-Token": token, "Content-Type": "application/companion-input" },
+      body: "{}",
+    }).then(function () {
+      // The Mac materializes the tab on its next tick; refresh shortly.
+      setTimeout(refreshSessions, 900);
+    }).catch(function () {});
+  });
   Array.prototype.forEach.call(document.querySelectorAll("#inputs button[data-key]"), function (button) {
     button.addEventListener("click", function () { post({ key: button.getAttribute("data-key") }); });
   });
