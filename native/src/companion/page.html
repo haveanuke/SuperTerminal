@@ -10,7 +10,7 @@
   html,body { height:100%; }
   body { background:var(--bg); color:var(--text); font:14px -apple-system,system-ui,sans-serif; }
   .hidden { display:none !important; }
-  header { display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--border); background:var(--panel); position:sticky; top:0; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--border); background:var(--panel); position:sticky; top:0; z-index:2; }
   header .title { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:none; }
   .dot.on { background:#9ece6a; }
@@ -20,11 +20,18 @@
   #sessions li { display:flex; align-items:center; gap:12px; padding:16px 14px; border-bottom:1px solid var(--border); min-height:56px; }
   #sessions li .label { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #sessions li .chev { color:var(--muted); }
-  #gridwrap { overflow:auto; -webkit-overflow-scrolling:touch; padding:8px; }
+  /* The terminal screen is a full-height column: header and key pad keep
+     their natural size, the grid area takes every remaining pixel and does
+     its own 2D scrolling. */
+  #term { display:flex; flex-direction:column; height:100vh; height:100dvh; }
+  #gridwrap { flex:1 1 0; overflow:auto; -webkit-overflow-scrolling:touch; padding:8px; }
   #grid { position:relative; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:1; }
   #grid span { position:absolute; white-space:pre; }
   #cursor { position:absolute; outline:1px solid var(--accent); pointer-events:none; }
-  #inputs { position:sticky; bottom:0; background:var(--panel); border-top:1px solid var(--border); padding:8px; display:flex; flex-wrap:wrap; gap:6px; }
+  #inputs { position:sticky; bottom:0; background:var(--panel); border-top:1px solid var(--border); padding:8px; display:flex; flex-wrap:wrap; gap:6px; z-index:2; }
+  #keys { display:flex; flex-wrap:wrap; gap:6px; width:100%; }
+  #inputs.compact #keys { display:none; }
+  #inputs.compact #padtoggle svg { transform:rotate(180deg); }
   #inputs button { min-width:44px; min-height:44px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); font:13px -apple-system,system-ui,sans-serif; }
   #inputs button:active { background:var(--accent); color:var(--bg); }
   #inputs svg { width:16px; height:16px; vertical-align:middle; }
@@ -55,21 +62,26 @@
       <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg>
     </button>
     <div class="title" id="termtitle"></div>
+    <button class="back" id="zoomout" aria-label="smaller text">A-</button>
+    <button class="back" id="zoomin" aria-label="larger text">A+</button>
     <div id="termdot" class="dot"></div>
   </header>
   <div id="gridwrap"><div id="grid"><div id="cursor" class="hidden"></div></div></div>
   <div id="inputs">
-    <button data-key="enter">Enter</button>
-    <button data-key="ctrl-c">Ctrl+C</button>
-    <button data-key="up" aria-label="up"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10l5-5 5 5"/></svg></button>
-    <button data-key="down" aria-label="down"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l5 5 5-5"/></svg></button>
-    <button data-key="left" aria-label="left"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg></button>
-    <button data-key="right" aria-label="right"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg></button>
-    <button data-key="tab">Tab</button>
-    <button data-key="esc">Esc</button>
-    <button data-key="y">y</button>
-    <button data-key="n">n</button>
+    <div id="keys">
+      <button data-key="enter">Enter</button>
+      <button data-key="ctrl-c">Ctrl+C</button>
+      <button data-key="up" aria-label="up"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10l5-5 5 5"/></svg></button>
+      <button data-key="down" aria-label="down"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l5 5 5-5"/></svg></button>
+      <button data-key="left" aria-label="left"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg></button>
+      <button data-key="right" aria-label="right"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg></button>
+      <button data-key="tab">Tab</button>
+      <button data-key="esc">Esc</button>
+      <button data-key="y">y</button>
+      <button data-key="n">n</button>
+    </div>
     <div id="textrow">
+      <button id="padtoggle" aria-label="toggle key pad"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l5 5 5-5"/></svg></button>
       <input id="textbox" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command">
       <button id="send">Send</button>
     </div>
@@ -82,7 +94,19 @@
   var token = location.hash.replace(/^#/, "");
   if (!token) { document.getElementById("badlink").classList.remove("hidden"); document.getElementById("list").classList.add("hidden"); return; }
   var $ = function (id) { return document.getElementById(id); };
-  var current = null, source = null;
+  var current = null, source = null, lastSnap = null, lastTouch = 0;
+
+  // Per-device view preferences; storage can be absent (private mode) so
+  // every access is guarded and the defaults must always work.
+  function loadPref(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function storePref(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+  // Manual text size (px), 0 = fit-to-width. Stored absolutely: steps
+  // relative to a moving fit re-clamp into dead zones; a size does not.
+  var userSize = (function () {
+    var v = parseFloat(loadPref("st-size"));
+    return v >= 5 && v <= 18 ? v : 0;
+  })();
+  if (loadPref("st-pad") === "1") $("inputs").classList.add("compact");
 
   function api(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "t=" + encodeURIComponent(token); }
 
@@ -113,7 +137,7 @@
 
   // Fixed-grid rendering: measure one cell, position every run absolutely —
   // the phone's font metrics can never drift columns.
-  var cw = 0, lh = 0;
+  var cw = 0, lh = 0, perPx = 0, fitFor = 0, lastSize = 0, progScroll = null;
   function measure() {
     var probe = document.createElement("span");
     probe.textContent = "MMMMMMMMMM";
@@ -122,13 +146,61 @@
     cw = rect.width / 10; lh = Math.ceil(rect.height) + 2;
     probe.remove();
   }
+  // Cell width per px of font size, measured once at a reference size.
+  function measurePerPx() {
+    var probe = document.createElement("span");
+    probe.textContent = "MMMMMMMMMM";
+    probe.style.fontSize = "11px";
+    $("grid").appendChild(probe);
+    perPx = probe.getBoundingClientRect().width / 10 / 11;
+    probe.remove();
+  }
+  // Largest font that shows a full host row in availW, floored so a very
+  // wide host grid stays readable and pans instead of shrinking away.
+  function fitSize(cols, availW, per) {
+    return Math.max(6, Math.min(14, availW / (cols * per)));
+  }
+  function applyFit(cols) {
+    if (!perPx) measurePerPx();
+    var avail = Math.max(120, $("gridwrap").clientWidth - 16);
+    var size = userSize || fitSize(cols, avail, perPx);
+    lastSize = size;
+    $("grid").style.fontSize = size.toFixed(2) + "px";
+    measure();
+    fitFor = cols;
+  }
+  // Keep fresh output visible: unless the user touched the grid in the last
+  // few seconds, bring the cursor (or the bottom) into view each frame.
+  function follow() {
+    if (Date.now() - lastTouch < 4000) return;
+    var wrap = $("gridwrap");
+    var top = wrap.scrollTop, left = wrap.scrollLeft;
+    if (lastSnap && lastSnap.cursor) {
+      var ctop = lastSnap.cursor.row * lh;
+      if (ctop < top || ctop + lh > top + wrap.clientHeight)
+        top = Math.max(0, ctop + lh + 8 - wrap.clientHeight);
+      var cleft = lastSnap.cursor.col * cw;
+      if (cleft < left || cleft + cw > left + wrap.clientWidth)
+        left = Math.max(0, cleft + cw + 8 - wrap.clientWidth);
+    } else {
+      top = wrap.scrollHeight;
+    }
+    if (top !== wrap.scrollTop || left !== wrap.scrollLeft) {
+      wrap.scrollTop = top;
+      wrap.scrollLeft = left;
+      // Remember the (post-clamp) programmed position so the scroll
+      // listener can tell our scrolls from the user's.
+      progScroll = { top: wrap.scrollTop, left: wrap.scrollLeft };
+    }
+  }
 
   function render(snap) {
+    lastSnap = snap;
     var grid = $("grid");
     grid.textContent = "";
     var cursor = document.createElement("div"); cursor.id = "cursor"; cursor.className = "hidden";
     grid.appendChild(cursor);
-    if (!cw) measure();
+    if (snap.cols !== fitFor || !cw) applyFit(snap.cols);
     grid.style.width = snap.cols * cw + "px";
     grid.style.height = snap.lines * lh + "px";
     if (snap.error) { grid.textContent = snap.error; return; }
@@ -155,10 +227,12 @@
       cursor.style.width = cw + "px";
       cursor.style.height = lh + "px";
     }
+    follow();
   }
 
   function open(session) {
     current = session;
+    fitFor = 0; // re-fit: viewport may have rotated since the last view
     $("termtitle").textContent = session.label;
     $("list").classList.add("hidden");
     $("term").classList.remove("hidden");
@@ -183,6 +257,7 @@
   function close() {
     if (source) { source.close(); source = null; }
     current = null;
+    lastSnap = null;
     $("term").classList.add("hidden");
     $("list").classList.remove("hidden");
     refreshSessions();
@@ -217,6 +292,42 @@
   });
   $("textbox").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { event.preventDefault(); $("send").click(); }
+  });
+  $("gridwrap").addEventListener("touchstart", function () { lastTouch = Date.now(); }, { passive: true });
+  $("gridwrap").addEventListener("touchmove", function () { lastTouch = Date.now(); }, { passive: true });
+  $("gridwrap").addEventListener("wheel", function () { lastTouch = Date.now(); }, { passive: true });
+  // Momentum scrolling keeps firing after the finger lifts; only scrolls we
+  // did not cause ourselves count as the user looking around. A scroll still
+  // sitting at the programmed position is ours (events for one programmatic
+  // move can be coalesced or duplicated, so match by position, not count).
+  $("gridwrap").addEventListener("scroll", function () {
+    var wrap = $("gridwrap");
+    if (progScroll
+        && Math.abs(wrap.scrollTop - progScroll.top) < 1
+        && Math.abs(wrap.scrollLeft - progScroll.left) < 1) return;
+    progScroll = null;
+    lastTouch = Date.now();
+  }, { passive: true });
+  window.addEventListener("resize", function () {
+    fitFor = 0;
+    if (lastSnap) render(lastSnap);
+  });
+  // A+/A- move an absolute target size starting from what is on screen, so
+  // every press lands within [5,18] and changes exactly what is visible —
+  // no offset that can strand outside the clamp when the fit changes.
+  function nudgeZoom(delta) {
+    var base = userSize || lastSize || 11;
+    var next = Math.max(5, Math.min(18, base + delta));
+    if (next === base && userSize) return;
+    userSize = next;
+    storePref("st-size", String(userSize));
+    if (lastSnap) { fitFor = 0; render(lastSnap); }
+  }
+  $("zoomin").addEventListener("click", function () { nudgeZoom(1); });
+  $("zoomout").addEventListener("click", function () { nudgeZoom(-1); });
+  $("padtoggle").addEventListener("click", function () {
+    var compact = $("inputs").classList.toggle("compact");
+    storePref("st-pad", compact ? "1" : "0");
   });
 
   refreshSessions();

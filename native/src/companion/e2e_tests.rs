@@ -198,3 +198,30 @@ fn scrolled_back_host_still_publishes_the_live_screen() {
         .shutdown()
         .join_with_deadline(Duration::from_secs(5));
 }
+
+#[test]
+fn page_gives_the_grid_the_whole_viewport() {
+    let page = include_str!("page.html");
+    // Full-height flex shell: the terminal screen is a 100dvh column where
+    // the grid area flexes and header/key pad stay fixed-size.
+    assert!(
+        page.contains("100dvh"),
+        "term screen is a full-height column"
+    );
+    // The grid pane owns its own scrolling and takes every spare pixel.
+    assert!(page.contains("#gridwrap { flex:1"), "gridwrap flexes");
+    // Sticky chrome paints above the grid's absolutely-positioned spans —
+    // without a z-index the back chevron gets covered once scrolled.
+    assert!(page.contains("z-index"), "header stacks above grid spans");
+    // Fit-to-width font sizing with a readable floor.
+    assert!(
+        page.contains("function fitSize"),
+        "fit-to-width sizing exists"
+    );
+    // Follow-the-tail: new output scrolls into view unless the user is
+    // actively looking elsewhere.
+    assert!(page.contains("function follow"), "tail-follow exists");
+    // The key rows collapse to reclaim vertical space; the toggle survives.
+    assert!(page.contains("id=\"keys\""), "key rows are wrapped");
+    assert!(page.contains("id=\"padtoggle\""), "key pad toggle exists");
+}
