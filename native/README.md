@@ -22,11 +22,17 @@ cargo test -p superterminal-native     # unit + PTY round-trip tests
 ## Bundle
 
 ```sh
+native/dev-cert.sh                     # one-time per machine: signing identity
 native/bundle.sh                       # -> target/release/bundle/SuperTerminal Native.app
 ```
 
-The bundle is hand-rolled (Info.plist + binary + icns, ad-hoc signed): no
-bundler dependency. The script resolves its own location, so it runs from any
+The bundle is hand-rolled (Info.plist + binary + icns): no bundler
+dependency. Run `dev-cert.sh` once before your first build — it creates a
+self-signed "SuperTerminal Dev" identity in your login keychain (fresh
+private key per machine, nothing shared) so the app's signature stays stable
+across rebuilds. Without it builds fall back to ad-hoc signing and macOS
+resets the app's permission grants (folder access, local network) on every
+install. The script resolves its own location, so it runs from any
 working directory. Sessions are shared with the Tauri app; settings live in
 `~/Library/Application Support/com.tomaspinal.superterminal.native/`.
 

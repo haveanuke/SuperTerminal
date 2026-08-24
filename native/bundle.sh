@@ -58,6 +58,10 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q "SuperTerminal
     SIGN_ID="SuperTerminal Dev"
 else
     SIGN_ID="-"
+    echo "WARNING: no 'SuperTerminal Dev' identity — signing AD-HOC." >&2
+    echo "         macOS will reset this app's permission grants on every" >&2
+    echo "         rebuild. Run native/dev-cert.sh once to fix (one-time," >&2
+    echo "         per machine)." >&2
 fi
 codesign --force --deep --sign "$SIGN_ID" "$APP"
 echo "Signed with: $SIGN_ID"
