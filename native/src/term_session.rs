@@ -510,6 +510,13 @@ impl TermSession {
         self.status().0
     }
 
+    /// Whether UI->terminal ops (resize, scroll, selection) await the next
+    /// sync — render must sync itself then, even when a companion publish
+    /// already refreshed the snapshot this frame.
+    pub fn has_pending_ops(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
     /// Apply all deferred ops and copy out a render snapshot under ONE lock.
     pub fn sync_and_snapshot(&mut self) -> RenderableSnapshot {
         let mut term = self.term.lock();

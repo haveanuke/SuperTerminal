@@ -104,6 +104,13 @@ pub struct TerminalPane {
     attended: bool,
     /// An unattended bell arrived since the cue tick last drained it.
     bell_pending: bool,
+    /// Companion hub while the phone server runs (None = zero-cost off).
+    companion: Option<std::sync::Arc<crate::companion::hub::Hub>>,
+    /// Last hub generation this pane force-published for (server start).
+    companion_generation: u64,
+    /// Set when the pump already synced the snapshot this frame — render
+    /// then consumes the cache instead of syncing again.
+    snapshot_fresh: bool,
     /// Pane origin in window coordinates (for mouse cell math), updated from
     /// the measuring canvas via `pending_bounds` on each pump tick.
     origin: (Pixels, Pixels),
@@ -259,10 +266,28 @@ impl TerminalPane {
                         pane.blink_on = !pane.blink_on;
                         cx.notify();
                     }
-                    if pane.session.as_ref().is_some_and(|s| s.take_dirty()) {
+                    let dirty = pane.session.as_ref().is_some_and(|s| s.take_dirty());
+                    if dirty {
                         pane.last_activity = std::time::Instant::now();
                         pane.process_events(cx);
                         cx.notify();
+                    }
+                    // Companion publish: on fresh output, or once per hub
+                    // generation bump (server start needs idle grids too).
+                    if let Some(hub) = pane.companion.clone() {
+                        let generation = hub.generation.load(std::sync::atomic::Ordering::Relaxed);
+                        if dirty || generation != pane.companion_generation {
+                            pane.companion_generation = generation;
+                            if let Some(session) = pane.session.as_mut() {
+                                pane.snapshot = session.sync_and_snapshot();
+                                pane.snapshot_fresh = true;
+                                hub.publish_snapshot(
+                                    &pane.id,
+                                    std::sync::Arc::new(pane.snapshot.clone()),
+                                );
+                                cx.notify();
+                            }
+                        }
                     }
                 });
                 if alive.is_err() {
@@ -322,6 +347,9 @@ impl TerminalPane {
             last_input: std::time::Instant::now(),
             attended: false,
             bell_pending: false,
+            companion: None,
+            companion_generation: 0,
+            snapshot_fresh: false,
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             resize_candidate: None,
@@ -384,8 +412,22 @@ impl TerminalPane {
         self.focus_handle.focus(window);
     }
 
+    /// Attach/detach the companion hub (attaching also forces a publish on
+    /// the next pump tick via the generation check).
+    pub fn set_companion(&mut self, hub: Option<std::sync::Arc<crate::companion::hub::Hub>>) {
+        self.companion_generation = 0;
+        self.companion = hub;
+    }
+
+    pub fn input_sender(&self) -> Option<alacritty_terminal::event_loop::EventLoopSender> {
+        self.session.as_ref().map(|s| s.input_sender())
+    }
+
     /// Begin teardown; the returned handle must be joined off the UI thread.
     pub fn shutdown(&mut self) -> Option<ShutdownHandle> {
+        if let Some(hub) = self.companion.take() {
+            hub.unregister(&self.id);
+        }
         self.broadcast.members.lock().unwrap().remove(&self.id);
         self.session.take().map(TermSession::shutdown)
     }
@@ -839,7 +881,13 @@ impl Render for TerminalPane {
         }
 
         if let Some(session) = self.session.as_mut() {
-            self.snapshot = session.sync_and_snapshot();
+            // With the companion publishing, the pump may have synced this
+            // frame already; re-syncing is only needed for queued UI ops
+            // (resize/scroll/selection must apply before paint).
+            if !self.snapshot_fresh || session.has_pending_ops() {
+                self.snapshot = session.sync_and_snapshot();
+            }
+            self.snapshot_fresh = false;
         }
 
         let theme = self.theme;
