@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::term_session::{CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell};
+use crate::term_session::{CellColor, CellStyle, CursorStyle, RenderableSnapshot};
 use crate::themes::{ansi_256, Theme};
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -165,7 +165,7 @@ fn finish_run((style, col, text, width): (Resolved, u16, String, u16)) -> WireRu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::term_session::SnapshotCursor;
+    use crate::term_session::{SnapshotCell, SnapshotCursor};
 
     fn style() -> CellStyle {
         CellStyle {
