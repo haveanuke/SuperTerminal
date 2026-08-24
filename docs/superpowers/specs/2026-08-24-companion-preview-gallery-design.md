@@ -130,7 +130,8 @@ poll streaming, if ever wanted, becomes a new SSE event type carrying
 
 ## Open questions (for review)
 
-1. Default folder `~/Pictures/SuperTerminal` vs `~/Pictures/` directly —
-   the former is opt-in-by-saving-there, the latter shows everything.
+1. ~~Default folder `~/Pictures/SuperTerminal` vs `~/Pictures/` directly~~
+   — resolved 2026-08-24: `~/Pictures/SuperTerminal`, opt-in by saving
+   there.
 2. GIFs animate in full view for free; cap thumbnail generation to first
    frame (sips does this implicitly) — acceptable?
