@@ -76,6 +76,12 @@ pub struct TerminalPane {
     translucent: bool,
     cell_width: Pixels,
     line_height: Pixels,
+    /// Shaped advance per non-ASCII (char, bold, italic) seen on screen —
+    /// keyed by style because a bold/italic fallback face can carry a
+    /// different advance than the upright one. The coalescer only groups
+    /// glyphs whose advance matches their grid span. Cleared when metrics
+    /// change.
+    advance_cache: std::collections::HashMap<(char, bool, bool), f32>,
     selecting: bool,
     /// Live pointer position (window coords) during a selection drag; the
     /// pump auto-scrolls while it sits past the pane's vertical edge.
@@ -334,6 +340,7 @@ impl TerminalPane {
             translucent: false,
             cell_width,
             line_height,
+            advance_cache: std::collections::HashMap::new(),
             selecting: false,
             drag_position: None,
             drag_scroll_tick: 0,
@@ -372,6 +379,7 @@ impl TerminalPane {
         self.font_family = font_family.to_string().into();
         self.resolved_family = None; // re-resolve on next render
         self.font_size = font_size;
+        self.advance_cache.clear();
         cx.notify();
     }
 
@@ -564,7 +572,11 @@ impl TerminalPane {
             .text_system()
             .shape_line(text, px(self.font_size), &[run], None);
         if f32::from(shaped.width) > 0.0 {
-            self.cell_width = shaped.width / 10.0;
+            let measured = shaped.width / 10.0;
+            if measured != self.cell_width {
+                self.advance_cache.clear();
+            }
+            self.cell_width = measured;
         }
         self.line_height = px((self.font_size * 1.4).round());
         let _ = cx;
@@ -758,14 +770,98 @@ fn dim(color: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-/// One visual run: consecutive cells sharing style + selection state.
+/// One visual run: consecutive cells sharing style + selection state,
+/// pinned at its starting grid column so painted x never drifts off-grid.
+/// `cells` is the grid span (wide chars count 2), painted as the explicit
+/// element width so backgrounds cover exactly their cells. `safe` records
+/// whether every glyph's advance was verified to match its grid span.
 struct Run {
+    col: usize,
+    cells: usize,
+    safe: bool,
     text: String,
     fg: u32,
     bg: Option<u32>,
     bold: bool,
     italic: bool,
     underline: bool,
+}
+
+/// Resolved look of one visible cell — selection, search, inverse, dim and
+/// hidden already applied by the caller.
+#[derive(Clone, Copy, PartialEq)]
+struct CellLook {
+    fg: u32,
+    bg: Option<u32>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+/// Group visible cells into paint runs. Beyond style equality, a run only
+/// extends while glyph advances are trustworthy per `advance_safe(ch,
+/// cells)` — the render pass verifies each glyph's shaped advance against
+/// its grid span, so an in-font border like `╭──╮` stays one element while
+/// a fallback glyph (U+23BF shapes ~1.7 cells wide via Menlo's fallback)
+/// pins alone at its own column and can only misdraw its own span. Column
+/// contiguity is also required — a skipped wide-char spacer breaks the
+/// one-flowed-cell-per-char assumption. Trailing default-style whitespace
+/// runs are trimmed; rows never come back empty so each still occupies one
+/// line.
+fn coalesce_runs(
+    cells: impl Iterator<Item = (usize, char, usize, CellLook)>,
+    advance_safe: &dyn Fn(char, usize, &CellLook) -> bool,
+    default_fg: u32,
+) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (col, ch, span, look) in cells {
+        let safe = advance_safe(ch, span, &look);
+        let extends = runs.last().is_some_and(|run| {
+            let same_look = run.fg == look.fg
+                && run.bg == look.bg
+                && run.bold == look.bold
+                && run.italic == look.italic
+                && run.underline == look.underline;
+            same_look && run.safe && safe && col == run.col + run.cells
+        });
+        if extends {
+            let run = runs.last_mut().unwrap();
+            run.text.push(ch);
+            run.cells += span;
+        } else {
+            runs.push(Run {
+                col,
+                cells: span,
+                safe,
+                text: ch.to_string(),
+                fg: look.fg,
+                bg: look.bg,
+                bold: look.bold,
+                italic: look.italic,
+                underline: look.underline,
+            });
+        }
+    }
+    while runs
+        .last()
+        .is_some_and(|r| r.bg.is_none() && r.text.trim().is_empty() && runs.len() > 1)
+    {
+        runs.pop();
+    }
+    if runs.is_empty() {
+        runs.push(Run {
+            col: 0,
+            cells: 1,
+            safe: true,
+            text: " ".to_string(),
+            fg: default_fg,
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: false,
+        });
+    }
+    runs
 }
 
 /// IME-correct text input: composed text goes straight to the PTY; marked
@@ -896,9 +992,68 @@ impl Render for TerminalPane {
         let theme = self.theme;
         let focused = self.focus_handle.is_focused(window);
         self.attended = focused && window.is_window_active();
+        // Measure any new non-ASCII glyphs on screen against the resolved
+        // family: the coalescer only trusts a glyph whose shaped advance
+        // matches its grid span, so fallback glyphs pin to their own column.
+        let mut unmeasured: std::collections::HashSet<(char, bool, bool)> =
+            std::collections::HashSet::new();
+        for row in &self.snapshot.rows {
+            for cell in row {
+                let key = (cell.ch, cell.style.bold, cell.style.italic);
+                if !cell.ch.is_ascii()
+                    && !cell.wide_spacer
+                    && !self.advance_cache.contains_key(&key)
+                {
+                    unmeasured.insert(key);
+                }
+            }
+        }
+        if !unmeasured.is_empty() {
+            let family = self
+                .resolved_family
+                .clone()
+                .unwrap_or_else(|| self.font_family.clone());
+            for (ch, bold, italic) in unmeasured {
+                let text: SharedString = ch.to_string().into();
+                // Shape with the attributes the run will paint with: bold or
+                // italic fallback faces can advance differently.
+                let mut font = gpui::font(family.clone());
+                if bold {
+                    font.weight = gpui::FontWeight::BOLD;
+                }
+                if italic {
+                    font.style = gpui::FontStyle::Italic;
+                }
+                let run = gpui::TextRun {
+                    len: text.len(),
+                    font,
+                    color: gpui::Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped =
+                    window
+                        .text_system()
+                        .shape_line(text, px(self.font_size), &[run], None);
+                self.advance_cache
+                    .insert((ch, bold, italic), f32::from(shaped.width));
+            }
+        }
+
         let snapshot = &self.snapshot;
         let cell_w = self.cell_width;
         let line_h = self.line_height;
+        let advance_cache = &self.advance_cache;
+        let advance_safe = move |ch: char, span: usize, look: &CellLook| -> bool {
+            if ch.is_ascii() {
+                return true; // vouched for by the monospace probe
+            }
+            let expected = span as f32 * f32::from(cell_w);
+            advance_cache
+                .get(&(ch, look.bold, look.italic))
+                .is_some_and(|adv| (adv - expected).abs() <= expected * 0.02)
+        };
 
         // Build styled runs per row.
         let selection: std::collections::HashSet<(usize, usize)> =
@@ -907,80 +1062,73 @@ impl Render for TerminalPane {
             snapshot.search_matches.iter().copied().collect();
         let mut row_divs = Vec::with_capacity(snapshot.lines);
         for (row_idx, row) in snapshot.rows.iter().enumerate() {
-            let mut runs: Vec<Run> = Vec::new();
-            for (col_idx, cell) in row.iter().enumerate() {
-                if cell.wide_spacer {
-                    continue;
-                }
-                let selected = selection.contains(&(col_idx, row_idx));
-                let style = &cell.style;
-                let (mut fg, mut bg) = if style.inverse {
-                    let fg_resolved = self.resolve_fg(style.fg);
-                    let bg_resolved = self.resolve_bg(style.bg).unwrap_or(theme.background);
-                    (bg_resolved, Some(fg_resolved))
-                } else {
-                    (self.resolve_fg(style.fg), self.resolve_bg(style.bg))
-                };
-                if style.dim {
-                    fg = dim(fg);
-                }
-                if style.hidden {
-                    fg = bg.unwrap_or(theme.background);
-                }
-                if search_hits.contains(&(col_idx, row_idx)) {
-                    bg = Some(theme.yellow);
-                    fg = theme.background;
-                }
-                if selected {
-                    bg = Some(theme.selection);
-                }
-                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-                let matches_last = runs.last().is_some_and(|r| {
-                    r.fg == fg
-                        && r.bg == bg
-                        && r.bold == style.bold
-                        && r.italic == style.italic
-                        && r.underline == style.underline
+            let looks = row
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.wide_spacer)
+                .map(|(col_idx, cell)| {
+                    let selected = selection.contains(&(col_idx, row_idx));
+                    let style = &cell.style;
+                    let (mut fg, mut bg) = if style.inverse {
+                        let fg_resolved = self.resolve_fg(style.fg);
+                        let bg_resolved = self.resolve_bg(style.bg).unwrap_or(theme.background);
+                        (bg_resolved, Some(fg_resolved))
+                    } else {
+                        (self.resolve_fg(style.fg), self.resolve_bg(style.bg))
+                    };
+                    if style.dim {
+                        fg = dim(fg);
+                    }
+                    if style.hidden {
+                        fg = bg.unwrap_or(theme.background);
+                    }
+                    if search_hits.contains(&(col_idx, row_idx)) {
+                        bg = Some(theme.yellow);
+                        fg = theme.background;
+                    }
+                    if selected {
+                        bg = Some(theme.selection);
+                    }
+                    let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+                    let span = if row.get(col_idx + 1).is_some_and(|next| next.wide_spacer) {
+                        2
+                    } else {
+                        1
+                    };
+                    (
+                        col_idx,
+                        ch,
+                        span,
+                        CellLook {
+                            fg,
+                            bg,
+                            bold: style.bold,
+                            italic: style.italic,
+                            underline: style.underline,
+                        },
+                    )
                 });
-                if matches_last {
-                    runs.last_mut().unwrap().text.push(ch);
-                } else {
-                    runs.push(Run {
-                        text: ch.to_string(),
-                        fg,
-                        bg,
-                        bold: style.bold,
-                        italic: style.italic,
-                        underline: style.underline,
-                    });
-                }
-            }
-            // Trailing default-style whitespace is layout-neutral; keep rows
-            // non-empty so every row occupies one line.
-            while runs
-                .last()
-                .is_some_and(|r| r.bg.is_none() && r.text.trim().is_empty() && runs.len() > 1)
-            {
-                runs.pop();
-            }
-            if runs.is_empty() {
-                runs.push(Run {
-                    text: " ".to_string(),
-                    fg: theme.foreground,
-                    bg: None,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                });
-            }
+            let runs = coalesce_runs(looks, &advance_safe, theme.foreground);
 
+            // Runs are pinned at col * cell_width instead of flowed: flowed
+            // widths drift off-grid (gpui ceils each text element to whole
+            // pixels, and fallback glyphs advance wider than a cell), which
+            // clipped the last characters of heavily-styled rows.
             let row_div = div()
-                .flex()
-                .flex_row()
-                .whitespace_nowrap()
+                .relative()
                 .h(line_h)
                 .children(runs.into_iter().map(|run| {
+                    // Explicit grid-sized box: the background covers exactly the
+                    // run's cells (wide-char spans included). Glyph ink is NOT
+                    // clipped — a fallback glyph may legitimately paint past its
+                    // cell, and pinning already contains the layout damage.
                     let mut d = div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(run.col as f32 * f32::from(cell_w)))
+                        .w(px(run.cells as f32 * f32::from(cell_w)))
+                        .h(line_h)
+                        .whitespace_nowrap()
                         .child(SharedString::from(run.text))
                         .text_color(rgb(run.fg));
                     if let Some(bg) = run.bg {
@@ -1287,7 +1435,127 @@ impl TerminalPane {
 
 #[cfg(test)]
 mod tests {
-    use super::drag_scroll_lines;
+    use super::{coalesce_runs, drag_scroll_lines, CellLook};
+
+    const LOOK: CellLook = CellLook {
+        fg: 0xffffff,
+        bg: None,
+        bold: false,
+        italic: false,
+        underline: false,
+    };
+
+    fn cols_and_texts(runs: &[super::Run]) -> Vec<(usize, &str)> {
+        runs.iter().map(|r| (r.col, r.text.as_str())).collect()
+    }
+
+    // Predicates standing in for the render-time advance measurement: every
+    // glyph verified grid-safe, vs only ASCII trusted (all else fallback).
+    fn all_safe(_: char, _: usize, _: &CellLook) -> bool {
+        true
+    }
+    fn ascii_only(ch: char, _: usize, _: &CellLook) -> bool {
+        ch.is_ascii()
+    }
+
+    #[test]
+    fn ascii_same_look_coalesces_into_one_pinned_run() {
+        let runs = coalesce_runs(
+            [(0, 'l', 1, LOOK), (1, 's', 1, LOOK)].into_iter(),
+            &ascii_only,
+            0xffffff,
+        );
+        assert_eq!(cols_and_texts(&runs), vec![(0, "ls")]);
+    }
+
+    #[test]
+    fn style_change_starts_new_run_at_its_column() {
+        let red = CellLook {
+            fg: 0xff0000,
+            ..LOOK
+        };
+        let runs = coalesce_runs(
+            [(0, 'a', 1, LOOK), (1, 'b', 1, red)].into_iter(),
+            &all_safe,
+            0xffffff,
+        );
+        assert_eq!(cols_and_texts(&runs), vec![(0, "a"), (1, "b")]);
+    }
+
+    #[test]
+    fn unsafe_glyph_pins_at_own_column_and_rebreaks_after() {
+        // '⎿' falls back to a font whose advance is ~1.7 cells; flowed after
+        // "ab" it would drift every following glyph rightward. It must start
+        // its own run, and the ASCII after it must re-pin at its true column.
+        let cells = [
+            (0, 'a', 1, LOOK),
+            (1, 'b', 1, LOOK),
+            (2, '⎿', 1, LOOK),
+            (3, 'c', 1, LOOK),
+            (4, 'd', 1, LOOK),
+        ];
+        let runs = coalesce_runs(cells.into_iter(), &ascii_only, 0xffffff);
+        assert_eq!(cols_and_texts(&runs), vec![(0, "ab"), (2, "⎿"), (3, "cd")]);
+    }
+
+    #[test]
+    fn repeated_unsafe_glyphs_never_group() {
+        // Identical fallback glyphs accumulate the same per-glyph drift this
+        // fix exists to kill — repetition is not proof of a one-cell advance.
+        let cells = [(0, '⎿', 1, LOOK), (1, '⎿', 1, LOOK), (2, '⎿', 1, LOOK)];
+        let runs = coalesce_runs(cells.into_iter(), &ascii_only, 0xffffff);
+        assert_eq!(cols_and_texts(&runs), vec![(0, "⎿"), (1, "⎿"), (2, "⎿")]);
+    }
+
+    #[test]
+    fn verified_glyphs_coalesce_across_identities() {
+        // Mixed box-drawing measured at exactly one cell each stays one
+        // element per style run, so borders don't explode the element count.
+        let cells = [
+            (0, '╭', 1, LOOK),
+            (1, '─', 1, LOOK),
+            (2, '┬', 1, LOOK),
+            (3, '─', 1, LOOK),
+            (4, '╮', 1, LOOK),
+        ];
+        let runs = coalesce_runs(cells.into_iter(), &all_safe, 0xffffff);
+        assert_eq!(cols_and_texts(&runs), vec![(0, "╭─┬─╮")]);
+    }
+
+    #[test]
+    fn wide_chars_span_their_cells() {
+        // A wide char occupies two grid cells (the caller skips the spacer).
+        // Unverified: it pins alone and the col gap is kept. Verified at two
+        // cells: contiguous wide chars may merge, and the span accumulates.
+        let cells = [(0, 'a', 1, LOOK), (1, '個', 2, LOOK), (3, 'b', 1, LOOK)];
+        let runs = coalesce_runs(cells.into_iter(), &ascii_only, 0xffffff);
+        assert_eq!(cols_and_texts(&runs), vec![(0, "a"), (1, "個"), (3, "b")]);
+
+        let cells = [(0, '個', 2, LOOK), (2, '個', 2, LOOK)];
+        let runs = coalesce_runs(cells.into_iter(), &all_safe, 0xffffff);
+        assert_eq!(cols_and_texts(&runs), vec![(0, "個個")]);
+        assert_eq!(runs[0].cells, 4);
+    }
+
+    #[test]
+    fn trailing_default_whitespace_run_is_trimmed_but_row_never_empty() {
+        let bold = CellLook { bold: true, ..LOOK };
+        let runs = coalesce_runs(
+            [(0, 'a', 1, bold), (1, ' ', 1, LOOK), (2, ' ', 1, LOOK)].into_iter(),
+            &all_safe,
+            0xffffff,
+        );
+        assert_eq!(cols_and_texts(&runs), vec![(0, "a")]);
+
+        // A row of nothing but default spaces keeps its one run so the row
+        // still occupies a line.
+        let runs = coalesce_runs(
+            [(0, ' ', 1, LOOK), (1, ' ', 1, LOOK)].into_iter(),
+            &all_safe,
+            0xffffff,
+        );
+        assert_eq!(cols_and_texts(&runs), vec![(0, "  ")]);
+    }
 
     #[test]
     fn no_scroll_inside_pane() {
