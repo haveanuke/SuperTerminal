@@ -6,4 +6,5 @@
 //! is a capability token carried in the bookmark's URL fragment — tailnet
 //! membership authenticates devices, the token authenticates the page.
 
+pub mod net;
 pub mod wire;
