@@ -1,2 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>SuperTerminal Companion</title>
-<p>placeholder page (Task 10 replaces this)</p>
+<style>
+  :root { --bg:#14141b; --panel:#1d1d27; --border:#2c2c3a; --text:#c8cbe0; --muted:#7d8199; --accent:#7aa2f7; --busy:#e0af68; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; }
+  body { background:var(--bg); color:var(--text); font:14px -apple-system,system-ui,sans-serif; }
+  .hidden { display:none !important; }
+  header { display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--border); background:var(--panel); position:sticky; top:0; }
+  header .title { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:none; }
+  .dot.on { background:#9ece6a; }
+  .dot.busy { background:var(--busy); }
+  button.back { background:none; border:none; color:var(--accent); font-size:15px; padding:8px; min-width:44px; min-height:44px; }
+  #sessions { list-style:none; }
+  #sessions li { display:flex; align-items:center; gap:12px; padding:16px 14px; border-bottom:1px solid var(--border); min-height:56px; }
+  #sessions li .label { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #sessions li .chev { color:var(--muted); }
+  #gridwrap { overflow:auto; -webkit-overflow-scrolling:touch; padding:8px; }
+  #grid { position:relative; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:1; }
+  #grid span { position:absolute; white-space:pre; }
+  #cursor { position:absolute; outline:1px solid var(--accent); pointer-events:none; }
+  #inputs { position:sticky; bottom:0; background:var(--panel); border-top:1px solid var(--border); padding:8px; display:flex; flex-wrap:wrap; gap:6px; }
+  #inputs button { min-width:44px; min-height:44px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); font:13px -apple-system,system-ui,sans-serif; }
+  #inputs button:active { background:var(--accent); color:var(--bg); }
+  #inputs svg { width:16px; height:16px; vertical-align:middle; }
+  #textrow { display:flex; gap:6px; width:100%; }
+  #textbox { flex:1; min-height:44px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); padding:0 10px; font-size:16px; }
+  #send { min-width:64px; }
+  .notice { padding:32px 20px; color:var(--muted); text-align:center; }
+</style>
+</head>
+<body>
+<div id="badlink" class="notice hidden">This link is missing its access key. Open the full companion URL (with the part after #) from SuperTerminal's bottom bar.</div>
+
+<div id="list">
+  <header><div class="title">SuperTerminal</div><div id="listdot" class="dot"></div></header>
+  <ul id="sessions"></ul>
+  <div id="empty" class="notice hidden">No sessions.</div>
+</div>
+
+<div id="term" class="hidden">
+  <header>
+    <button class="back" id="back" aria-label="back">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg>
+    </button>
+    <div class="title" id="termtitle"></div>
+    <div id="termdot" class="dot"></div>
+  </header>
+  <div id="gridwrap"><div id="grid"><div id="cursor" class="hidden"></div></div></div>
+  <div id="inputs">
+    <button data-key="enter">Enter</button>
+    <button data-key="ctrl-c">Ctrl+C</button>
+    <button data-key="up" aria-label="up"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10l5-5 5 5"/></svg></button>
+    <button data-key="down" aria-label="down"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l5 5 5-5"/></svg></button>
+    <button data-key="left" aria-label="left"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg></button>
+    <button data-key="right" aria-label="right"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3l5 5-5 5"/></svg></button>
+    <button data-key="tab">Tab</button>
+    <button data-key="esc">Esc</button>
+    <button data-key="y">y</button>
+    <button data-key="n">n</button>
+    <div id="textrow">
+      <input id="textbox" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command">
+      <button id="send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var token = location.hash.replace(/^#/, "");
+  if (!token) { document.getElementById("badlink").classList.remove("hidden"); document.getElementById("list").classList.add("hidden"); return; }
+  var $ = function (id) { return document.getElementById(id); };
+  var current = null, source = null;
+
+  function api(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "t=" + encodeURIComponent(token); }
+
+  function refreshSessions() {
+    fetch(api("/sessions"), { headers: { "X-Companion-Token": token } })
+      .then(function (r) { if (!r.ok) throw 0; $("listdot").classList.add("on"); return r.json(); })
+      .then(function (sessions) {
+        var list = $("sessions"); list.textContent = "";
+        $("empty").classList.toggle("hidden", sessions.length > 0);
+        sessions.forEach(function (s) {
+          var li = document.createElement("li");
+          var dot = document.createElement("div");
+          dot.className = "dot" + (s.busy ? " busy" : s.alive ? " on" : "");
+          var label = document.createElement("div"); label.className = "label"; label.textContent = s.label;
+          var chev = document.createElement("div"); chev.className = "chev"; chev.textContent = ">";
+          li.appendChild(dot); li.appendChild(label); li.appendChild(chev);
+          li.addEventListener("click", function () { open(s); });
+          list.appendChild(li);
+        });
+      })
+      .catch(function () { $("listdot").classList.remove("on"); });
+  }
+
+  // Fixed-grid rendering: measure one cell, position every run absolutely —
+  // the phone's font metrics can never drift columns.
+  var cw = 0, lh = 0;
+  function measure() {
+    var probe = document.createElement("span");
+    probe.textContent = "MMMMMMMMMM";
+    $("grid").appendChild(probe);
+    var rect = probe.getBoundingClientRect();
+    cw = rect.width / 10; lh = Math.ceil(rect.height) + 2;
+    probe.remove();
+  }
+
+  function render(snap) {
+    var grid = $("grid");
+    grid.textContent = "";
+    var cursor = document.createElement("div"); cursor.id = "cursor"; cursor.className = "hidden";
+    grid.appendChild(cursor);
+    if (!cw) measure();
+    grid.style.width = snap.cols * cw + "px";
+    grid.style.height = snap.lines * lh + "px";
+    if (snap.error) { grid.textContent = snap.error; return; }
+    snap.rows.forEach(function (runs, row) {
+      runs.forEach(function (run) {
+        var span = document.createElement("span");
+        span.textContent = run.text;
+        span.style.left = run.col * cw + "px";
+        span.style.top = row * lh + "px";
+        span.style.color = run.fg;
+        if (run.bg) { span.style.background = run.bg; span.style.height = lh + "px"; }
+        if (run.b) span.style.fontWeight = "700";
+        if (run.i) span.style.fontStyle = "italic";
+        if (run.u) span.style.textDecoration = "underline";
+        grid.appendChild(span);
+      });
+    });
+    if (snap.cursor) {
+      cursor.classList.remove("hidden");
+      cursor.style.left = snap.cursor.col * cw + "px";
+      cursor.style.top = snap.cursor.row * lh + "px";
+      cursor.style.width = cw + "px";
+      cursor.style.height = lh + "px";
+    }
+  }
+
+  function open(session) {
+    current = session;
+    $("termtitle").textContent = session.label;
+    $("list").classList.add("hidden");
+    $("term").classList.remove("hidden");
+    source = new EventSource(api("/stream/" + encodeURIComponent(session.id)));
+    source.onopen = function () { $("termdot").classList.add("on"); };
+    source.onerror = function () { $("termdot").classList.remove("on"); };
+    source.onmessage = function (event) { try { render(JSON.parse(event.data)); } catch (e) {} };
+  }
+
+  function close() {
+    if (source) { source.close(); source = null; }
+    current = null;
+    $("term").classList.add("hidden");
+    $("list").classList.remove("hidden");
+    refreshSessions();
+  }
+
+  function post(body) {
+    if (!current) return;
+    fetch("/input/" + encodeURIComponent(current.id), {
+      method: "POST",
+      headers: { "X-Companion-Token": token, "Content-Type": "application/companion-input" },
+      body: JSON.stringify(body),
+    }).then(function (r) { if (r.status === 410 || r.status === 404) close(); }).catch(function () {});
+  }
+
+  $("back").addEventListener("click", close);
+  Array.prototype.forEach.call(document.querySelectorAll("#inputs button[data-key]"), function (button) {
+    button.addEventListener("click", function () { post({ key: button.getAttribute("data-key") }); });
+  });
+  $("send").addEventListener("click", function () {
+    var box = $("textbox");
+    if (box.value) { post({ text: box.value + "\r" }); box.value = ""; }
+  });
+  $("textbox").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") { event.preventDefault(); $("send").click(); }
+  });
+
+  refreshSessions();
+  setInterval(function () { if (!current) refreshSessions(); }, 5000);
+})();
+</script>
+</body>
+</html>

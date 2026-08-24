@@ -7,6 +7,7 @@
 //! membership authenticates devices, the token authenticates the page.
 
 pub mod auth;
+mod e2e_tests;
 pub mod http;
 pub mod hub;
 pub mod input;
