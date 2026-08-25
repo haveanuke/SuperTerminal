@@ -8,7 +8,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use std::time::Duration;
 
 use super::previews::PreviewStore;
