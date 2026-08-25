@@ -15,4 +15,5 @@ pub mod net;
 pub mod previews;
 pub mod qr;
 pub mod server;
+pub mod thumbs;
 pub mod wire;
