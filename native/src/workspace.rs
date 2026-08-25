@@ -232,6 +232,9 @@ pub struct Workspace {
     /// Phone companion: hub shared with panes while the server runs.
     companion_hub: Option<Arc<crate::companion::hub::Hub>>,
     companion_server: Option<crate::companion::server::ServerHandle>,
+    /// The live preview catalog while the server runs; settings changes swap
+    /// its watched dir in place (the server never restarts for that).
+    companion_previews: Option<std::sync::Arc<crate::companion::previews::PreviewStore>>,
     companion_error: Option<String>,
     /// Terminal awaiting a window-aware focus handoff: phone spawns happen
     /// on the tick (no Window), so render — which has one — completes the
@@ -352,6 +355,7 @@ impl Workspace {
             awake: crate::awake::AwakeHold::default(),
             companion_hub: None,
             companion_server: None,
+            companion_previews: None,
             companion_error: None,
             companion_pending_focus: None,
             companion_flyout: false,
@@ -1067,6 +1071,7 @@ impl Workspace {
             Some(handle) => {
                 self.companion_hub = Some(hub);
                 self.companion_server = Some(handle);
+                self.companion_previews = Some(previews);
             }
             None => {
                 for pane in self.panes.values() {
@@ -1090,10 +1095,51 @@ impl Workspace {
             pane.update(cx, |pane, _| pane.set_companion(None));
         }
         self.companion_hub = None;
+        self.companion_previews = None;
         if let Some(handle) = self.companion_server.take() {
             handle.cancel();
             std::thread::spawn(move || handle.stop());
         }
+    }
+
+    /// Point the live catalog at the (re)configured folder; no-op while the
+    /// server is down (the next start resolves the setting itself).
+    fn apply_preview_dir(&self) {
+        if let Some(store) = &self.companion_previews {
+            store.set_dir(crate::settings::resolved_preview_dir(&self.settings));
+        }
+    }
+
+    /// Native directory picker, same osascript pattern as the background
+    /// image picker — no dependencies, run off the UI thread.
+    fn pick_preview_dir(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |ws, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    std::process::Command::new("/usr/bin/osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose folder with prompt \"Preview folder\")",
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .filter(|path| !path.is_empty())
+                })
+                .await;
+            if let Some(path) = picked {
+                let _ = ws.update(cx, |ws, cx| {
+                    ws.settings.preview_dir = Some(path);
+                    let _ = ws.settings.save();
+                    ws.apply_preview_dir();
+                    cx.notify();
+                });
+            }
+            Ok::<(), ()>(())
+        })
+        .detach();
     }
 
     /// Regenerate the capability token: old bookmarks die, the server
@@ -2953,6 +2999,46 @@ impl Workspace {
             )
     }
 
+    fn render_previews_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let label: SharedString = match &self.settings.preview_dir {
+            Some(path) => std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone())
+                .into(),
+            None => "Pictures/SuperTerminal".into(),
+        };
+        let overridden = self.settings.preview_dir.is_some();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_color(rgb(theme.ui_text_muted))
+            .child(div().w(px(72.0)).child("previews"))
+            .child(div().text_size(px(11.0)).child(label))
+            .child(self.chip_button(
+                "choose",
+                false,
+                |ws, _window, cx| ws.pick_preview_dir(cx),
+                cx,
+            ))
+            .children(overridden.then(|| {
+                self.chip_button(
+                    "default",
+                    false,
+                    |ws, _window, cx| {
+                        ws.settings.preview_dir = None;
+                        let _ = ws.settings.save();
+                        ws.apply_preview_dir();
+                        cx.notify();
+                    },
+                    cx,
+                )
+            }))
+    }
+
     fn render_background_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let opacity = self.settings.background_opacity;
@@ -4097,7 +4183,10 @@ impl Workspace {
                         self.render_font_family_row(window, cx).into_any_element(),
                     ],
                     SettingsSection::Background => {
-                        vec![self.render_background_row(cx).into_any_element()]
+                        vec![
+                            self.render_background_row(cx).into_any_element(),
+                            self.render_previews_row(cx).into_any_element(),
+                        ]
                     }
                     SettingsSection::Buddy => vec![self.render_buddy_row(cx).into_any_element()],
                     SettingsSection::Alerts => vec![self.render_alerts_row(cx).into_any_element()],
