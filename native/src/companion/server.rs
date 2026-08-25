@@ -360,7 +360,8 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                     .iter()
                     .map(|s| {
                         serde_json::json!({
-                            "id": s.id, "label": s.label, "alive": s.alive, "busy": s.busy
+                            "id": s.id, "label": s.label, "alive": s.alive,
+                            "busy": s.busy, "finished": s.finished
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -778,6 +779,10 @@ mod tests {
         let ok = get(&host, &format!("/sessions?t={TOKEN}"));
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
         assert!(ok.contains("\"label\":\"work\""));
+        assert!(
+            ok.contains("\"finished\":0"),
+            "finish counter rides the wire: {ok}"
+        );
         handle.stop();
     }
 

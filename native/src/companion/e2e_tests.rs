@@ -292,7 +292,11 @@ fn page_flags_rooms_that_finished() {
     let page = include_str!("page.html");
     assert!(
         page.contains("function markAttention"),
-        "busy->idle transitions tracked"
+        "finish transitions tracked"
+    );
+    assert!(
+        page.contains("s.finished"),
+        "attention diffs the server's finish counter, not sampled busy"
     );
     assert!(page.contains("attnpulse"), "attention dots pulse");
     assert!(

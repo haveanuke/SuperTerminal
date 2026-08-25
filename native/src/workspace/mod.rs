@@ -446,8 +446,15 @@ impl Workspace {
                 pane.update(cx, |pane, _| (pane.foreground_busy(), pane.take_bell()));
             let gate = self.cue_gates.entry(id.clone()).or_default();
             let outcome = gate.tick(now, busy, bell && audio_on);
-            if outcome.long_job_finished && self.focused_terminal.as_ref() == Some(id) {
-                focused_long_job = true;
+            if outcome.long_job_finished {
+                if self.focused_terminal.as_ref() == Some(id) {
+                    focused_long_job = true;
+                }
+                // The phone's attention alerts diff this counter — cue-gate
+                // semantics, so silent-but-running jobs never false-finish.
+                if let Some(hub) = &self.companion_hub {
+                    hub.bump_finished(id);
+                }
             }
             if audio_on {
                 if let Some(kind) = outcome.cue {

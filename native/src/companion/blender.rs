@@ -53,6 +53,10 @@ pub fn spawn(store: Weak<PreviewStore>, scratch_dir: PathBuf) {
 /// any failure or timeout — the caller just tries again next interval.
 pub(crate) fn capture_once(addr: &str, frame_path: &Path, timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Write;
+    // `timeout` is the TOTAL round-trip budget: per-read socket timeouts
+    // alone would let a peer trickling occasional bytes hold the poller
+    // forever, so every read gets only the remaining budget.
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = std::net::TcpStream::connect_timeout(&addr.parse().ok()?, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
@@ -70,6 +74,12 @@ pub(crate) fn capture_once(addr: &str, frame_path: &Path, timeout: Duration) -> 
     let mut reply = Vec::new();
     let mut buf = [0u8; 4096];
     let ok = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        // set_read_timeout rejects a zero Duration; the floor is harmless.
+        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(10))));
         let read = match stream.read(&mut buf) {
             Ok(0) | Err(_) => break false,
             Ok(read) => read,
@@ -154,6 +164,34 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "must give up within the io timeout, not hang"
+        );
+    }
+
+    #[test]
+    fn trickling_peer_cannot_outlive_the_total_deadline() {
+        // A broken peer feeding one byte per read window would keep a
+        // per-read timeout alive forever; the deadline must be absolute.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            for _ in 0..200 {
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let frame = scratch_frame("trickle");
+        let started = std::time::Instant::now();
+        assert!(capture_once(&addr, &frame, Duration::from_millis(400)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "absolute deadline must cut the trickle off"
         );
     }
 

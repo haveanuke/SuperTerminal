@@ -168,10 +168,13 @@
 
   function api(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "t=" + encodeURIComponent(token); }
 
-  // "Needs attention": a room that flipped busy -> idle while you weren't
-  // looking at it. Pulses its list dot until opened; while you're inside
-  // another terminal, a tappable banner announces it.
-  var lastBusy = {}, attention = {}, bannerTimer = null;
+  // "Needs attention": a room whose long job just finished while you were
+  // not looking at it. Driven by the Mac's monotonic finish counter (cue
+  // semantics: foreground job 5s+ back to prompt) — a counter diff cannot
+  // be missed between polls the way a sampled busy flag can, and a quiet
+  // but still-running job never false-finishes. Pulses the list dot until
+  // opened; inside another terminal a tappable banner announces it.
+  var lastFinish = {}, attention = {}, bannerTimer = null;
   function showBanner(session) {
     var banner = $("attnbanner");
     banner.textContent = session.label + " finished — tap to switch";
@@ -186,16 +189,17 @@
   }
   function markAttention(sessions) {
     sessions.forEach(function (s) {
-      var was = lastBusy[s.id];
-      lastBusy[s.id] = s.busy;
-      if (was && !s.busy && s.alive && (!current || current.id !== s.id)) {
+      var prev = lastFinish[s.id];
+      lastFinish[s.id] = s.finished;
+      if (prev !== undefined && s.finished > prev && s.alive
+          && (!current || current.id !== s.id)) {
         attention[s.id] = true;
         if (current) showBanner(s);
       }
     });
-    Object.keys(lastBusy).forEach(function (id) {
+    Object.keys(lastFinish).forEach(function (id) {
       if (!sessions.some(function (s) { return s.id === id; })) {
-        delete lastBusy[id];
+        delete lastFinish[id];
         delete attention[id];
       }
     });
@@ -433,11 +437,10 @@
     if (unavailable) {
       $("punavailable").textContent =
         "Preview folder unavailable. Save renders into Pictures/SuperTerminal on the Mac (or set a folder in settings).";
-      $("pgrid").textContent = ""; tileEls = {};
-      $("pempty").classList.add("hidden");
-      return;
     }
-    $("pempty").classList.toggle("hidden", data.entries.length > 0);
+    // Entries render regardless of folder state: the live viewport tile
+    // rides the list even when the watched folder is unavailable.
+    $("pempty").classList.toggle("hidden", unavailable || data.entries.length > 0);
     var grid = $("pgrid"), seen = {};
     data.entries.forEach(function (entry) {
       seen[entry.id] = true;

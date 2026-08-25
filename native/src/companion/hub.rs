@@ -33,6 +33,11 @@ pub struct SessionInfo {
     pub label: String,
     pub alive: bool,
     pub busy: bool,
+    /// Monotonic long-job completion counter (cue-gate semantics: a
+    /// foreground job busy 5s+ returned to the prompt). The phone diffs it
+    /// per poll — a counter cannot be missed the way a sampled busy flag
+    /// transition can.
+    pub finished: u64,
 }
 
 struct Published<S> {
@@ -85,6 +90,7 @@ impl<S: Clone> CompanionHub<S> {
                     label: label.to_string(),
                     alive: true,
                     busy: false,
+                    finished: 0,
                 },
                 sender,
             },
@@ -114,6 +120,14 @@ impl<S: Clone> CompanionHub<S> {
         if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
             entry.snapshot = Some(snapshot);
             entry.revision += 1;
+        }
+    }
+
+    /// A long foreground job in this session just returned to the prompt
+    /// (cue-gate transition). No-op for unknown ids.
+    pub fn bump_finished(&self, id: &str) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
+            entry.info.finished += 1;
         }
     }
 
@@ -393,6 +407,16 @@ mod tests {
         assert_eq!(hub.take_spawns(), MAX_PENDING_SPAWNS);
         assert_eq!(hub.take_spawns(), 0, "drain resets");
         assert!(hub.request_spawn(), "capacity returns after drain");
+    }
+
+    #[test]
+    fn finish_counter_bumps_and_rides_session_info() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert_eq!(hub.sessions()[0].finished, 0);
+        hub.bump_finished("t1");
+        hub.bump_finished("t1");
+        assert_eq!(hub.sessions()[0].finished, 2);
+        hub.bump_finished("ghost"); // unknown ids are a quiet no-op
     }
 
     #[test]
