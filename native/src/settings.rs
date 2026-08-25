@@ -44,6 +44,9 @@ pub struct Settings {
     pub buddy_tts_pitch: f32,
     /// Imported custom themes, in the old app's export JSON format.
     pub custom_themes: Vec<serde_json::Value>,
+    /// Watched folder for the phone preview gallery; None = the default
+    /// `$HOME/Pictures/SuperTerminal`. Absolute path, `~` never stored.
+    pub preview_dir: Option<String>,
 }
 
 impl Default for Settings {
@@ -71,6 +74,7 @@ impl Default for Settings {
             buddy_tts_rate: 175,
             buddy_tts_pitch: 1.0,
             custom_themes: Vec::new(),
+            preview_dir: None,
         }
     }
 }
@@ -85,6 +89,15 @@ pub fn settings_dir() -> PathBuf {
 
 pub fn settings_path() -> PathBuf {
     settings_dir().join("settings.json")
+}
+
+/// The watched preview folder: the setting verbatim, else
+/// `$HOME/Pictures/SuperTerminal`. None only when HOME is unset.
+pub fn resolved_preview_dir(settings: &Settings) -> Option<PathBuf> {
+    if let Some(dir) = &settings.preview_dir {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures/SuperTerminal"))
 }
 
 impl Settings {
@@ -173,6 +186,7 @@ mod tests {
             buddy_tts_rate: 200,
             buddy_tts_pitch: 1.2,
             custom_themes: Vec::new(),
+            preview_dir: Some("/tmp/renders".into()),
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
@@ -211,6 +225,26 @@ mod tests {
         std::fs::write(&corrupt, "{ not json").unwrap();
         assert_eq!(Settings::load_from(&corrupt), Settings::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preview_dir_defaults_to_pictures_superterminal() {
+        let s = Settings::default();
+        assert_eq!(s.preview_dir, None);
+        let resolved = resolved_preview_dir(&s).expect("HOME is set in tests");
+        assert!(resolved.ends_with("Pictures/SuperTerminal"), "{resolved:?}");
+    }
+
+    #[test]
+    fn preview_dir_setting_overrides_default() {
+        let s = Settings {
+            preview_dir: Some("/tmp/renders".into()),
+            ..Settings::default()
+        };
+        assert_eq!(
+            resolved_preview_dir(&s),
+            Some(PathBuf::from("/tmp/renders"))
+        );
     }
 
     #[test]
