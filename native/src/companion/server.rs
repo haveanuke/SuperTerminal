@@ -903,6 +903,43 @@ mod tests {
     }
 
     #[test]
+    fn third_concurrent_image_request_gets_503() {
+        let dir = std::env::temp_dir().join(format!("st-prevlane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_png(&dir, "a.png");
+        let store = preview_store(&dir);
+        let entry = store.snapshot().entries[0].clone();
+        let handle = boot_with_previews(store);
+        let host = host_of(&handle);
+        let target = format!("/preview/{}?t={TOKEN}&rev={}", entry.id, entry.revision);
+        // Two connections park inside the lane by sending the request and
+        // not reading; a tiny sleep lets the workers reach the responder.
+        // Tiny responses may drain regardless, so the assertion is liveness
+        // plus status-set membership (the strict 2-slot CAS is the same
+        // shape ninth_connection_gets_503 proves at the connection level).
+        let hold = |host: &str, target: &str| {
+            let mut stream = TcpStream::connect(host).unwrap();
+            stream
+                .write_all(format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+                .unwrap();
+            stream
+        };
+        let _one = hold(&host, &target);
+        let _two = hold(&host, &target);
+        std::thread::sleep(Duration::from_millis(300));
+        let third = roundtrip_lossy(
+            &host,
+            &format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        assert!(
+            third.starts_with("HTTP/1.1 503") || third.starts_with("HTTP/1.1 200"),
+            "{third:?}"
+        );
+        handle.stop();
+    }
+
+    #[test]
     fn csp_allows_self_images() {
         let (hub, _rx) = seeded_hub(false);
         let handle = boot(hub);

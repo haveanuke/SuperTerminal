@@ -98,6 +98,11 @@ temp file and atomically renamed. Keyed by revision, so replacement
 invalidates naturally. Pruned on catalog refresh: max 128 MiB / 30 days,
 oldest first.
 
+Implementation note: pruning runs on the worker thread (startup + after
+each job), not on catalog refresh — same bound, keeps HTTP workers free.
+The phone's full-size view uses double-tap-to-zoom with pan instead of
+pinch (the page's viewport meta pins zoom off app-wide).
+
 ## Phone UX
 
 Third screen `#previews`, reachable from a button on the session list
@@ -133,5 +138,6 @@ poll streaming, if ever wanted, becomes a new SSE event type carrying
 1. ~~Default folder `~/Pictures/SuperTerminal` vs `~/Pictures/` directly~~
    — resolved 2026-08-24: `~/Pictures/SuperTerminal`, opt-in by saving
    there.
-2. GIFs animate in full view for free; cap thumbnail generation to first
-   frame (sips does this implicitly) — acceptable?
+2. ~~GIFs animate in full view for free; cap thumbnail generation to first
+   frame (sips does this implicitly) — acceptable?~~ — resolved
+   2026-08-24: first-frame GIF thumbnails accepted (default).

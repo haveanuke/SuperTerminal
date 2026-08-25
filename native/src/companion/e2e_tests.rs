@@ -288,7 +288,10 @@ fn page_has_a_previews_screen() {
         page.contains("unavailable"),
         "distinct unavailable notice is rendered"
     );
-    assert!(page.contains("thumb=1"), "tiles load the downscaled variant");
+    assert!(
+        page.contains("thumb=1"),
+        "tiles load the downscaled variant"
+    );
 }
 
 #[test]
