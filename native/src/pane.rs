@@ -337,6 +337,7 @@ impl TerminalPane {
             exited: None,
             selection_text: None,
             search_matches: Vec::new(),
+            history_rows: Vec::new(),
         };
 
         if let Some(session) = &session {

@@ -267,6 +267,7 @@ mod tests {
             exited: None,
             selection_text: None,
             search_matches: Vec::new(),
+            history_rows: Vec::new(),
         })
     }
 

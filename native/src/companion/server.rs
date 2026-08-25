@@ -507,6 +507,7 @@ mod tests {
             exited: None,
             selection_text: None,
             search_matches: Vec::new(),
+            history_rows: Vec::new(),
         };
         snapshot.rows[0][1].ch = 'e';
         snapshot.rows[0][2].ch = 'l';
@@ -740,6 +741,7 @@ mod tests {
             exited: None,
             selection_text: None,
             search_matches: Vec::new(),
+            history_rows: Vec::new(),
         };
         updated.rows[0] = "WORLD"
             .chars()

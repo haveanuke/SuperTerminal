@@ -200,6 +200,76 @@ fn scrolled_back_host_still_publishes_the_live_screen() {
 }
 
 #[test]
+fn history_tail_rides_the_companion_snapshot() {
+    let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    // 200 tagged lines: ~176 land in scrollback above the 24-line viewport.
+    session.write(b"printf 'L_%s\\n' $(seq 1 200)\r".to_vec());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut display = None;
+    while Instant::now() < deadline {
+        if session.take_dirty() {
+            let (snap, live) = session.sync_and_snapshot_with_live();
+            assert!(live.is_none(), "host never scrolled back");
+            let text: String = snap
+                .rows
+                .iter()
+                .flat_map(|row| row.iter().map(|cell| cell.ch))
+                .collect();
+            let done = text.contains("L_200");
+            display = Some(snap);
+            if done {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let display = display.expect("output never arrived");
+    let hist_text: String = display
+        .history_rows
+        .iter()
+        .flat_map(|row| row.iter().map(|cell| cell.ch))
+        .collect();
+    assert!(display.history_rows.len() <= 150, "tail is capped at 150");
+    assert!(
+        hist_text.contains("L_100"),
+        "lines above the viewport must ride the tail"
+    );
+
+    // The Mac-only sync never pays for the tail.
+    let plain = session.sync_and_snapshot();
+    assert!(plain.history_rows.is_empty(), "renderer path stays lean");
+
+    // Scrolled back, the tail rides the LIVE snapshot the phone publishes.
+    session.queue_scroll(60);
+    let (display2, live2) = session.sync_and_snapshot_with_live();
+    assert!(display2.history_rows.is_empty());
+    let live2 = live2.expect("scrolled-back sync must supply the live screen");
+    assert!(
+        !live2.history_rows.is_empty(),
+        "tail follows the live screen"
+    );
+
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
+fn page_renders_the_history_tail_above_the_live_screen() {
+    let page = include_str!("page.html");
+    // The page consumes the wire's history rows...
+    assert!(page.contains("snap.history"), "history rows are consumed");
+    // ...grows row containers in place instead of resetting the grid as
+    // history fills...
+    assert!(
+        page.contains("function ensureRows"),
+        "row containers grow without a full reset"
+    );
+    // ...and renders the tail visually receded from the live screen.
+    assert!(page.contains("HIST_DIM"), "history rows render dimmed");
+}
+
+#[test]
 fn page_gives_the_grid_the_whole_viewport() {
     let page = include_str!("page.html");
     // Full-height flex shell: the terminal screen is a 100dvh column where

@@ -21,6 +21,10 @@ pub struct WireSnapshot {
     pub cursor: Option<WireCursor>,
     pub app_cursor: bool,
     pub rows: Vec<Vec<WireRun>>,
+    /// Scrollback tail rendered above the live rows, oldest first. Empty
+    /// (and omitted from the JSON) when there is no history yet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Vec<WireRun>>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -102,44 +106,54 @@ fn hex(v: u32) -> String {
     format!("#{v:06x}")
 }
 
-pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireSnapshot {
-    let mut rows = Vec::with_capacity(snapshot.rows.len());
-    for row in &snapshot.rows {
-        let mut runs: Vec<WireRun> = Vec::new();
-        let mut current: Option<(Resolved, u16, String, u16)> = None; // (style, col, text, width)
-        for (col_index, cell) in row.iter().enumerate() {
-            if cell.wide_spacer {
-                // The spacer extends the previous glyph's footprint.
-                if let Some((_, _, _, width)) = current.as_mut() {
-                    *width += 1;
-                }
-                continue;
+fn row_runs(row: &[crate::term_session::SnapshotCell], theme: &Theme) -> Vec<WireRun> {
+    let mut runs: Vec<WireRun> = Vec::new();
+    let mut current: Option<(Resolved, u16, String, u16)> = None; // (style, col, text, width)
+    for (col_index, cell) in row.iter().enumerate() {
+        if cell.wide_spacer {
+            // The spacer extends the previous glyph's footprint.
+            if let Some((_, _, _, width)) = current.as_mut() {
+                *width += 1;
             }
-            let (resolved, blank) = resolve(&cell.style, theme);
-            // NUL cells render as spaces, exactly like the native renderer.
-            let ch = if blank || cell.ch == '\0' {
-                ' '
-            } else {
-                cell.ch
-            };
-            match current.as_mut() {
-                Some((style, _, text, width)) if *style == resolved => {
-                    text.push(ch);
-                    *width += 1;
+            continue;
+        }
+        let (resolved, blank) = resolve(&cell.style, theme);
+        // NUL cells render as spaces, exactly like the native renderer.
+        let ch = if blank || cell.ch == '\0' {
+            ' '
+        } else {
+            cell.ch
+        };
+        match current.as_mut() {
+            Some((style, _, text, width)) if *style == resolved => {
+                text.push(ch);
+                *width += 1;
+            }
+            _ => {
+                if let Some(run) = current.take() {
+                    runs.push(finish_run(run));
                 }
-                _ => {
-                    if let Some(run) = current.take() {
-                        runs.push(finish_run(run));
-                    }
-                    current = Some((resolved, col_index as u16, ch.to_string(), 1));
-                }
+                current = Some((resolved, col_index as u16, ch.to_string(), 1));
             }
         }
-        if let Some(run) = current.take() {
-            runs.push(finish_run(run));
-        }
-        rows.push(runs);
     }
+    if let Some(run) = current.take() {
+        runs.push(finish_run(run));
+    }
+    runs
+}
+
+pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireSnapshot {
+    let rows = snapshot
+        .rows
+        .iter()
+        .map(|row| row_runs(row, theme))
+        .collect();
+    let history = snapshot
+        .history_rows
+        .iter()
+        .map(|row| row_runs(row, theme))
+        .collect();
     let cursor = match (&snapshot.cursor.row, snapshot.cursor.style) {
         (Some(row), style) if style != CursorStyle::Hidden => Some(WireCursor {
             col: snapshot.cursor.col as u16,
@@ -153,6 +167,7 @@ pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireS
         cursor,
         app_cursor: snapshot.app_cursor_mode,
         rows,
+        history,
     }
 }
 
@@ -216,6 +231,7 @@ mod tests {
             exited: None,
             selection_text: None,
             search_matches: Vec::new(),
+            history_rows: Vec::new(),
         }
     }
 
@@ -225,6 +241,17 @@ mod tests {
 
     fn hex(v: u32) -> String {
         format!("#{v:06x}")
+    }
+
+    #[test]
+    fn history_rows_ride_a_separate_history_field() {
+        let mut s = snap(vec![vec![cell('l', style()), cell('i', style())]]);
+        s.history_rows = vec![vec![cell('h', style()), cell('i', style())]];
+        let wire = serialize_snapshot(&s, theme());
+        assert_eq!(wire.history.len(), 1);
+        assert_eq!(wire.history[0][0].text, "hi");
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"history\""), "{json}");
     }
 
     #[test]

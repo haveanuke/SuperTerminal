@@ -183,7 +183,15 @@ pub struct RenderableSnapshot {
     pub selection_text: Option<String>,
     /// Cells covered by search matches in the viewport, as (col, row) pairs.
     pub search_matches: Vec<(usize, usize)>,
+    /// Scrollback tail for the phone: up to [`HISTORY_TAIL`] lines just above
+    /// the LIVE screen, oldest first. Populated only on the companion sync
+    /// path, and only on the snapshot the phone publishes — the Mac renderer
+    /// never pays for it.
+    pub history_rows: Vec<Vec<SnapshotCell>>,
 }
+
+/// How many scrollback lines ride the companion snapshot ("a few screens").
+pub const HISTORY_TAIL: usize = 150;
 
 /// Deferred UI -> terminal operations, applied at the next sync.
 enum TermOp {
@@ -521,15 +529,24 @@ impl TermSession {
 
     /// Apply all deferred ops and copy out a render snapshot under ONE lock.
     pub fn sync_and_snapshot(&mut self) -> RenderableSnapshot {
-        self.sync_and_snapshot_with_live().0
+        self.sync_impl(false).0
     }
 
     /// Same single per-frame lock as [`Self::sync_and_snapshot`]; the second
     /// value is the LIVE screen (display offset ignored) whenever the host
     /// is scrolled back — the phone companion publishes that, never the
-    /// Mac's scrollback viewport. None means the display IS live.
+    /// Mac's scrollback viewport. None means the display IS live. Only this
+    /// path pays for the history tail, and it lands on whichever snapshot
+    /// the phone publishes.
     pub fn sync_and_snapshot_with_live(
         &mut self,
+    ) -> (RenderableSnapshot, Option<RenderableSnapshot>) {
+        self.sync_impl(true)
+    }
+
+    fn sync_impl(
+        &mut self,
+        with_history: bool,
     ) -> (RenderableSnapshot, Option<RenderableSnapshot>) {
         let mut term = self.term.lock();
 
@@ -665,7 +682,7 @@ impl TermSession {
             }
 
             let live_cursor_style = cursor.style;
-            let display = RenderableSnapshot {
+            let mut display = RenderableSnapshot {
                 cols,
                 lines,
                 rows,
@@ -680,52 +697,20 @@ impl TermSession {
                 exited: self.exited,
                 selection_text,
                 search_matches: search_matches.clone(),
+                history_rows: Vec::new(),
             };
             // Live screen for the companion: direct grid indexing (Line 0..
             // lines are the live rows regardless of scrollback position).
-            let live = (display_offset > 0).then(|| {
+            let mut live = (display_offset > 0).then(|| {
                 let grid = term.grid();
-                let mut live_rows = vec![
-                    vec![
-                        SnapshotCell {
-                            ch: ' ',
-                            style: CellStyle {
-                                fg: CellColor::Default,
-                                bg: CellColor::Default,
-                                bold: false,
-                                italic: false,
-                                dim: false,
-                                underline: false,
-                                inverse: false,
-                                hidden: false,
-                            },
-                            wide_spacer: false,
-                        };
-                        cols
-                    ];
-                    lines
-                ];
-                for (line, live_row) in live_rows.iter_mut().enumerate() {
-                    let row = &grid[Line(line as i32)];
-                    for (col, out) in live_row.iter_mut().enumerate() {
-                        let cell = &row[Column(col)];
-                        let flags = cell.flags;
-                        *out = SnapshotCell {
-                            ch: cell.c,
-                            style: CellStyle {
-                                fg: convert_color(cell.fg),
-                                bg: convert_color(cell.bg),
-                                bold: flags.contains(Flags::BOLD),
-                                italic: flags.contains(Flags::ITALIC),
-                                dim: flags.contains(Flags::DIM),
-                                underline: flags.intersects(Flags::ALL_UNDERLINES),
-                                inverse: flags.contains(Flags::INVERSE),
-                                hidden: flags.contains(Flags::HIDDEN),
-                            },
-                            wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
-                        };
-                    }
-                }
+                let live_rows = (0..lines)
+                    .map(|line| {
+                        let row = &grid[Line(line as i32)];
+                        (0..cols)
+                            .map(|col| snapshot_cell(&row[Column(col)]))
+                            .collect()
+                    })
+                    .collect();
                 RenderableSnapshot {
                     cols,
                     lines,
@@ -746,8 +731,28 @@ impl TermSession {
                     exited: self.exited,
                     selection_text: None,
                     search_matches: Vec::new(),
+                    history_rows: Vec::new(),
                 }
             });
+            if with_history {
+                // The tail is always relative to the LIVE screen (negative
+                // grid lines), so Mac-side scrollback never shifts it.
+                let grid = term.grid();
+                let avail = grid.history_size().min(HISTORY_TAIL);
+                let tail: Vec<Vec<SnapshotCell>> = (1..=avail)
+                    .rev()
+                    .map(|back| {
+                        let row = &grid[Line(-(back as i32))];
+                        (0..cols)
+                            .map(|col| snapshot_cell(&row[Column(col)]))
+                            .collect()
+                    })
+                    .collect();
+                match live.as_mut() {
+                    Some(live) => live.history_rows = tail,
+                    None => display.history_rows = tail,
+                }
+            }
             (display, live)
         }
     }
@@ -852,6 +857,26 @@ fn viewport_to_buffer<T>(
     let line = Line(viewport_row as i32 - display_offset as i32);
     let col = Column(col.min(term.columns().saturating_sub(1)));
     alacritty_terminal::index::Point::new(line, col)
+}
+
+/// One grid cell -> snapshot cell, shared by the live-screen and
+/// history-tail copies (the display path maps through `renderable_content`).
+fn snapshot_cell(cell: &alacritty_terminal::term::cell::Cell) -> SnapshotCell {
+    let flags = cell.flags;
+    SnapshotCell {
+        ch: cell.c,
+        style: CellStyle {
+            fg: convert_color(cell.fg),
+            bg: convert_color(cell.bg),
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+            dim: flags.contains(Flags::DIM),
+            underline: flags.intersects(Flags::ALL_UNDERLINES),
+            inverse: flags.contains(Flags::INVERSE),
+            hidden: flags.contains(Flags::HIDDEN),
+        },
+        wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
+    }
 }
 
 fn convert_color(color: AnsiColor) -> CellColor {

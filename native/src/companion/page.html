@@ -176,7 +176,10 @@
     var wrap = $("gridwrap");
     var top = wrap.scrollTop, left = wrap.scrollLeft;
     if (lastSnap && lastSnap.cursor) {
-      var ctop = lastSnap.cursor.row * lh;
+      // The history tail sits above the live rows, so the cursor's DOM
+      // position is offset by its height.
+      var hlen = lastSnap.history ? lastSnap.history.length : 0;
+      var ctop = (hlen + lastSnap.cursor.row) * lh;
       if (ctop < top || ctop + lh > top + wrap.clientHeight)
         top = Math.max(0, ctop + lh + 8 - wrap.clientHeight);
       var cleft = lastSnap.cursor.col * cw;
@@ -194,12 +197,15 @@
     }
   }
 
-  // Row-level DOM patching: one absolutely-positioned container per grid
-  // row, rebuilt only when that row's runs changed (compared by their JSON
-  // signature). A streaming frame usually touches a handful of rows; the
-  // rest keep their DOM nodes. Shape changes (cols/lines/font) reset all.
+  // Row-level DOM patching: one absolutely-positioned container per row —
+  // the history tail first (dimmed), then the live grid — rebuilt only when
+  // that row's runs changed (compared by their JSON signature). A streaming
+  // frame usually touches a handful of rows; the rest keep their DOM nodes.
+  // Cols/font changes reset everything; row-count changes (history filling
+  // in, resizes) just grow or trim the container list in place.
+  var HIST_DIM = "0.62";
   var rowEls = [], rowSigs = [], gridShape = "", cursorEl = null;
-  function resetGrid(snap) {
+  function resetGrid() {
     var grid = $("grid");
     grid.textContent = "";
     rowEls = []; rowSigs = [];
@@ -208,50 +214,65 @@
     cursorEl.id = "cursor";
     cursorEl.className = "hidden";
     grid.appendChild(cursorEl);
-    for (var r = 0; r < snap.rows.length; r++) {
+  }
+  function ensureRows(count) {
+    var grid = $("grid");
+    while (rowEls.length < count) {
       var rowEl = document.createElement("div");
       rowEl.style.position = "absolute";
       rowEl.style.left = "0";
-      rowEl.style.top = r * lh + "px";
+      rowEl.style.top = rowEls.length * lh + "px";
       rowEl.style.height = lh + "px";
       grid.appendChild(rowEl);
       rowEls.push(rowEl); rowSigs.push("");
     }
+    while (rowEls.length > count) {
+      $("grid").removeChild(rowEls.pop());
+      rowSigs.pop();
+    }
+  }
+  function patchRow(index, runs, dim) {
+    // The dim flag joins the signature so a container flips style when a
+    // row crosses the history/live boundary.
+    var sig = (dim ? "d" : "l") + JSON.stringify(runs);
+    if (sig === rowSigs[index]) return;
+    rowSigs[index] = sig;
+    var rowEl = rowEls[index];
+    rowEl.style.opacity = dim ? HIST_DIM : "";
+    rowEl.textContent = "";
+    runs.forEach(function (run) {
+      var span = document.createElement("span");
+      span.textContent = run.text;
+      span.style.left = run.col * cw + "px";
+      span.style.top = "0px";
+      span.style.width = run.width * cw + "px";
+      span.style.overflow = "hidden";
+      span.style.color = run.fg;
+      if (run.bg) { span.style.background = run.bg; span.style.height = lh + "px"; }
+      if (run.b) span.style.fontWeight = "700";
+      if (run.i) span.style.fontStyle = "italic";
+      if (run.u) span.style.textDecoration = "underline";
+      rowEl.appendChild(span);
+    });
   }
   function render(snap) {
     lastSnap = snap;
     var grid = $("grid");
     if (snap.cols !== fitFor || !cw) applyFit(snap.cols);
     if (snap.error) { grid.textContent = snap.error; gridShape = ""; return; }
+    var hist = snap.history || [];
+    var h = hist.length;
     grid.style.width = snap.cols * cw + "px";
-    grid.style.height = snap.lines * lh + "px";
-    var shape = snap.cols + "x" + snap.rows.length + "@" + lastSize;
-    if (shape !== gridShape) { gridShape = shape; resetGrid(snap); }
-    snap.rows.forEach(function (runs, row) {
-      var sig = JSON.stringify(runs);
-      if (sig === rowSigs[row]) return;
-      rowSigs[row] = sig;
-      var rowEl = rowEls[row];
-      rowEl.textContent = "";
-      runs.forEach(function (run) {
-        var span = document.createElement("span");
-        span.textContent = run.text;
-        span.style.left = run.col * cw + "px";
-        span.style.top = "0px";
-        span.style.width = run.width * cw + "px";
-        span.style.overflow = "hidden";
-        span.style.color = run.fg;
-        if (run.bg) { span.style.background = run.bg; span.style.height = lh + "px"; }
-        if (run.b) span.style.fontWeight = "700";
-        if (run.i) span.style.fontStyle = "italic";
-        if (run.u) span.style.textDecoration = "underline";
-        rowEl.appendChild(span);
-      });
-    });
+    grid.style.height = (h + snap.lines) * lh + "px";
+    var shape = snap.cols + "@" + lastSize;
+    if (shape !== gridShape) { gridShape = shape; resetGrid(); }
+    ensureRows(h + snap.rows.length);
+    hist.forEach(function (runs, row) { patchRow(row, runs, true); });
+    snap.rows.forEach(function (runs, row) { patchRow(h + row, runs, false); });
     if (snap.cursor) {
       cursorEl.classList.remove("hidden");
       cursorEl.style.left = snap.cursor.col * cw + "px";
-      cursorEl.style.top = snap.cursor.row * lh + "px";
+      cursorEl.style.top = (h + snap.cursor.row) * lh + "px";
       cursorEl.style.width = cw + "px";
       cursorEl.style.height = lh + "px";
     } else {
