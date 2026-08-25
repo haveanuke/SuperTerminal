@@ -47,6 +47,9 @@ pub struct Settings {
     /// Watched folder for the phone preview gallery; None = the default
     /// `$HOME/Pictures/SuperTerminal`. Absolute path, `~` never stored.
     pub preview_dir: Option<String>,
+    /// Live Blender viewport tile in the phone gallery (captures via the
+    /// blender-mcp addon on localhost, only while the phone is watching).
+    pub blender_viewport: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +78,7 @@ impl Default for Settings {
             buddy_tts_pitch: 1.0,
             custom_themes: Vec::new(),
             preview_dir: None,
+            blender_viewport: false,
         }
     }
 }
@@ -253,6 +257,7 @@ mod tests {
             buddy_tts_pitch: 1.2,
             custom_themes: Vec::new(),
             preview_dir: Some("/tmp/renders".into()),
+            blender_viewport: true,
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);

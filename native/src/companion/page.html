@@ -47,6 +47,8 @@
   #pgrid .tile { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   #pgrid .tile img { width:100%; aspect-ratio:1; object-fit:cover; display:block; background:var(--bg); }
   #pgrid .tile .cap { padding:6px 8px; font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #pgrid .tile.live { border-color:var(--accent); }
+  #pgrid .tile.live .cap { color:var(--accent); }
   #pfull { position:fixed; inset:0; background:rgba(0,0,0,.92); z-index:3; display:flex; flex-direction:column; }
   #pfullwrap { flex:1 1 0; overflow:auto; -webkit-overflow-scrolling:touch; }
   #pfullwrap img { display:block; margin:auto; max-width:100%; }
@@ -421,7 +423,8 @@
         setTimeout(function () { loadThumb(img, entry, attempt + 1); }, 1000);
       }
     };
-    img.src = imgSrc(entry, true) + "&a=" + attempt;
+    // Viewport frames are already small and live in memory: no thumb.
+    img.src = imgSrc(entry, entry.kind !== "viewport") + "&a=" + attempt;
   }
   function renderPreviews(data) {
     $("pdot").classList.add("on");
@@ -454,8 +457,15 @@
         loadThumb(tile.firstChild, entry, 0);
       }
       tile.entry = entry;
-      tile.children[1].textContent = entry.name;
+      tile.children[1].textContent =
+        entry.kind === "viewport" ? "LIVE · " + entry.name : entry.name;
+      tile.classList.toggle("live", entry.kind === "viewport");
       grid.appendChild(tile); // re-appending keeps newest-first order
+      // A full view open on the live tile follows each new frame.
+      if (pfullEntry && pfullEntry.id === entry.id && pfullEntry.revision !== entry.revision) {
+        pfullEntry = entry;
+        $("pfullimg").src = imgSrc(entry, false);
+      }
     });
     Object.keys(tileEls).forEach(function (id) {
       if (!seen[id]) { grid.removeChild(tileEls[id]); delete tileEls[id]; }
@@ -479,7 +489,9 @@
     $("list").classList.remove("hidden");
     refreshSessions();
   }
+  var pfullEntry = null;
   function openFull(entry) {
+    pfullEntry = entry;
     $("pfull").classList.remove("hidden");
     $("pfulltitle").textContent = entry.name;
     $("pfullcap").textContent = new Date(entry.modifiedAt * 1000).toLocaleString();
@@ -492,6 +504,7 @@
   $("previewsbtn").addEventListener("click", openPreviews);
   $("pback").addEventListener("click", closePreviews);
   $("pfullclose").addEventListener("click", function () {
+    pfullEntry = null;
     $("pfull").classList.add("hidden");
     $("pfullimg").src = "";
   });

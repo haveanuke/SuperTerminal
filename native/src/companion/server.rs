@@ -204,6 +204,25 @@ fn serve_preview<S: InputSink>(
         return;
     };
     let etag = format!("\"{revision}\"");
+    // The live viewport serves from memory; the same order holds — the
+    // exact revision must exist before any 304.
+    if id == super::previews::VIEWPORT_ID {
+        let Some(bytes) = shared.previews.viewport_frame(revision) else {
+            let _ = respond(stream, "404 Not Found", &[], b"");
+            return;
+        };
+        if request.header("if-none-match") == Some(etag.as_str()) {
+            let _ = respond(stream, "304 Not Modified", &[("ETag", &etag)], b"");
+            return;
+        }
+        let _ = respond(
+            stream,
+            "200 OK",
+            &[("Content-Type", "image/png"), ("ETag", &etag)],
+            &bytes,
+        );
+        return;
+    }
     let snap = shared.previews.snapshot();
     // Full verification BEFORE any conditional answer: a 304 is a promise
     // the bytes are still exactly what this revision named, so an unknown
@@ -356,17 +375,23 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
         }
         (Method::Get, "/previews") => {
             let snap = shared.previews.snapshot();
-            let entries: Vec<serde_json::Value> = snap
-                .entries
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "id": e.id, "kind": "image", "name": e.name,
-                        "revision": e.revision, "modifiedAt": e.modified_at,
-                        "bytes": e.bytes,
-                    })
+            // The live viewport leads the list when a frame is fresh; it is
+            // independent of the watched folder's availability.
+            let mut entries: Vec<serde_json::Value> = Vec::with_capacity(snap.entries.len() + 1);
+            if let Some(live) = shared.previews.viewport_entry() {
+                entries.push(serde_json::json!({
+                    "id": live.id, "kind": "viewport", "name": live.name,
+                    "revision": live.revision, "modifiedAt": live.modified_at,
+                    "bytes": live.bytes,
+                }));
+            }
+            entries.extend(snap.entries.iter().map(|e| {
+                serde_json::json!({
+                    "id": e.id, "kind": "image", "name": e.name,
+                    "revision": e.revision, "modifiedAt": e.modified_at,
+                    "bytes": e.bytes,
                 })
-                .collect();
+            }));
             let json = serde_json::json!({
                 "state": if snap.available { "ok" } else { "unavailable" },
                 "entries": entries,
@@ -1044,6 +1069,40 @@ mod tests {
             third.starts_with("HTTP/1.1 503") || third.starts_with("HTTP/1.1 200"),
             "{third:?}"
         );
+        handle.stop();
+    }
+
+    #[test]
+    fn live_viewport_rides_the_gallery_and_serves_from_memory() {
+        let store = Arc::new(crate::companion::previews::PreviewStore::new(None));
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"frame");
+        store.set_viewport_frame(png);
+        let revision = store.viewport_entry().unwrap().revision;
+        let handle = boot_with_previews(Arc::clone(&store));
+        let host = host_of(&handle);
+        // Listed even though the watched folder is unavailable.
+        let list = get(&host, &format!("/previews?t={TOKEN}"));
+        assert!(list.contains("\"kind\":\"viewport\""), "{list}");
+        assert!(list.contains("\"id\":\"live\""), "{list}");
+        assert!(list.contains("\"state\":\"unavailable\""), "{list}");
+        // Bytes come from memory with the ETag discipline of file entries.
+        let ok = roundtrip_lossy(
+            &host,
+            &format!("GET /preview/live?t={TOKEN}&rev={revision} HTTP/1.1\r\nHost: {host}\r\n\r\n"),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("Content-Type: image/png"), "{ok}");
+        assert!(ok.ends_with("frame"), "{ok}");
+        let not_modified = roundtrip(
+            &host,
+            &format!(
+                "GET /preview/live?t={TOKEN}&rev={revision} HTTP/1.1\r\nHost: {host}\r\nIf-None-Match: \"{revision}\"\r\n\r\n"
+            ),
+        );
+        assert!(not_modified.starts_with("HTTP/1.1 304"), "{not_modified}");
+        let stale = get(&host, &format!("/preview/live?t={TOKEN}&rev=v999999"));
+        assert!(stale.starts_with("HTTP/1.1 404"), "{stale}");
         handle.stop();
     }
 

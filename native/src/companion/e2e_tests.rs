@@ -274,6 +274,20 @@ fn page_renders_the_history_tail_above_the_live_screen() {
 }
 
 #[test]
+fn page_treats_the_live_viewport_tile_specially() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("kind !== \"viewport\""),
+        "viewport tiles skip the thumb variant"
+    );
+    assert!(page.contains("LIVE"), "live tile is labeled");
+    assert!(
+        page.contains("pfullEntry"),
+        "an open full view follows new live revisions"
+    );
+}
+
+#[test]
 fn page_flags_rooms_that_finished() {
     let page = include_str!("page.html");
     assert!(

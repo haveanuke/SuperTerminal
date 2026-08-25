@@ -14,6 +14,20 @@ pub const MAX_SCAN: usize = 512;
 pub const SNAPSHOT_TTL_MS: u64 = 2000;
 pub const MAX_FULL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The live Blender viewport's synthetic entry id (spec phase 2): one slot,
+/// served from memory, revision-bumped per captured frame.
+pub const VIEWPORT_ID: &str = "live";
+/// A frame older than this stops being listed — the tile disappears rather
+/// than showing a frozen viewport as if it were live.
+pub const VIEWPORT_FRESH_MS: u64 = 15_000;
+/// A /previews list within this window counts as "someone is watching";
+/// the bridge captures only then, so Blender is never polled for nobody.
+pub const DEMAND_WINDOW_MS: u64 = 15_000;
+
+fn viewport_fresh(age: Duration) -> bool {
+    age <= Duration::from_millis(VIEWPORT_FRESH_MS)
+}
+
 const EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 
 #[derive(Debug, Clone)]
@@ -57,8 +71,18 @@ struct Inner {
     cached: Option<(Instant, Arc<CatalogSnapshot>)>,
 }
 
+struct Viewport {
+    bytes: Arc<Vec<u8>>,
+    revision: String,
+    seq: u64,
+    at: Instant,
+}
+
 pub struct PreviewStore {
     inner: Mutex<Inner>,
+    viewport: Mutex<Option<Viewport>>,
+    viewport_enabled: std::sync::atomic::AtomicBool,
+    last_demand: Mutex<Option<Instant>>,
 }
 
 /// FNV-1a over the identity tuple: replacement (new inode/size/mtime) is a
@@ -93,7 +117,61 @@ impl PreviewStore {
                 ids: HashMap::new(),
                 cached: None,
             }),
+            viewport: Mutex::new(None),
+            viewport_enabled: std::sync::atomic::AtomicBool::new(false),
+            last_demand: Mutex::new(None),
         }
+    }
+
+    /// Publish the latest captured Blender frame; each call is a new
+    /// revision, so ETag polling sees every frame exactly once.
+    pub fn set_viewport_frame(&self, bytes: Vec<u8>) {
+        let mut slot = self.viewport.lock().unwrap();
+        let seq = slot.as_ref().map(|v| v.seq + 1).unwrap_or(1);
+        *slot = Some(Viewport {
+            bytes: Arc::new(bytes),
+            revision: format!("v{seq}"),
+            seq,
+            at: Instant::now(),
+        });
+    }
+
+    /// The synthetic gallery entry for the live tile — Some only while a
+    /// frame is fresh, independent of the watched dir's availability.
+    pub fn viewport_entry(&self) -> Option<PreviewEntry> {
+        let slot = self.viewport.lock().unwrap();
+        let viewport = slot.as_ref()?;
+        viewport_fresh(viewport.at.elapsed()).then(|| PreviewEntry {
+            id: VIEWPORT_ID.into(),
+            name: "blender viewport".into(),
+            revision: viewport.revision.clone(),
+            modified_at: 0,
+            bytes: viewport.bytes.len() as u64,
+        })
+    }
+
+    /// Frame bytes for an exact revision; None = stale (phone re-lists).
+    pub fn viewport_frame(&self, revision: &str) -> Option<Arc<Vec<u8>>> {
+        let slot = self.viewport.lock().unwrap();
+        let viewport = slot.as_ref()?;
+        (viewport.revision == revision).then(|| Arc::clone(&viewport.bytes))
+    }
+
+    pub fn set_viewport_enabled(&self, on: bool) {
+        self.viewport_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the bridge should capture: the feature is on AND a phone
+    /// listed the gallery within the demand window.
+    pub fn viewport_wanted(&self) -> bool {
+        self.viewport_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .last_demand
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(DEMAND_WINDOW_MS))
     }
 
     /// Swap the watched folder atomically; the next snapshot() rescans.
@@ -104,6 +182,7 @@ impl PreviewStore {
     }
 
     pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        *self.last_demand.lock().unwrap() = Some(Instant::now());
         let mut inner = self.inner.lock().unwrap();
         if let Some((at, snap)) = &inner.cached {
             if at.elapsed() < Duration::from_millis(SNAPSHOT_TTL_MS) {
@@ -491,6 +570,53 @@ mod tests {
             snap.open_verified(&entry.id, &entry.revision).is_none(),
             "stale mtime must fail closed"
         );
+    }
+
+    #[test]
+    fn viewport_frames_ride_a_synthetic_entry_with_moving_revisions() {
+        let store = PreviewStore::new(None);
+        assert!(store.viewport_entry().is_none(), "no frame yet");
+        store.set_viewport_frame(vec![1, 2, 3]);
+        let first = store.viewport_entry().expect("fresh frame is listed");
+        assert_eq!(first.id, VIEWPORT_ID);
+        assert_eq!(first.bytes, 3);
+        assert_eq!(
+            store.viewport_frame(&first.revision).map(|b| b.to_vec()),
+            Some(vec![1, 2, 3])
+        );
+        assert!(
+            store.viewport_frame("v999999").is_none(),
+            "stale revisions 404"
+        );
+        store.set_viewport_frame(vec![4, 5]);
+        let second = store.viewport_entry().unwrap();
+        assert_ne!(
+            first.revision, second.revision,
+            "each frame is a new revision"
+        );
+        // The gallery entry appears even when the folder is unavailable —
+        // the live tile does not depend on the watched dir.
+        assert!(!store.snapshot().available);
+    }
+
+    #[test]
+    fn viewport_freshness_window_expires_stale_frames() {
+        assert!(viewport_fresh(Duration::from_secs(2)));
+        assert!(!viewport_fresh(Duration::from_millis(
+            VIEWPORT_FRESH_MS + 1
+        )));
+    }
+
+    #[test]
+    fn viewport_capture_is_demand_and_toggle_gated() {
+        let store = PreviewStore::new(None);
+        assert!(!store.viewport_wanted(), "off by default, no demand yet");
+        store.set_viewport_enabled(true);
+        assert!(!store.viewport_wanted(), "enabled but nobody is looking");
+        let _ = store.snapshot(); // a phone listed the gallery
+        assert!(store.viewport_wanted());
+        store.set_viewport_enabled(false);
+        assert!(!store.viewport_wanted(), "toggle wins over demand");
     }
 
     #[test]

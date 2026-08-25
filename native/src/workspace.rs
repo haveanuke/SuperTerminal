@@ -1056,10 +1056,13 @@ impl Workspace {
         let previews = Arc::new(crate::companion::previews::PreviewStore::new(
             crate::settings::resolved_preview_dir(&self.settings),
         ));
-        let thumbs = crate::companion::thumbs::Thumbnailer::new(
-            crate::companion::thumbs::default_cache_dir()
-                .unwrap_or_else(|| std::env::temp_dir().join("st-thumbs")),
-        );
+        previews.set_viewport_enabled(self.settings.blender_viewport);
+        let cache_dir = crate::companion::thumbs::default_cache_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("st-thumbs"));
+        // The bridge gates itself on the setting + phone demand and dies
+        // with the store, so spawning unconditionally is free when off.
+        crate::companion::blender::spawn(Arc::downgrade(&previews), cache_dir.clone());
+        let thumbs = crate::companion::thumbs::Thumbnailer::new(cache_dir);
         let mut started = None;
         for port in 43110..43121u16 {
             match server::start(
@@ -3050,6 +3053,23 @@ impl Workspace {
                     cx,
                 )
             }))
+            .child(self.chip_button(
+                if self.settings.blender_viewport {
+                    "live viewport: on"
+                } else {
+                    "live viewport: off"
+                },
+                self.settings.blender_viewport,
+                |ws, _window, cx| {
+                    ws.settings.blender_viewport = !ws.settings.blender_viewport;
+                    let _ = ws.settings.save();
+                    if let Some(store) = &ws.companion_previews {
+                        store.set_viewport_enabled(ws.settings.blender_viewport);
+                    }
+                    cx.notify();
+                },
+                cx,
+            ))
     }
 
     fn render_background_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
