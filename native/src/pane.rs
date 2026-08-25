@@ -430,6 +430,16 @@ impl TerminalPane {
         self.session.as_ref().is_some_and(|s| s.foreground_busy())
     }
 
+    /// The phone's busy dot. A foreground app alone is not "working" —
+    /// claude parked at its prompt owns the tty for hours, which painted
+    /// every session orange. Working = an app owns the tty AND it produced
+    /// output within the window (streaming/spinners repaint continuously;
+    /// prompts are quiet). Tradeoff: a silent long job reads idle after
+    /// the window.
+    pub fn companion_busy(&self) -> bool {
+        busy_dot(self.foreground_busy(), self.last_activity.elapsed())
+    }
+
     /// (cwd, foreground-job-running) in one probe.
     pub fn status(&self) -> (Option<String>, bool) {
         self.session
@@ -669,6 +679,16 @@ impl TerminalPane {
         let row = (y / f32::from(self.line_height)) as usize;
         (col, row)
     }
+}
+
+/// Output silence longer than this reads as "not working" for the phone's
+/// busy dot, even while an app owns the tty.
+pub const COMPANION_BUSY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The busy-dot predicate, pure for testing: an app owns the tty AND the
+/// pty produced output within the window.
+fn busy_dot(foreground_busy: bool, since_output: std::time::Duration) -> bool {
+    foreground_busy && since_output < COMPANION_BUSY_WINDOW
 }
 
 /// Lines to scroll per auto-scroll step while a selection drag sits past the
@@ -1480,7 +1500,20 @@ impl TerminalPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_runs, drag_scroll_lines, CellLook};
+    use super::{busy_dot, coalesce_runs, drag_scroll_lines, CellLook, COMPANION_BUSY_WINDOW};
+
+    #[test]
+    fn busy_dot_requires_recent_output_not_just_a_foreground_app() {
+        use std::time::Duration;
+        // claude parked at its prompt: owns the tty, quiet for minutes.
+        assert!(!busy_dot(true, Duration::from_secs(60)));
+        // claude actively streaming: owns the tty, output moments ago.
+        assert!(busy_dot(true, Duration::from_millis(300)));
+        // shell at its prompt: never busy, however recent the echo.
+        assert!(!busy_dot(false, Duration::from_millis(100)));
+        // boundary: silence at the window flips to idle.
+        assert!(!busy_dot(true, COMPANION_BUSY_WINDOW));
+    }
 
     const LOOK: CellLook = CellLook {
         fg: 0xffffff,

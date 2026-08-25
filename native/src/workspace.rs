@@ -667,7 +667,7 @@ impl Workspace {
                         }
                         found
                     };
-                    let busy = pane.read(cx).foreground_busy();
+                    let busy = pane.read(cx).companion_busy();
                     hub.set_meta(id, &label, true, busy);
                 }
                 // Prune entries whose pane is gone: their streams end and
