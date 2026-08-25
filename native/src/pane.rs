@@ -432,12 +432,23 @@ impl TerminalPane {
 
     /// The phone's busy dot. A foreground app alone is not "working" —
     /// claude parked at its prompt owns the tty for hours, which painted
-    /// every session orange. Working = an app owns the tty AND it produced
-    /// output within the window (streaming/spinners repaint continuously;
-    /// prompts are quiet). Tradeoff: a silent long job reads idle after
-    /// the window.
+    /// every session orange — but output activity alone is not "working"
+    /// either: a terminal blocked on a long silent job goes quiet and read
+    /// idle. Neither is knowable from the pty, so instrumented agents
+    /// report their own state through the adapters' lifecycle hooks and
+    /// that wins; the output window survives only as the fallback for
+    /// uninstrumented foregrounds. See [`busy_dot`].
     pub fn companion_busy(&self) -> bool {
-        busy_dot(self.foreground_busy(), self.last_activity.elapsed())
+        let (agent, pgid) = match self.session.as_ref() {
+            Some(session) => (session.agent_state(), session.foreground_pgid()),
+            None => (None, 0),
+        };
+        busy_dot(
+            self.foreground_busy(),
+            self.last_activity.elapsed(),
+            agent,
+            pgid,
+        )
     }
 
     /// (cwd, foreground-job-running) in one probe.
@@ -685,10 +696,46 @@ impl TerminalPane {
 /// busy dot, even while an app owns the tty.
 pub const COMPANION_BUSY_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// The busy-dot predicate, pure for testing: an app owns the tty AND the
-/// pty produced output within the window.
-fn busy_dot(foreground_busy: bool, since_output: std::time::Duration) -> bool {
-    foreground_busy && since_output < COMPANION_BUSY_WINDOW
+/// The busy-dot predicate, pure for testing.
+///
+/// Precedence, strongest evidence first:
+/// 1. Nothing owns the tty -> idle. The shell prompt is unambiguous.
+/// 2. An INSTRUMENTED agent owns it -> believe the agent. Its own lifecycle
+///    hooks are the only source that knows the difference between "thinking"
+///    and "waiting for you"; the pty cannot see it, and no macOS API can
+///    recover it after the fact.
+/// 3. Otherwise fall back to recent output. This is a guess, and a knowingly
+///    imperfect one: a silent long job reads idle. It only applies to
+///    uninstrumented foregrounds.
+///
+/// Known limit: claude runs no hook after a USER INTERRUPT (Ctrl-C), so the
+/// state stays `working`. The next prompt does NOT clear it — that fires
+/// `UserPromptSubmit`, which sets working again — so the dot stays busy
+/// until the END of that next turn, or until the session exits or a new
+/// claude launches and truncates the file. This IS stickier than the old
+/// behavior, where the output heuristic fell idle after four seconds; it
+/// errs toward false-busy rather than false-idle, which is the direction
+/// this feature exists to correct. Detecting the interrupt from the byte
+/// stream was tried and removed: pasted text legitimately contains 0x03,
+/// and clearing on a paste would make a WORKING agent read idle.
+///
+/// The agent's pid must match the process group that owns the tty, or the
+/// file is a leftover from an agent that already exited and we ignore it.
+fn busy_dot(
+    foreground_busy: bool,
+    since_output: std::time::Duration,
+    agent: Option<(crate::term_session::AgentState, i32)>,
+    foreground_pgid: i32,
+) -> bool {
+    if !foreground_busy {
+        return false;
+    }
+    if let Some((state, pid)) = agent {
+        if pid == foreground_pgid {
+            return state == crate::term_session::AgentState::Working;
+        }
+    }
+    since_output < COMPANION_BUSY_WINDOW
 }
 
 /// Lines to scroll per auto-scroll step while a selection drag sits past the
@@ -1505,18 +1552,60 @@ impl TerminalPane {
 #[cfg(test)]
 mod tests {
     use super::{busy_dot, coalesce_runs, drag_scroll_lines, CellLook, COMPANION_BUSY_WINDOW};
+    use crate::term_session::AgentState;
 
     #[test]
-    fn busy_dot_requires_recent_output_not_just_a_foreground_app() {
+    fn uninstrumented_foreground_falls_back_to_recent_output() {
         use std::time::Duration;
-        // claude parked at its prompt: owns the tty, quiet for minutes.
-        assert!(!busy_dot(true, Duration::from_secs(60)));
-        // claude actively streaming: owns the tty, output moments ago.
-        assert!(busy_dot(true, Duration::from_millis(300)));
+        // No agent has reported, so the heuristic is all we have.
+        assert!(!busy_dot(true, Duration::from_secs(60), None, 0));
+        assert!(busy_dot(true, Duration::from_millis(300), None, 0));
         // shell at its prompt: never busy, however recent the echo.
-        assert!(!busy_dot(false, Duration::from_millis(100)));
+        assert!(!busy_dot(false, Duration::from_millis(100), None, 0));
         // boundary: silence at the window flips to idle.
-        assert!(!busy_dot(true, COMPANION_BUSY_WINDOW));
+        assert!(!busy_dot(true, COMPANION_BUSY_WINDOW, None, 0));
+    }
+
+    #[test]
+    fn an_instrumented_agent_overrides_the_output_guess() {
+        use std::time::Duration;
+        // THE BUG: claude blocked on a long silent job. Quiet for minutes,
+        // so the heuristic says idle — but the agent says it is working.
+        assert!(busy_dot(
+            true,
+            Duration::from_secs(600),
+            Some((AgentState::Working, 1793)),
+            1793
+        ));
+        // The mirror case: claude parked at its prompt having just printed
+        // its answer. Output is recent, but it is waiting on the human.
+        assert!(!busy_dot(
+            true,
+            Duration::from_millis(50),
+            Some((AgentState::Idle, 1793)),
+            1793
+        ));
+    }
+
+    #[test]
+    fn a_stale_state_file_is_ignored() {
+        use std::time::Duration;
+        // claude exited leaving "working" behind, and something else owns
+        // the tty now: the pid no longer matches, so fall back rather than
+        // pin the dot on forever.
+        assert!(!busy_dot(
+            true,
+            Duration::from_secs(60),
+            Some((AgentState::Working, 1793)),
+            4242
+        ));
+        // And a stale file can never make a shell prompt look busy.
+        assert!(!busy_dot(
+            false,
+            Duration::from_millis(10),
+            Some((AgentState::Working, 1793)),
+            1793
+        ));
     }
 
     const LOOK: CellLook = CellLook {

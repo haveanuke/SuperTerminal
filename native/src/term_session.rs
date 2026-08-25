@@ -53,6 +53,30 @@ fn adapters_enabled() -> bool {
     TOOL_ADAPTERS.load(Ordering::Relaxed)
 }
 
+/// What an instrumented agent says it is doing. The pty cannot answer this:
+/// `tcgetpgrp` reports only that SOME app owns the terminal, which is true
+/// for the whole hours-long life of a claude session whether it is working
+/// or parked at its prompt. The agent's own lifecycle hooks are the only
+/// authoritative source, so the adapters make it report.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AgentState {
+    Working,
+    Idle,
+}
+
+/// Parse an agent state file: `working:1793` / `idle:1793`. The pid is the
+/// agent that wrote it, so a stale file left behind by an exited agent can
+/// be told apart from the process that owns the tty now.
+pub(crate) fn parse_agent_state(raw: &str) -> Option<(AgentState, i32)> {
+    let (word, pid) = raw.trim().split_once(':')?;
+    let state = match word {
+        "working" => AgentState::Working,
+        "idle" => AgentState::Idle,
+        _ => return None,
+    };
+    Some((state, pid.trim().parse().ok()?))
+}
+
 /// The bundled adapter shims: Resources/adapters in the .app, with a source
 /// checkout fallback for `cargo run` dev builds.
 fn adapters_dir() -> Option<PathBuf> {
@@ -66,6 +90,122 @@ fn adapters_dir() -> Option<PathBuf> {
     }
     let dev = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/adapters"));
     dev.is_dir().then_some(dev)
+}
+
+/// A private per-session file the agent's hooks write their state into.
+/// Unique per (app process, session) so two panes never cross-talk and a
+/// crashed run cannot poison the next one.
+fn new_agent_state_slot() -> Option<(String, PathBuf)> {
+    let dir = dirs_cache_dir()?.join("agent-state");
+    std::fs::create_dir_all(&dir).ok()?;
+    prune_abandoned_state_files(&dir);
+    // create_new means we OWN this path: an abandoned file from a previous
+    // run of this app pid can never be silently adopted and briefly trusted.
+    for _ in 0..8 {
+        let id = state_slot_id();
+        let path = dir.join(&id);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Some((id, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// The opaque id handed to the adapter. Pure lowercase hex, because that is
+/// exactly what the adapter's filter accepts — handing out an ID instead of
+/// a path is what makes it impossible for a stray or hostile ST_PANE_ID to
+/// name a file at all.
+fn state_slot_id() -> String {
+    format!("{:016x}{:016x}", std::process::id(), state_nonce())
+}
+
+/// Per-session nonce: a monotonic counter mixed with the clock, so neither a
+/// reused app pid nor two sessions opened in the same nanosecond collide.
+fn state_nonce() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // FNV-1a mix, same primitive the preview store uses for revisions.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in seq.to_le_bytes().iter().chain(nanos.to_le_bytes().iter()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+/// Abnormal exits (crash, SIGKILL) leave state files behind; sweep anything
+/// older than a day once per app run. Cheap: the directory holds one tiny
+/// file per live terminal.
+fn prune_abandoned_state_files(dir: &std::path::Path) {
+    use std::sync::Once;
+    static PRUNED: Once = Once::new();
+    PRUNED.call_once(|| {
+        const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+        // Never sweep through a symlink: if `agent-state` itself were one,
+        // this loop would enumerate and delete files somewhere else entirely.
+        // symlink_metadata does not follow it, unlike metadata().
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            _ => return,
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            // Same reasoning per entry: only plain files we could have
+            // created are candidates for removal.
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            let stale = meta
+                .modified()
+                .map(|m| m.elapsed().unwrap_or_default() > MAX_AGE)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    });
+}
+
+/// Caches live beside the thumbnail cache, under the app's own directory.
+fn dirs_cache_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library/Caches")
+            .join(crate::settings::APP_DIR_NAME)
+    })
+}
+
+/// Owns a freshly created state file until the session takes it. PTY and
+/// event-loop construction can both fail after the file exists; without this
+/// the file survives until the 24h sweep.
+struct StateFileGuard(Option<PathBuf>);
+
+impl StateFileGuard {
+    fn take(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for StateFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Standard xterm color for OSC 4/10/11 queries (0-15 classic, cube, gray).
@@ -287,6 +427,9 @@ pub struct TermSession {
     shared_window_size: Arc<Mutex<WindowSize>>,
     /// Active search: compiled regex (escaped literal) + the raw needle.
     search: Option<(RegexSearch, String)>,
+    /// Where this session's instrumented agent reports working/idle. Removed
+    /// when the session shuts down so a dead pane leaves nothing behind.
+    agent_state_path: Option<PathBuf>,
 }
 
 impl TermSession {
@@ -372,11 +515,26 @@ impl TermSession {
         // with zero user setup. The pre-shim PATH rides along so an adapter
         // resolves the REAL binary and can never recurse into itself. New
         // sessions only — an already-running shell keeps its PATH.
+        // The adapters' hooks report agent working/idle here. Only set when
+        // adapters are on: without the shims nothing writes it, and a stale
+        // variable would point hooks at a file nobody reads.
+        // Clear any INHERITED values first, unconditionally. The PTY env
+        // starts from the login shell's, so stale values would otherwise
+        // ride along — including when slot creation below fails.
+        env.remove("ST_PANE_STATE");
+        env.remove("ST_PANE_ID");
+        // Guarded: every `?` between here and the constructed session drops
+        // it, removing the file.
+        let mut agent_state_path = StateFileGuard(None);
         if adapters_enabled() {
             if let Some(dir) = adapters_dir() {
                 let orig = env.get("PATH").cloned().unwrap_or_default();
                 env.insert("ST_ORIG_PATH".to_string(), orig.clone());
                 env.insert("PATH".to_string(), format!("{}:{orig}", dir.display()));
+            }
+            if let Some((id, path)) = new_agent_state_slot() {
+                env.insert("ST_PANE_ID".to_string(), id);
+                agent_state_path = StateFileGuard(Some(path));
             }
         }
         // App bundles launch with cwd "/" — a shell must never start there.
@@ -415,6 +573,7 @@ impl TermSession {
             lines,
             shared_window_size,
             search: None,
+            agent_state_path: agent_state_path.take(),
         })
     }
 
@@ -497,6 +656,32 @@ impl TermSession {
         }
         let fg = unsafe { tcgetpgrp(self.master_fd) };
         fg > 0 && fg != self.shell_pid
+    }
+
+    /// What the instrumented agent in this session last reported, if any.
+    /// None means "nothing has reported" — the caller falls back to its
+    /// heuristic rather than assuming either state.
+    pub fn agent_state(&self) -> Option<(AgentState, i32)> {
+        let path = self.agent_state_path.as_ref()?;
+        // The shell owns the tty: no agent is running, so whatever the file
+        // says is a leftover. Dropping it here means a later process that
+        // happens to reuse the old pid can never inherit its state — a
+        // reused pid must pass through this prompt first.
+        if !self.foreground_busy() {
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        let raw = std::fs::read_to_string(path).ok()?;
+        parse_agent_state(&raw)
+    }
+
+    /// The process group that currently owns the tty (0 when none does).
+    pub fn foreground_pgid(&self) -> i32 {
+        if self.exited.is_some() {
+            return 0;
+        }
+        let fg = unsafe { tcgetpgrp(self.master_fd) };
+        fg.max(0)
     }
 
     /// One ioctl for both answers: (cwd, foreground-job-owns-terminal).
@@ -797,6 +982,9 @@ impl TermSession {
             io_thread: self.io_thread.take(),
             shell_pid: self.shell_pid,
             master_fd: self.master_fd,
+            // Removed only AFTER the join below: a hook still running during
+            // shutdown would otherwise recreate the file we just deleted.
+            agent_state_path: self.agent_state_path.take(),
         }
     }
 }
@@ -805,6 +993,7 @@ pub struct ShutdownHandle {
     io_thread: Option<JoinHandle<(EventLoop<tty::Pty, EventProxy>, IoState)>>,
     shell_pid: i32,
     master_fd: c_int,
+    agent_state_path: Option<PathBuf>,
 }
 
 impl ShutdownHandle {
@@ -813,8 +1002,17 @@ impl ShutdownHandle {
     /// the child and then waits unboundedly — and shells can ignore SIGHUP.
     /// SIGKILL cannot be ignored, so the drop-side wait is guaranteed to
     /// return. Call OFF the UI thread.
-    pub fn join_with_deadline(self, deadline: Duration) {
-        let Some(handle) = self.io_thread else { return };
+    pub fn join_with_deadline(mut self, deadline: Duration) {
+        let state_path = self.agent_state_path.take();
+        let remove_state = || {
+            if let Some(path) = &state_path {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        let Some(handle) = self.io_thread else {
+            remove_state();
+            return;
+        };
         let start = Instant::now();
         while !handle.is_finished() && start.elapsed() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -845,6 +1043,9 @@ impl ShutdownHandle {
             }
         }
         let _ = handle.join();
+        // Now that the shell and every hook it spawned are dead, nothing can
+        // recreate the file.
+        remove_state();
     }
 }
 
@@ -914,6 +1115,297 @@ fn convert_color(color: AnsiColor) -> CellColor {
         },
         AnsiColor::Indexed(i) => CellColor::Indexed(i),
         AnsiColor::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
+    }
+}
+
+#[cfg(test)]
+mod agent_state_tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_states_with_the_owning_pid() {
+        assert_eq!(
+            parse_agent_state("working:1793"),
+            Some((AgentState::Working, 1793))
+        );
+        assert_eq!(
+            parse_agent_state("idle:1793"),
+            Some((AgentState::Idle, 1793))
+        );
+        // Hooks write with echo as often as printf; a trailing newline is
+        // not a parse failure.
+        assert_eq!(
+            parse_agent_state("working:42\n"),
+            Some((AgentState::Working, 42))
+        );
+    }
+
+    /// Run the real adapter against a stub `claude` that records its argv,
+    /// and hand back what the adapter actually passed. This is the only way
+    /// to test the shell quoting: the hook command must survive the adapter
+    /// UNEXPANDED and still be valid JSON.
+    fn run_adapter(pane_id: Option<&str>, extra: &[&str]) -> Vec<String> {
+        let home = fake_home();
+        let argv = run_adapter_in(&home, pane_id, extra).0;
+        // The fake HOME is this call's alone; leaving it behind litters the
+        // system temp dir a few entries per test run.
+        let _ = std::fs::remove_dir_all(&home);
+        argv
+    }
+
+    /// A throwaway HOME with the app's cache layout already in place. Tests
+    /// never touch the real `~/Library/Caches`.
+    fn fake_home() -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("st-home-{}-{}", std::process::id(), state_nonce()));
+        std::fs::create_dir_all(state_dir_under(&home)).unwrap();
+        home
+    }
+
+    fn state_dir_under(home: &std::path::Path) -> PathBuf {
+        home.join("Library/Caches")
+            .join(crate::settings::APP_DIR_NAME)
+            .join("agent-state")
+    }
+
+    fn run_adapter_in(
+        home: &std::path::Path,
+        pane_id: Option<&str>,
+        extra: &[&str],
+    ) -> (Vec<String>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "st-adapter-test-{}-{}",
+            std::process::id(),
+            state_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_log = dir.join("argv");
+        let stub = dir.join("claude");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let adapter = adapters_dir().expect("adapters dir").join("claude");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg(&adapter)
+            .args(extra)
+            // ST_ORIG_PATH is what the adapter resolves `claude` through, so
+            // it points at the stub alone; PATH still needs the system tools
+            // the adapter script itself runs.
+            .env("ST_ORIG_PATH", &dir)
+            .env("HOME", home)
+            // A collating locale, deliberately: POSIX range expressions are
+            // collation-dependent, so running the hostile-id cases under
+            // this is what proves the adapter's character class is spelled
+            // out rather than written as [0-9a-f].
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("LC_COLLATE", "en_US.UTF-8")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()));
+        match pane_id {
+            Some(value) => cmd.env("ST_PANE_ID", value),
+            None => cmd.env_remove("ST_PANE_ID"),
+        };
+        assert!(cmd.status().unwrap().success(), "adapter should exec stub");
+        let recorded = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = pane_id
+            .map(|id| state_dir_under(home).join(id))
+            .unwrap_or_default();
+        (recorded.lines().map(str::to_string).collect(), state)
+    }
+
+    /// A unique path inside the real state directory — the only place the
+    /// adapter will honor, by design.
+    fn settings_of(argv: &[String]) -> serde_json::Value {
+        let idx = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        serde_json::from_str(&argv[idx + 1]).expect("settings must be valid JSON")
+    }
+
+    #[test]
+    fn adapter_injects_hooks_that_stay_unexpanded() {
+        let settings = settings_of(&run_adapter(Some("abc123"), &[]));
+        assert_eq!(settings["preferredNotifChannel"], "terminal_bell");
+        for event in ["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"] {
+            let command = settings["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} hook command"));
+            // The adapter must NOT expand these: the hook shell resolves them
+            // at run time, in the agent's process.
+            assert!(command.contains("$PPID"), "{event}: {command}");
+            assert!(command.contains("$ST_PANE_STATE"), "{event}: {command}");
+        }
+        assert!(
+            settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("working:")
+        );
+        // Every terminal event must CLEAR the state. Missing one strands the
+        // dot on "working" while claude waits at its prompt — the exact bug
+        // this feature exists to fix, in reverse.
+        for event in ["Stop", "StopFailure", "SessionEnd"] {
+            assert!(
+                settings["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("idle:"),
+                "{event} must clear the state"
+            );
+        }
+        // Notification stays out: it fires mid-turn for permission prompts.
+        assert!(settings["hooks"].get("Notification").is_none());
+    }
+
+    #[test]
+    fn adapter_clears_stale_state_before_launching() {
+        // A previous claude interrupted with Ctrl-C runs no Stop hook and
+        // leaves "working" behind; the next launch must not inherit it.
+        let home = fake_home();
+        let stale = state_dir_under(&home).join("beef01");
+        std::fs::write(&stale, "working:999").unwrap();
+        let _ = run_adapter_in(&home, Some("beef01"), &[]);
+        let left = std::fs::read_to_string(&stale).unwrap_or_default();
+        assert!(
+            parse_agent_state(&left).is_none(),
+            "stale state survived the launch: {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_passthrough_still_clears_stale_state() {
+        // The --settings passthrough execs early; if it skipped the clear,
+        // an interrupted predecessor's state would survive that launch.
+        let home = fake_home();
+        let stale = state_dir_under(&home).join("beef02");
+        std::fs::write(&stale, "working:999").unwrap();
+        let _ = run_adapter_in(&home, Some("beef02"), &["--settings", "{\"mine\":1}"]);
+        let left = std::fs::read_to_string(&stale).unwrap_or_default();
+        assert!(
+            parse_agent_state(&left).is_none(),
+            "passthrough skipped the clear: {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_adapters_confinement_path_matches_the_app() {
+        // The adapter hardcodes the cache directory it will honor. If
+        // APP_DIR_NAME ever changes, reporting would silently stop instead
+        // of failing loudly, so pin them together here.
+        let script = std::fs::read_to_string(adapters_dir().unwrap().join("claude")).unwrap();
+        assert!(script.contains(&format!(
+            "/Library/Caches/{}/agent-state",
+            crate::settings::APP_DIR_NAME
+        )));
+    }
+
+    #[test]
+    fn the_app_hands_out_hex_ids_the_adapter_accepts() {
+        // The two halves of the contract, proven end to end and WITHOUT
+        // touching the real cache: minting is a pure function, and the
+        // adapter must actually honor what it produces.
+        let id = state_slot_id();
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "id must be pure lowercase hex, got {id:?}"
+        );
+        let home = fake_home();
+        let settings = settings_of(&run_adapter_in(&home, Some(&id), &[]).0);
+        assert!(
+            settings["hooks"].is_object(),
+            "the adapter must accept an id the app minted: {id}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_non_hex_id_can_never_name_a_file() {
+        // THE point of handing out an id instead of a path: traversal is
+        // impossible because the id cannot contain a separator and survive.
+        let home = fake_home();
+        let victim = home.join("precious.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        for hostile in [
+            "../../../precious.txt",
+            "../../precious",
+            "/etc/passwd",
+            "beef; rm -rf /",
+            "BEEF",
+            "",
+        ] {
+            let settings = settings_of(&run_adapter_in(&home, Some(hostile), &[]).0);
+            assert!(
+                settings.get("hooks").is_none(),
+                "hostile id {hostile:?} must disable reporting"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious",
+            "no hostile id may reach a file"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_symlinked_slot_is_refused() {
+        // Inside the cache dir a planted link would redirect the write.
+        let home = fake_home();
+        let victim = home.join("precious.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        let link = state_dir_under(&home).join("beef03");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let settings = settings_of(&run_adapter_in(&home, Some("beef03"), &[]).0);
+        assert!(settings.get("hooks").is_none(), "symlink must be refused");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn adapter_without_an_id_injects_no_hooks() {
+        let settings = settings_of(&run_adapter(None, &[]));
+        assert_eq!(settings["preferredNotifChannel"], "terminal_bell");
+        assert!(settings.get("hooks").is_none(), "nothing writes the state");
+    }
+
+    #[test]
+    fn a_user_supplied_settings_is_never_fought() {
+        let argv = run_adapter(Some("beef04"), &["--settings", "{\"mine\":1}"]);
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--settings").count(),
+            1,
+            "must not append a second --settings: {argv:?}"
+        );
+        assert_eq!(settings_of(&argv)["mine"], 1);
+    }
+
+    #[test]
+    fn refuses_anything_it_cannot_trust() {
+        // Garbage must fall back to the heuristic, never guess a state.
+        for raw in [
+            "",
+            "working",
+            "1793",
+            "busy:1793",
+            "working:",
+            "working:abc",
+        ] {
+            assert_eq!(parse_agent_state(raw), None, "should refuse {raw:?}");
+        }
     }
 }
 

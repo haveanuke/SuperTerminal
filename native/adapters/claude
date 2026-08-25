@@ -12,9 +12,63 @@ real="$(PATH="${ST_ORIG_PATH:-$PATH}" command -v claude)" || {
     echo "superterminal adapter: refusing to recurse into itself" >&2
     exit 127
 }
+# The app hands us an opaque ID, never a path — so a stray or hostile
+# ST_PANE_ID cannot name a file at all. The character class is spelled out
+# rather than written as a range: POSIX range expressions like [0-9a-f] are
+# collation-dependent, so a hostile LC_COLLATE/LC_ALL could change what they
+# match. The path is DERIVED here from a
+# fixed directory plus that id, and the id must be pure lowercase hex, so
+# path traversal is impossible by construction. We then export the derived
+# path for the hooks, which overwrites any inbound value.
+#
+# Residual, accepted: someone who can already run code as this user could
+# plant a symlink inside the app's own cache dir or move HOME. They could
+# also just run rm, so this is not a boundary worth more machinery.
+unset ST_PANE_STATE
+if [ -n "${HOME:-}" ] && [ -n "${ST_PANE_ID:-}" ]; then
+    case "$ST_PANE_ID" in
+        *[!0123456789abcdef]*|"") ;;
+        *)
+            state_dir="$HOME/Library/Caches/com.tomaspinal.superterminal.native/agent-state"
+            candidate="$state_dir/$ST_PANE_ID"
+            # A symlink would redirect the write; refuse rather than follow.
+            if [ ! -L "$candidate" ]; then
+                # Start from a clean slate: a claude interrupted with Ctrl-C
+                # runs no Stop hook and leaves "working" behind. Doing this
+                # before the --settings passthrough means EVERY launch
+                # clears, so a recycled pid cannot inherit stale state. If
+                # the file cannot be written, reporting stays off rather
+                # than installing hooks that could only fail.
+                if : > "$candidate" 2>/dev/null; then
+                    ST_PANE_STATE="$candidate"
+                    export ST_PANE_STATE
+                fi
+            fi
+            ;;
+    esac
+fi
 for arg in "$@"; do
     case "$arg" in
         --settings|--settings=*) exec "$real" "$@" ;;
     esac
 done
-exec "$real" --settings '{"preferredNotifChannel":"terminal_bell"}' "$@"
+# Work-state reporting. tcgetpgrp only tells the app that SOME app owns the
+# tty — true for a whole claude session whether it is thinking or waiting on
+# the human — so claude reports for itself through its own lifecycle hooks.
+# $PPID and $ST_PANE_STATE are expanded by the HOOK's shell at run time, not
+# here, which is why they stay single-quoted; ST_PANE_STATE is the path we
+# derived and exported above. Without it, nothing is injected.
+bell='"preferredNotifChannel":"terminal_bell"'
+if [ -n "${ST_PANE_STATE:-}" ]; then
+    # Every way a turn can END must clear the state, or an interrupted or
+    # failed turn leaves "working" authoritative while claude sits at its
+    # prompt: Stop covers the normal finish, StopFailure the API errors
+    # (rate limit, auth), SessionEnd the exit. Notification is deliberately
+    # NOT used - it fires mid-turn for permission prompts, and marking idle
+    # there would strand the dot idle for the rest of a working turn.
+    idle='[{"hooks":[{"type":"command","command":"printf idle:%s \"$PPID\" > \"$ST_PANE_STATE\""}]}]'
+    work='[{"hooks":[{"type":"command","command":"printf working:%s \"$PPID\" > \"$ST_PANE_STATE\""}]}]'
+    report="\"hooks\":{\"UserPromptSubmit\":$work,\"Stop\":$idle,\"StopFailure\":$idle,\"SessionEnd\":$idle}"
+    exec "$real" --settings "{$bell,$report}" "$@"
+fi
+exec "$real" --settings "{$bell}" "$@"
