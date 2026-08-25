@@ -79,6 +79,72 @@ impl Default for Settings {
     }
 }
 
+/// Package version, for the settings footer.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Short git hash ("+" appended when the tree was dirty), stamped into the
+/// bundle's Info.plist by bundle.sh — the footer identity that actually
+/// distinguishes one build from the next (the version alone cannot).
+/// Bundle-time stamping keeps compile caching intact (a build.rs that
+/// re-runs per build forces a crate recompile every build) and is exact
+/// for the path that matters: every install flows through bundle.sh.
+/// Outside a bundle (cargo run/test) this is honestly "dev".
+pub fn build_hash() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let plist = std::env::current_exe().ok().and_then(|exe| {
+                let contents = exe.parent()?.parent()?;
+                std::fs::read_to_string(contents.join("Info.plist")).ok()
+            });
+            plist
+                .as_deref()
+                .and_then(parse_build_identity)
+                .unwrap_or_else(|| "dev".into())
+        })
+        .clone()
+}
+
+/// Minimal plist scrape: the <string> following our identity key. The file
+/// is our own bundle.sh output, so full plist parsing is not warranted.
+fn parse_build_identity(plist: &str) -> Option<String> {
+    let after_key = plist.split("<key>STBuildIdentity</key>").nth(1)?;
+    let value = after_key
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The running binary's own modification time — read at runtime, so it can
+/// never go stale the way a compile-time stamp can (a rebuild that reuses a
+/// cached build script would otherwise show a time older than the binary).
+pub fn build_time() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let epoch = std::env::current_exe()
+                .and_then(|exe| exe.metadata())
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            let Some(epoch) = epoch else {
+                return String::new();
+            };
+            std::process::Command::new("/bin/date")
+                .args(["-r", &epoch.to_string(), "+%m-%d %H:%M"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 pub fn settings_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -225,6 +291,30 @@ mod tests {
         std::fs::write(&corrupt, "{ not json").unwrap();
         assert_eq!(Settings::load_from(&corrupt), Settings::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_identity_is_always_present() {
+        assert!(!APP_VERSION.is_empty());
+        // Outside a .app bundle (this test binary) the hash is honestly
+        // "dev"; inside, bundle.sh's Info.plist stamp takes over.
+        assert_eq!(build_hash(), "dev");
+        // Runtime binary mtime: present for any real executable (the test
+        // binary included), formatted MM-dd HH:mm.
+        let time = build_time();
+        assert_eq!(time.len(), "08-24 19:54".len(), "{time:?}");
+    }
+
+    #[test]
+    fn build_identity_parses_from_bundle_plist() {
+        let plist = "<dict><key>CFBundleName</key><string>X</string>\
+                     <key>STBuildIdentity</key>\n    <string>dbec417+</string></dict>";
+        assert_eq!(parse_build_identity(plist), Some("dbec417+".into()));
+        assert_eq!(parse_build_identity("<dict></dict>"), None);
+        assert_eq!(
+            parse_build_identity("<key>STBuildIdentity</key><string></string>"),
+            None
+        );
     }
 
     #[test]

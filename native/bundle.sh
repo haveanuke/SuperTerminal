@@ -51,6 +51,16 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
+# Build identity for the settings footer: the exact commit this bundle was
+# produced from ("+" = dirty tree), read by the app at runtime. Stamped at
+# bundle time — not compile time — so cargo's incremental caching stays
+# intact and every install path is covered.
+HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
+    HASH="${HASH}+"
+fi
+/usr/libexec/PlistBuddy -c "Add :STBuildIdentity string $HASH" "$APP/Contents/Info.plist"
+
 # A stable identity keeps macOS permission grants (TCC) across rebuilds —
 # ad-hoc signatures make every build look like a different app, so the
 # system re-prompts for folder access after each install.

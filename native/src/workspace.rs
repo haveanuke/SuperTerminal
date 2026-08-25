@@ -4285,7 +4285,30 @@ impl Workspace {
                                             "custom",
                                             SettingsSection::Custom,
                                             cx,
-                                        )),
+                                        ))
+                                        // Build identity: the way to confirm
+                                        // WHICH build is running (the hash
+                                        // moves every commit; version won't).
+                                        .child(
+                                            div()
+                                                .mt(px(10.0))
+                                                .px(px(8.0))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(1.0))
+                                                .text_size(px(9.0))
+                                                .text_color(rgb(theme.ui_text_muted))
+                                                .child(SharedString::from(format!(
+                                                    "v{}",
+                                                    crate::settings::APP_VERSION
+                                                )))
+                                                .child(SharedString::from(
+                                                    crate::settings::build_hash(),
+                                                ))
+                                                .child(SharedString::from(
+                                                    crate::settings::build_time(),
+                                                )),
+                                        ),
                                 )
                                 .child(
                                     div()
