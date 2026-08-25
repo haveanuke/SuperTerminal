@@ -39,6 +39,17 @@
   #textbox { flex:1; min-height:44px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); padding:0 10px; font-size:16px; }
   #send { min-width:64px; }
   .notice { padding:32px 20px; color:var(--muted); text-align:center; }
+  #previews { display:flex; flex-direction:column; height:100dvh; }
+  #pwrap { flex:1 1 0; overflow:auto; -webkit-overflow-scrolling:touch; }
+  #pgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:8px; }
+  #pgrid .tile { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  #pgrid .tile img { width:100%; aspect-ratio:1; object-fit:cover; display:block; background:var(--bg); }
+  #pgrid .tile .cap { padding:6px 8px; font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #pfull { position:fixed; inset:0; background:rgba(0,0,0,.92); z-index:3; display:flex; flex-direction:column; }
+  #pfullwrap { flex:1 1 0; overflow:auto; -webkit-overflow-scrolling:touch; }
+  #pfullwrap img { display:block; margin:auto; max-width:100%; }
+  #pfullwrap img.zoomed { max-width:none; width:250%; }
+  #pfullcap { padding:10px 14px; font-size:12px; color:var(--muted); text-align:center; }
 </style>
 </head>
 <body>
@@ -47,6 +58,9 @@
 <div id="list">
   <header>
     <div class="title">SuperTerminal</div>
+    <button class="back" id="previewsbtn" aria-label="previews">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="12" height="10" rx="1"/><path d="M2 10l3-3 3 3 2-2 4 4"/></svg>
+    </button>
     <button class="back" id="newterm" aria-label="new terminal">
       <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v10M3 8h10"/></svg>
     </button>
@@ -86,6 +100,31 @@
       <button id="send">Send</button>
     </div>
   </div>
+</div>
+
+<div id="previews" class="hidden">
+  <header>
+    <button class="back" id="pback" aria-label="back">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg>
+    </button>
+    <div class="title">Previews</div>
+    <div id="pdot" class="dot"></div>
+  </header>
+  <div id="pwrap">
+    <div id="pgrid"></div>
+    <div id="pempty" class="notice hidden">No images yet.</div>
+    <div id="punavailable" class="notice hidden"></div>
+  </div>
+</div>
+<div id="pfull" class="hidden">
+  <header>
+    <button class="back" id="pfullclose" aria-label="close">
+      <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3l10 10M13 3 3 13"/></svg>
+    </button>
+    <div class="title" id="pfulltitle"></div>
+  </header>
+  <div id="pfullwrap"><img id="pfullimg" alt=""></div>
+  <div id="pfullcap"></div>
 </div>
 
 <script>
@@ -280,6 +319,104 @@
     }
     follow();
   }
+
+  // ---- Previews screen -------------------------------------------------
+  var previewTimer = null, tileEls = {};
+  function previewsVisible() { return !$("previews").classList.contains("hidden"); }
+  function imgSrc(entry, thumb) {
+    return api("/preview/" + encodeURIComponent(entry.id)) +
+      "&rev=" + encodeURIComponent(entry.revision) + (thumb ? "&thumb=1" : "");
+  }
+  // A 202 (thumb still rendering) surfaces as an <img> error: retry with a
+  // capped backoff instead of leaving a broken tile.
+  function loadThumb(img, entry, attempt) {
+    img.dataset.rev = entry.revision;
+    img.onerror = function () {
+      if (attempt < 8 && previewsVisible() && img.dataset.rev === entry.revision) {
+        setTimeout(function () { loadThumb(img, entry, attempt + 1); }, 1000);
+      }
+    };
+    img.src = imgSrc(entry, true) + "&a=" + attempt;
+  }
+  function renderPreviews(data) {
+    $("pdot").classList.add("on");
+    var unavailable = data.state !== "ok";
+    $("punavailable").classList.toggle("hidden", !unavailable);
+    if (unavailable) {
+      $("punavailable").textContent =
+        "Preview folder unavailable. Save renders into Pictures/SuperTerminal on the Mac (or set a folder in settings).";
+      $("pgrid").textContent = ""; tileEls = {};
+      $("pempty").classList.add("hidden");
+      return;
+    }
+    $("pempty").classList.toggle("hidden", data.entries.length > 0);
+    var grid = $("pgrid"), seen = {};
+    data.entries.forEach(function (entry) {
+      seen[entry.id] = true;
+      var tile = tileEls[entry.id];
+      if (!tile) {
+        tile = document.createElement("div");
+        tile.className = "tile";
+        var img = document.createElement("img");
+        img.alt = entry.name;
+        var cap = document.createElement("div");
+        cap.className = "cap";
+        tile.appendChild(img); tile.appendChild(cap);
+        tile.addEventListener("click", function () { openFull(tile.entry); });
+        tileEls[entry.id] = tile;
+        loadThumb(img, entry, 0);
+      } else if (tile.entry.revision !== entry.revision) {
+        loadThumb(tile.firstChild, entry, 0);
+      }
+      tile.entry = entry;
+      tile.children[1].textContent = entry.name;
+      grid.appendChild(tile); // re-appending keeps newest-first order
+    });
+    Object.keys(tileEls).forEach(function (id) {
+      if (!seen[id]) { grid.removeChild(tileEls[id]); delete tileEls[id]; }
+    });
+  }
+  function refreshPreviews() {
+    fetch(api("/previews"), { headers: { "X-Companion-Token": token } })
+      .then(function (r) { if (!r.ok) throw 0; return r.json(); })
+      .then(renderPreviews)
+      .catch(function () { $("pdot").classList.remove("on"); });
+  }
+  function openPreviews() {
+    $("list").classList.add("hidden");
+    $("previews").classList.remove("hidden");
+    refreshPreviews();
+    previewTimer = setInterval(refreshPreviews, 5000);
+  }
+  function closePreviews() {
+    clearInterval(previewTimer); previewTimer = null;
+    $("previews").classList.add("hidden");
+    $("list").classList.remove("hidden");
+    refreshSessions();
+  }
+  function openFull(entry) {
+    $("pfull").classList.remove("hidden");
+    $("pfulltitle").textContent = entry.name;
+    $("pfullcap").textContent = new Date(entry.modifiedAt * 1000).toLocaleString();
+    var img = $("pfullimg");
+    img.classList.remove("zoomed");
+    // Over-64MiB sources answer 413: show the spec's copy instead.
+    img.onerror = function () { $("pfullcap").textContent = "too large — open on Mac"; };
+    img.src = imgSrc(entry, false);
+  }
+  $("previewsbtn").addEventListener("click", openPreviews);
+  $("pback").addEventListener("click", closePreviews);
+  $("pfullclose").addEventListener("click", function () {
+    $("pfull").classList.add("hidden");
+    $("pfullimg").src = "";
+  });
+  // Double-tap toggles fit/2.5x (the viewport meta pins page zoom off).
+  var lastTap = 0;
+  $("pfullimg").addEventListener("click", function () {
+    var now = Date.now();
+    if (now - lastTap < 350) this.classList.toggle("zoomed");
+    lastTap = now;
+  });
 
   var lastFrame = "";
   function open(session) {

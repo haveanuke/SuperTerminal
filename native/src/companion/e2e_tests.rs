@@ -274,6 +274,24 @@ fn page_renders_the_history_tail_above_the_live_screen() {
 }
 
 #[test]
+fn page_has_a_previews_screen() {
+    let page = include_str!("page.html");
+    assert!(page.contains("id=\"previews\""), "previews screen exists");
+    assert!(page.contains("id=\"previewsbtn\""), "list header opens it");
+    assert!(page.contains("id=\"pgrid\""), "thumbnail grid exists");
+    assert!(page.contains("id=\"pfull\""), "full-size view exists");
+    assert!(
+        page.contains("function refreshPreviews"),
+        "5s polling loop exists"
+    );
+    assert!(
+        page.contains("unavailable"),
+        "distinct unavailable notice is rendered"
+    );
+    assert!(page.contains("thumb=1"), "tiles load the downscaled variant");
+}
+
+#[test]
 fn page_gives_the_grid_the_whole_viewport() {
     let page = include_str!("page.html");
     // Full-height flex shell: the terminal screen is a 100dvh column where
