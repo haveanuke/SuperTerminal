@@ -181,6 +181,97 @@ fn scan(dir: Option<PathBuf>, next_id: &mut u64) -> CatalogSnapshot {
     }
 }
 
+// openat is the one call std does not surface: opening RELATIVE to the held
+// directory descriptor (with O_NOFOLLOW) is what pins ids inside the watched
+// dir. Same hand-rolled FFI style as companion/net.rs's getifaddrs.
+extern "C" {
+    fn openat(
+        dirfd: std::os::raw::c_int,
+        path: *const std::os::raw::c_char,
+        flags: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+const O_RDONLY: std::os::raw::c_int = 0x0000;
+const O_NOFOLLOW: std::os::raw::c_int = 0x0100;
+const O_CLOEXEC: std::os::raw::c_int = 0x0100_0000;
+
+pub struct VerifiedFile {
+    pub file: std::fs::File,
+    pub len: u64,
+    pub content_type: &'static str,
+}
+
+pub(crate) fn sniff_content_type(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("image/png");
+    }
+    if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice()) {
+        return Some("image/webp");
+    }
+    None
+}
+
+impl CatalogSnapshot {
+    /// Open an id's bytes with the confinement contract: openat relative to
+    /// the held dirfd, O_NOFOLLOW, then fstat re-verification of regular
+    /// type + dev + inode + size, then magic-byte validation. Any mismatch
+    /// (including a revision the client learned from an older list) fails
+    /// closed with None.
+    pub fn open_verified(&self, id: &str, revision: &str) -> Option<VerifiedFile> {
+        use std::io::{Read, Seek};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let identity = self.by_id.get(id)?;
+        if identity.revision != revision {
+            return None;
+        }
+        let dir = self.dir_handle.as_ref()?;
+        let name = std::ffi::CString::new(identity.name.as_str()).ok()?;
+        // SAFETY: name is a valid NUL-terminated C string; the fd is owned
+        // by the File we construct immediately on success.
+        let fd = unsafe {
+            openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = file.metadata().ok()?; // fstat on the OPEN descriptor
+        if !meta.is_file()
+            || meta.dev() != identity.dev
+            || meta.ino() != identity.inode
+            || meta.len() != identity.size
+        {
+            return None;
+        }
+        let mut head = [0u8; 12];
+        let read = file.read(&mut head).ok()?;
+        let content_type = sniff_content_type(&head[..read])?;
+        file.rewind().ok()?;
+        Some(VerifiedFile {
+            file,
+            len: meta.len(),
+            content_type,
+        })
+    }
+
+    /// Absolute source path for the thumbnailer (sips reads a path; the
+    /// name was verified this scan and the revision key bounds staleness).
+    pub fn source_path(&self, id: &str) -> Option<PathBuf> {
+        let identity = self.by_id.get(id)?;
+        Some(self.dir_path.clone()?.join(&identity.name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +361,62 @@ mod tests {
         }
         let snap = PreviewStore::new(Some(dir)).snapshot();
         assert_eq!(snap.entries.len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn open_verified_serves_only_matching_id_and_revision() {
+        let dir = scratch("open");
+        write_png(&dir, "a.png", 5);
+        let store = PreviewStore::new(Some(dir));
+        let snap = store.snapshot();
+        let entry = &snap.entries[0];
+        let ok = snap.open_verified(&entry.id, &entry.revision).unwrap();
+        assert_eq!(ok.content_type, "image/png");
+        assert_eq!(ok.len, entry.bytes);
+        assert!(snap.open_verified(&entry.id, "0000000000000000").is_none());
+        assert!(snap.open_verified("p999999", &entry.revision).is_none());
+    }
+
+    #[test]
+    fn replaced_file_fails_closed_on_old_snapshot() {
+        let dir = scratch("toctou");
+        write_png(&dir, "a.png", 5);
+        let store = PreviewStore::new(Some(dir.clone()));
+        let snap = store.snapshot();
+        let entry = snap.entries[0].clone();
+        std::fs::remove_file(dir.join("a.png")).unwrap();
+        write_png(&dir, "a.png", 999); // new inode/size under the same name
+        assert!(
+            snap.open_verified(&entry.id, &entry.revision).is_none(),
+            "identity re-verification must reject the swapped file"
+        );
+    }
+
+    #[test]
+    fn magic_byte_mismatch_is_refused() {
+        let dir = scratch("magic");
+        std::fs::write(dir.join("fake.png"), b"MZ not a png at all........").unwrap();
+        let snap = PreviewStore::new(Some(dir)).snapshot();
+        let entry = &snap.entries[0]; // extension prefilter lists it...
+        assert!(
+            snap.open_verified(&entry.id, &entry.revision).is_none(),
+            "...but the magic sniff refuses the bytes"
+        );
+    }
+
+    #[test]
+    fn sniffer_knows_the_four_formats() {
+        assert_eq!(
+            sniff_content_type(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_content_type(&[0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_content_type(b"GIF89a\0\0\0\0\0\0"), Some("image/gif"));
+        assert_eq!(sniff_content_type(b"RIFF\0\0\0\0WEBP"), Some("image/webp"));
+        assert_eq!(sniff_content_type(b"MZ\0\0\0\0\0\0\0\0\0\0"), None);
     }
 
     #[test]
