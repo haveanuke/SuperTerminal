@@ -65,14 +65,40 @@ type SplitBoundsMap = HashMap<String, (Pixels, Pixels, Pixels, Pixels)>;
 type BoxedChipHandler = Box<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
 /// Which settings section shows in the settings sheet.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsSection {
-    Themes,
-    Font,
-    Background,
+    /// Everything about how the app LOOKS: palette, text, background, and
+    /// the theme files that carry all three. These were four separate nav
+    /// items; one pane with group labels beats hunting across tabs.
+    Appearance,
     Buddy,
     Alerts,
-    Custom,
+    /// Phone-side configuration: the watched gallery folder and the live
+    /// Blender viewport. Previously mis-filed under "background".
+    Companion,
+}
+
+impl SettingsSection {
+    /// Nav order, top to bottom. The renderer walks this, so a new section
+    /// cannot ship without a label.
+    const ALL: [SettingsSection; 4] = [
+        SettingsSection::Appearance,
+        SettingsSection::Buddy,
+        SettingsSection::Alerts,
+        SettingsSection::Companion,
+    ];
+
+    /// The pane the sheet opens on.
+    const DEFAULT: SettingsSection = SettingsSection::Appearance;
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "appearance",
+            SettingsSection::Buddy => "buddy",
+            SettingsSection::Alerts => "alerts",
+            SettingsSection::Companion => "companion",
+        }
+    }
 }
 
 /// Which view the left sidebar shows; the rail tabs between them.
@@ -368,7 +394,7 @@ impl Workspace {
             tts_voices: None,
             tts_voices_loading: false,
             tts_voice_list_open: false,
-            settings_section: SettingsSection::Themes,
+            settings_section: SettingsSection::DEFAULT,
             theme_action_note: None,
             buddy_note: None,
             buddy_source_pane: None,
@@ -3003,8 +3029,8 @@ impl Workspace {
                 let current = self.settings.theme.clone();
                 // Built only while the themes section is active — hidden
                 // sections must not pay for the whole chip grid per render.
-                let on_themes = self.settings_section == SettingsSection::Themes;
-                let chips: Vec<_> = if !on_themes {
+                let on_appearance = self.settings_section == SettingsSection::Appearance;
+                let chips: Vec<_> = if !on_appearance {
                     Vec::new()
                 } else {
                     themes::all_themes()
@@ -3071,14 +3097,16 @@ impl Workspace {
                 // nav column switches. This keeps every section fully in
                 // view no matter how settings grow.
                 let content: Vec<gpui::AnyElement> = match self.settings_section {
-                    SettingsSection::Themes => vec![div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(6.0))
-                        .children(chips)
-                        .into_any_element()],
-                    SettingsSection::Font => vec![
+                    SettingsSection::Appearance => vec![
+                        self.group_label("theme").into_any_element(),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(6.0))
+                            .children(chips)
+                            .into_any_element(),
+                        self.group_label("text").into_any_element(),
                         div()
                             .flex()
                             .flex_row()
@@ -3095,38 +3123,15 @@ impl Workspace {
                             ))
                             .into_any_element(),
                         self.render_font_family_row(window, cx).into_any_element(),
+                        self.group_label("background").into_any_element(),
+                        self.render_background_row(cx).into_any_element(),
+                        self.group_label("theme file").into_any_element(),
+                        self.render_theme_file_row(cx).into_any_element(),
                     ],
-                    SettingsSection::Background => {
-                        vec![
-                            self.render_background_row(cx).into_any_element(),
-                            self.render_previews_row(cx).into_any_element(),
-                        ]
-                    }
                     SettingsSection::Buddy => vec![self.render_buddy_row(cx).into_any_element()],
                     SettingsSection::Alerts => vec![self.render_alerts_row(cx).into_any_element()],
-                    SettingsSection::Custom => {
-                        vec![div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child(self.chip_button(
-                                "import theme",
-                                false,
-                                |ws, _window, cx| ws.import_theme(cx),
-                                cx,
-                            ))
-                            .child(self.chip_button(
-                                "export current",
-                                false,
-                                |ws, _window, cx| ws.export_theme(cx),
-                                cx,
-                            ))
-                            .children(self.theme_action_note.clone().map(|note| {
-                                div().text_size(px(10.0)).child(SharedString::from(note))
-                            }))
-                            .into_any_element()]
+                    SettingsSection::Companion => {
+                        vec![self.render_previews_row(cx).into_any_element()]
                     }
                 };
 
@@ -3174,32 +3179,12 @@ impl Workspace {
                                         .flex()
                                         .flex_col()
                                         .gap(px(2.0))
-                                        .child(nav_item(
-                                            self,
-                                            "themes",
-                                            SettingsSection::Themes,
-                                            cx,
-                                        ))
-                                        .child(nav_item(self, "font", SettingsSection::Font, cx))
-                                        .child(nav_item(
-                                            self,
-                                            "background",
-                                            SettingsSection::Background,
-                                            cx,
-                                        ))
-                                        .child(nav_item(self, "buddy", SettingsSection::Buddy, cx))
-                                        .child(nav_item(
-                                            self,
-                                            "alerts",
-                                            SettingsSection::Alerts,
-                                            cx,
-                                        ))
-                                        .child(nav_item(
-                                            self,
-                                            "custom",
-                                            SettingsSection::Custom,
-                                            cx,
-                                        ))
+                                        // Rendered from ALL: a section
+                                        // without a nav entry is a section
+                                        // nobody can open.
+                                        .children(SettingsSection::ALL.map(|section| {
+                                            nav_item(self, section.label(), section, cx)
+                                        }))
                                         // Build identity: the way to confirm
                                         // WHICH build is running (the hash
                                         // moves every commit; version won't).
@@ -4066,6 +4051,35 @@ mod tests {
             Some("Ava (Premium)".to_string())
         );
         assert_eq!(parse_voice_name(""), None);
+    }
+
+    #[test]
+    fn every_settings_section_is_reachable_from_the_nav() {
+        // The nav renders from ALL, so a section missing here is a section
+        // the user can never open.
+        assert_eq!(SettingsSection::ALL.len(), 4);
+        let labels: Vec<&str> = SettingsSection::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["appearance", "buddy", "alerts", "companion"],
+            "nav order is deliberate: look first, then the assistants, then the phone"
+        );
+        for label in &labels {
+            assert!(!label.is_empty());
+            assert_eq!(*label, label.to_lowercase(), "sheet labels are lowercase");
+        }
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "labels must be distinguishable");
+    }
+
+    #[test]
+    fn the_sheet_opens_on_a_real_nav_entry() {
+        // Opening on a section the nav cannot highlight would leave the
+        // sidebar with nothing selected.
+        assert_eq!(SettingsSection::DEFAULT, SettingsSection::Appearance);
+        assert_eq!(SettingsSection::ALL[0], SettingsSection::DEFAULT);
     }
 
     #[test]

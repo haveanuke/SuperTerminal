@@ -6,6 +6,44 @@ use gpui::{div, px, rgb, Context, MouseButton, SharedString, Window};
 
 use super::*;
 
+/// One-line explanations for the settings controls whose names cannot
+/// carry their own meaning. "tool adapters: on" says nothing about what a
+/// tool adapter IS; the chip stays terse and the hint does the explaining.
+/// Kept together so they hold one voice and one length budget.
+pub(super) mod hints {
+    pub const TOOL_ADAPTERS: &str =
+        "Shims that let claude and codex ring the bell when a long job ends. New terminals only.";
+    pub const GALLERY: &str = "Images saved to this folder show up in the phone companion.";
+    pub const LIVE_VIEWPORT: &str =
+        "Sends Blender's viewport to the phone every 2s, only while the gallery is open.";
+    pub const BUDDY: &str = "An agent that watches your terminals and comments on what it sees.";
+    pub const THEME_FILE: &str = "Import a palette from JSON, or export the current one to share.";
+    pub const CUES: &str = "Glass when a terminal finishes, Ping when one is waiting on you.";
+    pub const AWAKE: &str = "Holds the Mac awake while a terminal is still working.";
+
+    #[cfg(test)]
+    pub const ALL: [&str; 7] = [
+        TOOL_ADAPTERS,
+        GALLERY,
+        LIVE_VIEWPORT,
+        BUDDY,
+        THEME_FILE,
+        CUES,
+        AWAKE,
+    ];
+
+    /// Text budget that keeps hints short enough to read as captions. This
+    /// is a character count, NOT a guarantee about wrapping — actual line
+    /// breaks depend on font metrics and window width, and a narrow window
+    /// will still wrap the longest of these.
+    #[cfg(test)]
+    pub const MAX_LEN: usize = 92;
+    /// The UI takes SVG icons, never emoji; these are the only non-ASCII
+    /// characters a hint may use.
+    #[cfg(test)]
+    pub const ALLOWED_NON_ASCII: [char; 3] = ['\u{2014}', '\u{00b7}', '\u{2026}'];
+}
+
 impl Workspace {
     /// Push the current settings to every pane and persist them.
     pub(super) fn apply_appearance(&mut self, cx: &mut Context<Self>) {
@@ -190,6 +228,61 @@ impl Workspace {
         self.theme_action_note = Some(note);
         cx.notify();
     }
+    /// The explanatory line under a control, indented past the 72px label
+    /// gutter so it reads as belonging to the row above it.
+    pub(super) fn hint(&self, text: &'static str) -> impl IntoElement {
+        div()
+            .pl(px(80.0))
+            .text_size(px(10.0))
+            .text_color(rgb(self.theme.ui_text_muted))
+            .child(SharedString::from(text))
+    }
+
+    /// A quiet label above a group of controls. The appearance pane holds
+    /// four formerly separate sections; without these it reads as one
+    /// undifferentiated pile of chips.
+    pub(super) fn group_label(&self, text: &'static str) -> impl IntoElement {
+        div()
+            .text_size(px(9.0))
+            .text_color(rgb(self.theme.ui_text_muted))
+            .child(SharedString::from(text))
+    }
+
+    /// Theme import/export — the old "custom" section. It acts on the very
+    /// palette shown above it, so it belongs in the appearance pane.
+    pub(super) fn render_theme_file_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_color(rgb(self.theme.ui_text_muted))
+                    .child(self.chip_button(
+                        "import theme",
+                        false,
+                        |ws, _window, cx| ws.import_theme(cx),
+                        cx,
+                    ))
+                    .child(self.chip_button(
+                        "export current",
+                        false,
+                        |ws, _window, cx| ws.export_theme(cx),
+                        cx,
+                    ))
+                    .children(
+                        self.theme_action_note
+                            .clone()
+                            .map(|note| div().text_size(px(10.0)).child(SharedString::from(note))),
+                    ),
+            )
+            .child(self.hint(hints::THEME_FILE))
+    }
+
     pub(super) fn render_font_family_row(
         &self,
         window: &mut Window,
@@ -254,6 +347,9 @@ impl Workspace {
             )
     }
 
+    /// The companion pane: what the phone can see. Two labelled rows, each
+    /// with its own hint — "previews" and "live viewport" name mechanisms
+    /// nobody can guess from the label alone.
     pub(super) fn render_previews_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let label: SharedString = match &self.settings.preview_dir {
@@ -267,48 +363,64 @@ impl Workspace {
         let overridden = self.settings.preview_dir.is_some();
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
+            .flex_col()
+            .gap(px(4.0))
             .text_color(rgb(theme.ui_text_muted))
-            .child(div().w(px(72.0)).child("previews"))
-            .child(div().text_size(px(11.0)).child(label))
-            .child(self.chip_button(
-                "choose",
-                false,
-                |ws, _window, cx| ws.pick_preview_dir(cx),
-                cx,
-            ))
-            .children(overridden.then(|| {
-                self.chip_button(
-                    "default",
-                    false,
-                    |ws, _window, cx| {
-                        ws.settings.preview_dir = None;
-                        let _ = ws.settings.save();
-                        ws.apply_preview_dir();
-                        cx.notify();
-                    },
-                    cx,
-                )
-            }))
-            .child(self.chip_button(
-                if self.settings.blender_viewport {
-                    "live viewport: on"
-                } else {
-                    "live viewport: off"
-                },
-                self.settings.blender_viewport,
-                |ws, _window, cx| {
-                    ws.settings.blender_viewport = !ws.settings.blender_viewport;
-                    let _ = ws.settings.save();
-                    if let Some(store) = &ws.companion_previews {
-                        store.set_viewport_enabled(ws.settings.blender_viewport);
-                    }
-                    cx.notify();
-                },
-                cx,
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("gallery"))
+                    .child(div().text_size(px(11.0)).child(label))
+                    .child(self.chip_button(
+                        "choose",
+                        false,
+                        |ws, _window, cx| ws.pick_preview_dir(cx),
+                        cx,
+                    ))
+                    .children(overridden.then(|| {
+                        self.chip_button(
+                            "default",
+                            false,
+                            |ws, _window, cx| {
+                                ws.settings.preview_dir = None;
+                                let _ = ws.settings.save();
+                                ws.apply_preview_dir();
+                                cx.notify();
+                            },
+                            cx,
+                        )
+                    })),
+            )
+            .child(self.hint(hints::GALLERY))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("viewport"))
+                    .child(self.chip_button(
+                        if self.settings.blender_viewport {
+                            "live viewport: on"
+                        } else {
+                            "live viewport: off"
+                        },
+                        self.settings.blender_viewport,
+                        |ws, _window, cx| {
+                            ws.settings.blender_viewport = !ws.settings.blender_viewport;
+                            let _ = ws.settings.save();
+                            if let Some(store) = &ws.companion_previews {
+                                store.set_viewport_enabled(ws.settings.blender_viewport);
+                            }
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            .child(self.hint(hints::LIVE_VIEWPORT))
     }
 
     pub(super) fn render_background_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -474,6 +586,7 @@ impl Workspace {
                         cx,
                     )),
             )
+            .child(self.hint(hints::BUDDY))
             .child(
                 div()
                     .flex()
@@ -620,22 +733,6 @@ impl Workspace {
                         cx,
                     ))
                     .child(self.chip_button(
-                        if self.settings.tool_adapters {
-                            "tool adapters: on"
-                        } else {
-                            "tool adapters: off"
-                        },
-                        self.settings.tool_adapters,
-                        |ws, _window, cx| {
-                            ws.settings.tool_adapters = !ws.settings.tool_adapters;
-                            let _ = ws.settings.save();
-                            // New terminals only — a live shell keeps its PATH.
-                            crate::term_session::set_tool_adapters(ws.settings.tool_adapters);
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(self.chip_button(
                         if self.settings.buddy_tts {
                             "buddy voice: on"
                         } else {
@@ -654,13 +751,34 @@ impl Workspace {
                             cx.notify();
                         },
                         cx,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .child("terminal done: Glass - awaiting input: Ping"),
-                    ),
+                    )),
             )
+            .child(self.hint(hints::CUES))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().w(px(72.0)).child("adapters"))
+                    .child(self.chip_button(
+                        if self.settings.tool_adapters {
+                            "tool adapters: on"
+                        } else {
+                            "tool adapters: off"
+                        },
+                        self.settings.tool_adapters,
+                        |ws, _window, cx| {
+                            ws.settings.tool_adapters = !ws.settings.tool_adapters;
+                            let _ = ws.settings.save();
+                            // New terminals only — a live shell keeps its PATH.
+                            crate::term_session::set_tool_adapters(ws.settings.tool_adapters);
+                            cx.notify();
+                        },
+                        cx,
+                    )),
+            )
+            .child(self.hint(hints::TOOL_ADAPTERS))
             .child(
                 div()
                     .flex()
@@ -681,13 +799,9 @@ impl Workspace {
                             cx.notify();
                         },
                         cx,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .child("hold the Mac awake while a terminal is working"),
-                    ),
+                    )),
             )
+            .child(self.hint(hints::AWAKE))
             .children(voice_line)
             .children(self.render_voice_list(cx))
     }
@@ -755,5 +869,44 @@ impl Workspace {
                         )),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hints;
+
+    #[test]
+    fn hints_stay_within_the_text_budget() {
+        for hint in hints::ALL {
+            assert!(!hint.trim().is_empty(), "an empty hint explains nothing");
+            assert!(
+                hint.len() <= hints::MAX_LEN,
+                "hint is too long to read as a caption ({} chars): {hint}",
+                hint.len()
+            );
+        }
+    }
+
+    #[test]
+    fn hints_carry_no_emoji() {
+        // This UI uses SVG icons, never emoji.
+        for hint in hints::ALL {
+            for ch in hint.chars() {
+                assert!(
+                    ch.is_ascii() || hints::ALLOWED_NON_ASCII.contains(&ch),
+                    "non-ASCII {ch:?} in hint: {hint}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hints_read_as_sentences() {
+        for hint in hints::ALL {
+            let first = hint.chars().next().unwrap();
+            assert!(first.is_uppercase(), "hint should open a sentence: {hint}");
+            assert!(hint.ends_with('.'), "hint should close a sentence: {hint}");
+        }
     }
 }
