@@ -170,6 +170,26 @@ pub fn resolved_preview_dir(settings: &Settings) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Pictures/SuperTerminal"))
 }
 
+/// The watched folder, created if it is the default one. Without this the
+/// out-of-the-box gallery watches a folder that has never existed, so the
+/// previews screen is permanently empty and the feature looks broken. A
+/// folder the user picked explicitly is left alone: if it vanished,
+/// "unavailable" is the honest answer, not a silently recreated ghost.
+pub fn prepare_preview_dir(settings: &Settings) -> Option<PathBuf> {
+    prepare_dir(
+        resolved_preview_dir(settings),
+        settings.preview_dir.is_some(),
+    )
+}
+
+fn prepare_dir(dir: Option<PathBuf>, user_picked: bool) -> Option<PathBuf> {
+    let dir = dir?;
+    if !user_picked {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    Some(dir)
+}
+
 impl Settings {
     pub fn load() -> Settings {
         Self::load_from(&settings_path())
@@ -346,6 +366,31 @@ mod tests {
     fn settings_dir_is_the_app_support_dir() {
         assert!(
             settings_dir().ends_with(Path::new("Library/Application Support").join(APP_DIR_NAME))
+        );
+    }
+
+    #[test]
+    fn default_preview_dir_is_created_on_demand() {
+        let dir = std::env::temp_dir().join(format!("st-prep-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = prepare_dir(Some(dir.clone()), false).expect("dir");
+        assert_eq!(got, dir);
+        assert!(
+            dir.is_dir(),
+            "the default gallery folder must exist to watch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_picked_preview_dir_is_never_recreated() {
+        let dir = std::env::temp_dir().join(format!("st-prep-picked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = prepare_dir(Some(dir.clone()), true).expect("dir");
+        assert_eq!(got, dir);
+        assert!(
+            !dir.exists(),
+            "a vanished hand-picked folder stays vanished"
         );
     }
 }

@@ -103,6 +103,9 @@ struct Shared<S: Clone> {
     previews: Arc<super::previews::PreviewStore>,
     thumbs: Arc<super::thumbs::Thumbnailer>,
     img: AtomicUsize,
+    /// Build identity, resolved once at start so `/version` never touches
+    /// the filesystem per request.
+    build: String,
 }
 
 pub fn start<S: InputSink>(
@@ -126,6 +129,7 @@ pub fn start<S: InputSink>(
         previews: cfg.previews,
         thumbs: cfg.thumbs,
         img: AtomicUsize::new(0),
+        build: crate::settings::build_hash(),
     });
     let acceptor_workers = Arc::clone(&workers);
     let acceptor_shared = Arc::clone(&shared);
@@ -349,8 +353,27 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             let _ = respond(
                 &stream,
                 "200 OK",
-                &[("Content-Type", "text/html; charset=utf-8")],
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                ],
                 shared.page.as_bytes(),
+            );
+        }
+        (Method::Get, "/version") => {
+            let json = serde_json::json!({
+                "version": crate::settings::APP_VERSION,
+                "build": shared.build,
+            })
+            .to_string();
+            let _ = respond(
+                &stream,
+                "200 OK",
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Cache-Control", "no-store"),
+                ],
+                json.as_bytes(),
             );
         }
         (Method::Get, "/sessions") => {
@@ -796,6 +819,70 @@ mod tests {
         assert!(page.contains("companion-test-page"));
         assert!(page.contains("Referrer-Policy: no-referrer"));
         assert!(page.contains("Content-Security-Policy:"));
+        handle.stop();
+    }
+
+    #[test]
+    fn page_is_never_cached_by_the_phone() {
+        // A cached page.html is indistinguishable from a stale build on the
+        // phone: features ship, the browser replays yesterday's markup.
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(hub);
+        let host = host_of(&handle);
+        let page = get(&host, "/");
+        assert!(page.starts_with("HTTP/1.1 200"));
+        assert!(
+            page.contains("Cache-Control: no-store"),
+            "the static page must never be cached: {page}"
+        );
+        handle.stop();
+    }
+
+    #[test]
+    fn version_route_reports_the_running_build() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(hub);
+        let host = host_of(&handle);
+        let response = get(&host, &format!("/version?t={TOKEN}"));
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("application/json"));
+        assert!(
+            response.contains("Cache-Control: no-store"),
+            "a cached version readout would defeat its whole purpose: {response}"
+        );
+        let body = response.rsplit("\r\n\r\n").next().unwrap_or("");
+        let json: serde_json::Value = serde_json::from_str(body).expect("version json");
+        assert_eq!(
+            json["version"].as_str(),
+            Some(crate::settings::APP_VERSION),
+            "phone must see the same version string as settings"
+        );
+        assert!(
+            json["build"].as_str().is_some_and(|b| !b.is_empty()),
+            "build identity must be present: {body}"
+        );
+        handle.stop();
+    }
+
+    #[test]
+    fn version_route_is_token_protected() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(hub);
+        let host = host_of(&handle);
+        assert!(get(&host, "/version").starts_with("HTTP/1.1 404"));
+        assert!(get(&host, "/version?t=wrong").starts_with("HTTP/1.1 404"));
+        // Header auth works, and a rebinding host is refused even with the
+        // right token — the shared guards, asserted on this route too.
+        let host_header = roundtrip(
+            &host,
+            &format!("GET /version HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\n\r\n"),
+        );
+        assert!(host_header.starts_with("HTTP/1.1 200"));
+        let rebound = roundtrip(
+            &host,
+            &format!("GET /version?t={TOKEN} HTTP/1.1\r\nHost: evil.example\r\n\r\n"),
+        );
+        assert!(rebound.starts_with("HTTP/1.1 400"));
         handle.stop();
     }
 

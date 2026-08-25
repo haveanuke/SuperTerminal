@@ -95,7 +95,7 @@ impl Workspace {
         }
         hub.bump_generation();
         let previews = Arc::new(crate::companion::previews::PreviewStore::new(
-            crate::settings::resolved_preview_dir(&self.settings),
+            crate::settings::prepare_preview_dir(&self.settings),
         ));
         previews.set_viewport_enabled(self.settings.blender_viewport);
         let cache_dir = crate::companion::thumbs::default_cache_dir()
@@ -163,7 +163,7 @@ impl Workspace {
     /// server is down (the next start resolves the setting itself).
     pub(super) fn apply_preview_dir(&self) {
         if let Some(store) = &self.companion_previews {
-            store.set_dir(crate::settings::resolved_preview_dir(&self.settings));
+            store.set_dir(crate::settings::prepare_preview_dir(&self.settings));
         }
     }
 

@@ -376,3 +376,12 @@ fn page_gives_the_grid_the_whole_viewport() {
     assert!(page.contains("id=\"keys\""), "key rows are wrapped");
     assert!(page.contains("id=\"padtoggle\""), "key pad toggle exists");
 }
+
+#[test]
+fn page_shows_the_running_build() {
+    // The phone needs its own version readout: "did my build land?" must be
+    // answerable without walking to the Mac.
+    let page = include_str!("page.html");
+    assert!(page.contains(r#"id="buildtag""#), "build tag element");
+    assert!(page.contains("/version"), "page fetches the version route");
+}

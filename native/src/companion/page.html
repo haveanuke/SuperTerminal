@@ -63,6 +63,8 @@
     display:flex; align-items:center; justify-content:center; }
   #jumplive svg { width:18px; height:18px; }
   #gridarea { position:relative; flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
+  #buildtag { padding:14px; font-size:11px; color:var(--muted);
+    text-align:center; letter-spacing:.04em; }
 </style>
 </head>
 <body>
@@ -81,6 +83,7 @@
   </header>
   <ul id="sessions"></ul>
   <div id="empty" class="notice hidden">No sessions.</div>
+  <div id="buildtag"></div>
 </div>
 
 <div id="term" class="hidden">
@@ -167,6 +170,17 @@
   if (loadPref("st-pad") === "1") $("inputs").classList.add("compact");
 
   function api(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "t=" + encodeURIComponent(token); }
+
+  // Version readout: the phone answers "did my build land?" without a walk
+  // to the Mac. Fetched once — the page itself is served no-store, so a
+  // reload always carries the running build's markup.
+  fetch(api("/version"), { headers: { "X-Companion-Token": token } })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (v) {
+      if (!v) return;
+      $("buildtag").textContent = "v" + v.version + " \u00b7 " + v.build;
+    })
+    .catch(function () {});
 
   // "Needs attention": a room whose long job just finished while you were
   // not looking at it. Driven by the Mac's monotonic finish counter (cue
