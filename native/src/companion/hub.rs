@@ -24,6 +24,9 @@ pub const MAX_SERIALIZED: usize = 1024 * 1024;
 /// keeps a misbehaving page from carpeting the Mac in tabs.
 pub const MAX_PENDING_SPAWNS: usize = 4;
 
+/// Phone-requested renames waiting for the main-thread tick.
+pub const MAX_PENDING_RENAMES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInfo {
     pub id: String,
@@ -47,6 +50,9 @@ pub struct CompanionHub<S: Clone> {
     /// Terminals the phone asked for; drained by the workspace tick (PTY
     /// spawn is main-thread-only).
     pending_spawns: Mutex<usize>,
+    /// (terminal id, new label) renames from the phone; drained by the
+    /// workspace tick (tab state is main-thread-only).
+    pending_renames: Mutex<Vec<(String, String)>>,
     cache: Mutex<HashMap<String, (u64, Arc<String>)>>,
 }
 
@@ -56,6 +62,7 @@ impl<S: Clone> Default for CompanionHub<S> {
             inner: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
             pending_spawns: Mutex::new(0),
+            pending_renames: Mutex::new(Vec::new()),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -205,6 +212,27 @@ impl<S: Clone> CompanionHub<S> {
     /// Drain and return the number of queued spawns (main-thread tick).
     pub fn take_spawns(&self) -> usize {
         std::mem::take(&mut *self.pending_spawns.lock().unwrap())
+    }
+
+    /// Queue one phone-requested rename; a newer label for the same id
+    /// replaces the queued one (latest intent wins). False when the cap is
+    /// reached (the server answers 429).
+    pub fn request_rename(&self, id: &str, label: &str) -> bool {
+        let mut pending = self.pending_renames.lock().unwrap();
+        if let Some(slot) = pending.iter_mut().find(|(qid, _)| qid == id) {
+            slot.1 = label.to_string();
+            return true;
+        }
+        if pending.len() >= MAX_PENDING_RENAMES {
+            return false;
+        }
+        pending.push((id.to_string(), label.to_string()));
+        true
+    }
+
+    /// Drain queued renames (main-thread tick).
+    pub fn take_renames(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.pending_renames.lock().unwrap())
     }
 
     pub fn bump_generation(&self) {
@@ -365,6 +393,27 @@ mod tests {
         assert_eq!(hub.take_spawns(), MAX_PENDING_SPAWNS);
         assert_eq!(hub.take_spawns(), 0, "drain resets");
         assert!(hub.request_spawn(), "capacity returns after drain");
+    }
+
+    #[test]
+    fn rename_queue_caps_replaces_and_drains() {
+        let (hub, _rx) = hub_with("t1", "work");
+        assert!(hub.request_rename("t1", "build"));
+        // A newer rename for the same id replaces the queued one — the
+        // phone's latest intent wins, without eating queue capacity.
+        assert!(hub.request_rename("t1", "deploy"));
+        for i in 0..(MAX_PENDING_RENAMES - 1) {
+            assert!(hub.request_rename(&format!("x{i}"), "n"));
+        }
+        assert!(
+            !hub.request_rename("overflow", "n"),
+            "cap must refuse past MAX_PENDING_RENAMES"
+        );
+        let drained = hub.take_renames();
+        assert_eq!(drained.len(), MAX_PENDING_RENAMES);
+        assert_eq!(drained[0], ("t1".to_string(), "deploy".to_string()));
+        assert!(hub.take_renames().is_empty(), "drain resets");
+        assert!(hub.request_rename("t1", "again"), "capacity returns");
     }
 
     #[test]

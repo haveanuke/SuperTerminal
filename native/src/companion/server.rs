@@ -23,7 +23,7 @@ use crate::themes::Theme;
 use super::auth::token_matches;
 use super::http::{parse_request, Method, ParseError, Request};
 use super::hub::CompanionHub;
-use super::input::{parse_body, symbolic_bytes, text_bytes, InputMsg};
+use super::input::{parse_body, parse_rename, symbolic_bytes, text_bytes, InputMsg};
 
 pub const MAX_CONNS: usize = 8;
 pub const MAX_SSE: usize = 4;
@@ -438,6 +438,41 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 let _ = respond(&stream, "429 Too Many Requests", &[], b"");
             }
         }
+        (Method::Post, _) if path.starts_with("/rename/") => {
+            let our_origin = format!("http://{}", shared.host);
+            if let Some(origin) = request.header("origin") {
+                if origin != our_origin {
+                    let _ = respond(&stream, "403 Forbidden", &[], b"");
+                    return;
+                }
+            }
+            if request.header("content-type") != Some(INPUT_CONTENT_TYPE) {
+                let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
+                return;
+            }
+            let id = path["/rename/".len()..].to_string();
+            let Some(label) = parse_rename(&request.body) else {
+                let _ = respond(&stream, "400 Bad Request", &[], b"");
+                return;
+            };
+            match shared.hub.input_sender(&id) {
+                None => {
+                    let _ = respond(&stream, "404 Not Found", &[], b"");
+                }
+                Some((false, _)) => {
+                    let _ = respond(&stream, "410 Gone", &[], b"");
+                }
+                Some((true, _)) => {
+                    if shared.hub.request_rename(&id, &label) {
+                        // The Mac's next tick applies it; the phone sees the
+                        // new label on its next /sessions poll.
+                        let _ = respond(&stream, "202 Accepted", &[], b"");
+                    } else {
+                        let _ = respond(&stream, "429 Too Many Requests", &[], b"");
+                    }
+                }
+            }
+        }
         (Method::Post, _) if path.starts_with("/input/") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
@@ -814,6 +849,42 @@ mod tests {
             vec![0x1b, b'O', b'A']
         );
         handle2.stop();
+    }
+
+    fn post_rename(host: &str, id: &str, body: &str, content_type: &str) -> String {
+        roundtrip(
+            host,
+            &format!(
+                "POST /rename/{id} HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    #[test]
+    fn rename_route_guards_queue_and_lifecycle() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(Arc::clone(&hub));
+        let host = host_of(&handle);
+        // Guards mirror /input.
+        let plain = post_rename(&host, "t1", r#"{"label":"build"}"#, "text/plain");
+        assert!(plain.starts_with("HTTP/1.1 415"), "{plain}");
+        let bad = post_rename(&host, "t1", r#"{"label":"  "}"#, INPUT_CONTENT_TYPE);
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let unknown = post_rename(&host, "ghost", r#"{"label":"x"}"#, INPUT_CONTENT_TYPE);
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        // Accepted: queued for the Mac tick.
+        let ok = post_rename(&host, "t1", r#"{"label":" build "}"#, INPUT_CONTENT_TYPE);
+        assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+        assert_eq!(
+            hub.take_renames(),
+            vec![("t1".to_string(), "build".to_string())]
+        );
+        // Retired sessions answer 410 like /input.
+        hub.retire("t1");
+        let gone = post_rename(&host, "t1", r#"{"label":"x"}"#, INPUT_CONTENT_TYPE);
+        assert!(gone.starts_with("HTTP/1.1 410"), "{gone}");
+        handle.stop();
     }
 
     #[test]

@@ -634,6 +634,19 @@ impl Workspace {
                 // a Window, which the next render supplies.
                 self.companion_pending_focus = self.focused_terminal.clone();
             }
+            // Phone-requested renames: tab state is main-thread-only. The
+            // rename lands on the TAB holding that terminal (same label the
+            // Mac's inline rename edits); the metadata sweep below
+            // republishes it to the phone.
+            for (terminal_id, label) in hub.take_renames() {
+                for tab in &mut self.tabs {
+                    if tab.all_terminal_ids().iter().any(|id| *id == terminal_id) {
+                        tab.label = label;
+                        cx.notify();
+                        break;
+                    }
+                }
+            }
         }
         if self.pet_tick_count.is_multiple_of(3) {
             if let (Some(hub), Some(handle)) = (&self.companion_hub, &self.companion_server) {

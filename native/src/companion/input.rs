@@ -51,6 +51,24 @@ pub fn text_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     bytes
 }
 
+/// Rename body: `{"label": …}` — edge whitespace (including stray
+/// newlines from pastes) is trimmed; control characters INSIDE the name
+/// are rejected (escape-sequence smuggling; a mangled name is worse than
+/// an error); truncated to 64 chars. None = 400.
+pub fn parse_rename(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct RenameBody {
+        label: Option<String>,
+    }
+    let raw: RenameBody = serde_json::from_slice(body).ok()?;
+    let label = raw.label?;
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    Some(trimmed.chars().take(64).collect())
+}
+
 pub fn symbolic_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
     let arrow = |ch: u8| {
         if app_cursor {
@@ -130,6 +148,29 @@ mod tests {
             text_bytes("a\x1b[201~evil\r", true),
             b"\x1b[200~a[201~evil\x1b[201~\r".to_vec()
         );
+    }
+
+    #[test]
+    fn rename_body_parses_trims_and_rejects_junk() {
+        assert_eq!(
+            parse_rename(br#"{"label":" build "}"#),
+            Some("build".into())
+        );
+        assert_eq!(parse_rename(br#"{"label":"   "}"#), None);
+        assert_eq!(parse_rename(br#"{}"#), None);
+        assert_eq!(parse_rename(b"not json"), None);
+        // Interior control characters (escape-sequence smuggling) are
+        // rejected, not stripped — a mangled name is worse than an error.
+        assert_eq!(parse_rename(b"{\"label\":\"a\\u001b[31mred\"}"), None);
+        assert_eq!(parse_rename(b"{\"label\":\"a\\tb\"}"), None);
+        // Edge whitespace (stray paste newlines) trims away harmlessly.
+        assert_eq!(
+            parse_rename(b"{\"label\":\"build\\n\"}"),
+            Some("build".into())
+        );
+        // Over-long names truncate to 64 chars.
+        let long = format!("{{\"label\":\"{}\"}}", "x".repeat(90));
+        assert_eq!(parse_rename(long.as_bytes()).unwrap().chars().count(), 64);
     }
 
     #[test]

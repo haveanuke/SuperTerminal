@@ -274,6 +274,20 @@ fn page_renders_the_history_tail_above_the_live_screen() {
 }
 
 #[test]
+fn page_offers_terminal_rename() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("function promptRename"),
+        "rename prompt exists"
+    );
+    assert!(page.contains("/rename/"), "rename posts to the route");
+    assert!(
+        page.contains("setAttribute(\"aria-label\", \"rename\")"),
+        "list rows carry a rename affordance"
+    );
+}
+
+#[test]
 fn page_has_a_previews_screen() {
     let page = include_str!("page.html");
     assert!(page.contains("id=\"previews\""), "previews screen exists");

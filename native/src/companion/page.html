@@ -20,6 +20,8 @@
   #sessions li { display:flex; align-items:center; gap:12px; padding:16px 14px; border-bottom:1px solid var(--border); min-height:56px; }
   #sessions li .label { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #sessions li .chev { color:var(--muted); }
+  #sessions li .edit { background:none; border:none; color:var(--muted); min-width:40px; min-height:40px; }
+  #sessions li .edit svg { width:14px; height:14px; vertical-align:middle; }
   /* The terminal screen is a full-height column: header and key pad keep
      their natural size, the grid area takes every remaining pixel and does
      its own 2D scrolling. */
@@ -165,8 +167,13 @@
           var dot = document.createElement("div");
           dot.className = "dot" + (s.busy ? " busy" : s.alive ? " on" : "");
           var label = document.createElement("div"); label.className = "label"; label.textContent = s.label;
+          var edit = document.createElement("button");
+          edit.className = "edit";
+          edit.setAttribute("aria-label", "rename");
+          edit.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11.5 2.5l2 2L5 13l-2.7.7.7-2.7z"/></svg>';
+          edit.addEventListener("click", function (event) { event.stopPropagation(); promptRename(s); });
           var chev = document.createElement("div"); chev.className = "chev"; chev.textContent = ">";
-          li.appendChild(dot); li.appendChild(label); li.appendChild(chev);
+          li.appendChild(dot); li.appendChild(label); li.appendChild(edit); li.appendChild(chev);
           li.addEventListener("click", function () { open(s); });
           list.appendChild(li);
         });
@@ -319,6 +326,34 @@
     }
     follow();
   }
+
+  // ---- Rename ----------------------------------------------------------
+  // Native prompt keeps this dependency-free; the Mac applies the rename on
+  // its next tick, so the list refreshes shortly after the 202.
+  function promptRename(session) {
+    var name = window.prompt("Rename terminal", session.label);
+    if (name === null) return;
+    // Mirror the server: trim, cap at 64 characters (code points, matching
+    // the host's char cap) — the optimistic title must equal what the Mac
+    // actually stores.
+    name = Array.from(name.trim()).slice(0, 64).join("");
+    if (!name) return;
+    fetch("/rename/" + encodeURIComponent(session.id), {
+      method: "POST",
+      headers: { "X-Companion-Token": token, "Content-Type": "application/companion-input" },
+      body: JSON.stringify({ label: name }),
+    }).then(function (r) {
+      if (!r.ok) return;
+      if (current && current.id === session.id) {
+        current.label = name;
+        $("termtitle").textContent = name;
+      }
+      setTimeout(refreshSessions, 900);
+    }).catch(function () {});
+  }
+  $("termtitle").addEventListener("click", function () {
+    if (current) promptRename(current);
+  });
 
   // ---- Previews screen -------------------------------------------------
   var previewTimer = null, tileEls = {};
