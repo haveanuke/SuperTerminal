@@ -755,7 +755,11 @@ impl TerminalPane {
             }
             if m.platform && ks.key == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.write(text.into_bytes());
+                    // Same framing as phone Send: paste-aware TUIs must see
+                    // a paste, not a timing-dependent burst of keystrokes.
+                    let bytes =
+                        crate::companion::input::text_bytes(&text, self.snapshot.bracketed_paste);
+                    self.write(bytes);
                 }
                 return;
             }
