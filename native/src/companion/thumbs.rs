@@ -22,7 +22,11 @@ pub enum ThumbState {
 
 struct Job {
     revision: String,
-    source: PathBuf,
+    /// The VERIFIED descriptor from `open_verified` — generation never
+    /// touches the watched directory again, so post-verification swaps
+    /// (symlinks, replacements) cannot reach sips.
+    source: std::fs::File,
+    len: u64,
 }
 
 pub struct Thumbnailer {
@@ -44,10 +48,13 @@ impl Thumbnailer {
             queue: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
         });
-        let worker = Arc::clone(&this);
+        // The worker holds only a Weak handle and re-upgrades per cycle:
+        // when the last store reference drops, the thread exits within one
+        // wait timeout instead of leaking per companion start.
+        let weak = Arc::downgrade(&this);
         let _ = std::thread::Builder::new()
             .name("companion-thumbs".into())
-            .spawn(move || worker.run());
+            .spawn(move || worker_loop(weak));
         this
     }
 
@@ -56,8 +63,9 @@ impl Thumbnailer {
     }
 
     /// Ready iff the cache already holds this revision; otherwise enqueue
-    /// (drop-oldest beyond QUEUE_CAP) and return Pending immediately.
-    pub fn request(&self, revision: &str, source: PathBuf) -> ThumbState {
+    /// the verified descriptor (drop-oldest beyond QUEUE_CAP) and return
+    /// Pending immediately.
+    pub fn request(&self, revision: &str, source: std::fs::File, len: u64) -> ThumbState {
         let cached = self.cache_path(revision);
         if cached.is_file() {
             return ThumbState::Ready(cached);
@@ -70,6 +78,7 @@ impl Thumbnailer {
             queue.push_back(Job {
                 revision: revision.to_string(),
                 source,
+                len,
             });
         }
         drop(queue);
@@ -77,57 +86,77 @@ impl Thumbnailer {
         ThumbState::Pending
     }
 
-    fn run(&self) {
-        prune(&self.cache_dir);
-        loop {
-            let job = {
-                let mut queue = self.queue.lock().unwrap();
-                loop {
-                    if let Some(job) = queue.pop_front() {
-                        break job;
-                    }
-                    queue = self.wake.wait(queue).unwrap();
-                }
-            };
-            let out = self.cache_path(&job.revision);
-            if out.is_file() {
-                continue;
-            }
-            if !dimensions_acceptable(&job.source) {
-                continue;
-            }
-            let tmp = self
-                .cache_dir
-                .join(format!("{}.tmp.{}", job.revision, std::process::id()));
-            if generate_with(
-                Path::new("/usr/bin/sips"),
-                &job.source,
-                &tmp,
-                Duration::from_secs(SIPS_TIMEOUT_SECS),
-            ) {
-                let _ = std::fs::rename(&tmp, &out);
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-            }
-            prune(&self.cache_dir);
+    fn process(&self, job: Job) {
+        use std::io::{Read, Seek};
+        let out = self.cache_path(&job.revision);
+        if out.is_file() {
+            return;
         }
+        let mut source = job.source;
+        // Refuse absurd pixel counts BEFORE invoking sips (decompression-
+        // bomb guard); unknown or truncated headers refuse too.
+        let mut head = vec![0u8; 256 * 1024];
+        let read = match source.read(&mut head) {
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        match image_dimensions(&head[..read]) {
+            Some((w, h)) if (w as u64) * (h as u64) <= MAX_PIXELS => {}
+            _ => return,
+        }
+        // Bounded copy FROM THE DESCRIPTOR: this copy, not the watched
+        // path, is what sips reads.
+        let copy_path = self
+            .cache_dir
+            .join(format!("{}.src.{}", job.revision, std::process::id()));
+        let copied = (|| -> std::io::Result<u64> {
+            source.rewind()?;
+            let mut copy = std::fs::File::create(&copy_path)?;
+            std::io::copy(&mut (&mut source).take(job.len), &mut copy)
+        })();
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&copy_path);
+            return;
+        }
+        let tmp = self
+            .cache_dir
+            .join(format!("{}.tmp.{}", job.revision, std::process::id()));
+        if generate_with(
+            Path::new("/usr/bin/sips"),
+            &copy_path,
+            &tmp,
+            Duration::from_secs(SIPS_TIMEOUT_SECS),
+        ) {
+            let _ = std::fs::rename(&tmp, &out);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        let _ = std::fs::remove_file(&copy_path);
+        prune(&self.cache_dir);
     }
 }
 
-/// Refuse absurd pixel counts BEFORE invoking sips (decompression-bomb
-/// guard); unknown headers refuse too.
-fn dimensions_acceptable(source: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(source) else {
-        return false;
-    };
-    let mut head = [0u8; 64];
-    let Ok(read) = file.read(&mut head) else {
-        return false;
-    };
-    match image_dimensions(&head[..read]) {
-        Some((w, h)) => (w as u64) * (h as u64) <= MAX_PIXELS,
-        None => false,
+fn worker_loop(weak: std::sync::Weak<Thumbnailer>) {
+    if let Some(this) = weak.upgrade() {
+        prune(&this.cache_dir);
+    }
+    loop {
+        let Some(this) = weak.upgrade() else { break };
+        let job = {
+            let mut queue = this.queue.lock().unwrap();
+            if let Some(job) = queue.pop_front() {
+                Some(job)
+            } else {
+                let (mut queue, _) = this
+                    .wake
+                    .wait_timeout(queue, Duration::from_millis(500))
+                    .unwrap();
+                queue.pop_front()
+            }
+        };
+        if let Some(job) = job {
+            this.process(job);
+        }
     }
 }
 
@@ -176,14 +205,29 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
         return Some((w, h));
     }
     if head.starts_with(&[0xff, 0xd8, 0xff]) {
-        // JPEG: scan markers for a SOF segment within the sniffed head.
+        // JPEG: walk segments for a SOF marker. No SOF inside the buffer
+        // (the caller reads 256 KiB) means refuse — never assume small.
         let mut i = 2;
-        while i + 9 < head.len() {
+        while i + 1 < head.len() {
             if head[i] != 0xff {
                 return None;
             }
             let marker = head[i + 1];
+            if marker == 0xff {
+                i += 1; // fill byte
+                continue;
+            }
+            if (0xd0..=0xd9).contains(&marker) {
+                i += 2; // standalone marker, no length payload
+                continue;
+            }
+            if i + 8 >= head.len() {
+                return None;
+            }
             let len = u16::from_be_bytes([head[i + 2], head[i + 3]]) as usize;
+            if len < 2 {
+                return None;
+            }
             if (0xc0..=0xcf).contains(&marker) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc
             {
                 let h = u16::from_be_bytes([head[i + 5], head[i + 6]]) as u32;
@@ -192,18 +236,41 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
             }
             i += 2 + len;
         }
-        // SOF beyond the sniffed head: fall back to a conservative accept —
-        // sips bounds memory itself for JPEG; the cap targets PNG bombs.
-        return Some((1, 1));
+        return None;
     }
-    if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice()) && head.len() >= 30
+    if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP".as_slice()) && head.len() >= 25
     {
         if head.get(12..16) == Some(b"VP8X".as_slice()) {
+            if head.len() < 30 {
+                return None;
+            }
             let w = 1 + u32::from_le_bytes([head[24], head[25], head[26], 0]);
             let h = 1 + u32::from_le_bytes([head[27], head[28], head[29], 0]);
             return Some((w, h));
         }
-        return Some((1, 1)); // simple VP8/VP8L: bounded by webp's 16383 limit
+        if head.get(12..16) == Some(b"VP8 ".as_slice()) {
+            // Lossy: 3-byte frame tag, sync 9d 01 2a, then 14-bit dims.
+            if head.len() < 30 || head.get(23..26) != Some(&[0x9d, 0x01, 0x2a][..]) {
+                return None;
+            }
+            let w = (u16::from_le_bytes([head[26], head[27]]) & 0x3fff) as u32;
+            let h = (u16::from_le_bytes([head[28], head[29]]) & 0x3fff) as u32;
+            return Some((w, h));
+        }
+        if head.get(12..16) == Some(b"VP8L".as_slice()) {
+            // Lossless: 0x2f signature, then width-1 / height-1 as packed
+            // 14-bit little-endian bit fields.
+            if head.len() < 25 || head[20] != 0x2f {
+                return None;
+            }
+            let w = 1 + ((head[21] as u32) | ((head[22] as u32 & 0x3f) << 8));
+            let h = 1
+                + (((head[22] as u32) >> 6)
+                    | ((head[23] as u32) << 2)
+                    | ((head[24] as u32 & 0x0f) << 10));
+            return Some((w, h));
+        }
+        return None;
     }
     None
 }
@@ -254,6 +321,64 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_dimensions_walk_segments_and_refuse_when_sof_is_missing() {
+        // SOI, APP0 (18 bytes of payload), then SOF0 with 480x640.
+        let mut jpeg = vec![0xff, 0xd8];
+        jpeg.extend_from_slice(&[0xff, 0xe0, 0x00, 0x12]);
+        jpeg.extend(std::iter::repeat(0u8).take(0x12 - 2));
+        jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 8, 0x01, 0xe0, 0x02, 0x80]);
+        assert_eq!(image_dimensions(&jpeg), Some((640, 480)));
+        // No SOF within the buffer: refuse, never assume small.
+        let mut headless = vec![0xff, 0xd8];
+        headless.extend_from_slice(&[0xff, 0xe0, 0x00, 0x12]);
+        headless.extend(std::iter::repeat(0u8).take(0x12 - 2));
+        assert_eq!(image_dimensions(&headless), None);
+    }
+
+    #[test]
+    fn webp_dimensions_parse_lossy_and_lossless_refusing_unknown() {
+        // VP8 (lossy): sync code then 14-bit width/height at bytes 26..30.
+        let mut vp8 = b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0".to_vec();
+        vp8.extend_from_slice(&[0, 0, 0]); // frame tag
+        vp8.extend_from_slice(&[0x9d, 0x01, 0x2a]); // sync
+        vp8.extend_from_slice(&[0x40, 0x01, 0xf0, 0x00]); // 320 x 240
+        assert_eq!(image_dimensions(&vp8), Some((320, 240)));
+        // VP8L (lossless): signature 0x2f then packed 14-bit dims (-1).
+        let mut vp8l = b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0".to_vec();
+        vp8l.push(0x2f);
+        // width-1 = 0x13f (320), height-1 = 0xef (240):
+        // b21=0x3f, b22=0x01 | (0xef & 0x3)<<6 -> h low bits...
+        let w1: u32 = 319;
+        let h1: u32 = 239;
+        vp8l.push((w1 & 0xff) as u8);
+        vp8l.push((((w1 >> 8) & 0x3f) | ((h1 & 0x03) << 6)) as u8);
+        vp8l.push(((h1 >> 2) & 0xff) as u8);
+        vp8l.push(((h1 >> 10) & 0x0f) as u8);
+        assert_eq!(image_dimensions(&vp8l), Some((320, 240)));
+        // Unknown chunk type: refuse.
+        assert_eq!(
+            image_dimensions(b"RIFF\0\0\0\0WEBPXXXX\0\0\0\0\0\0\0\0\0\0"),
+            None
+        );
+    }
+
+    #[test]
+    fn dropping_the_store_ends_the_worker_thread() {
+        let cache = scratch("shutdown");
+        let thumbs = Thumbnailer::new(cache);
+        let weak = Arc::downgrade(&thumbs);
+        drop(thumbs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while weak.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker must release its handle and exit after the drop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
     fn dimensions_parse_png_and_gif_headers() {
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
@@ -285,13 +410,15 @@ mod tests {
             return;
         }
         let thumbs = Thumbnailer::new(cache.clone());
+        let open = || std::fs::File::open(&src).unwrap();
+        let len = std::fs::metadata(&src).unwrap().len();
         assert!(matches!(
-            thumbs.request("cafecafecafecafe", src.clone()),
+            thumbs.request("cafecafecafecafe", open(), len),
             ThumbState::Pending
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
-            if let ThumbState::Ready(path) = thumbs.request("cafecafecafecafe", src.clone()) {
+            if let ThumbState::Ready(path) = thumbs.request("cafecafecafecafe", open(), len) {
                 assert!(path.ends_with("cafecafecafecafe.jpg"));
                 let bytes = std::fs::read(path).unwrap();
                 assert!(!bytes.is_empty());

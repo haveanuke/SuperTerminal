@@ -30,6 +30,7 @@ pub(crate) struct FileIdentity {
     pub dev: u64,
     pub inode: u64,
     pub size: u64,
+    pub mtime_nanos: u64,
     pub revision: String,
 }
 
@@ -40,7 +41,6 @@ pub struct CatalogSnapshot {
     /// RELATIVE to this descriptor, so swapping the watched dir on disk
     /// cannot redirect an id to a new tree.
     pub(crate) dir_handle: Option<std::fs::File>,
-    pub(crate) dir_path: Option<PathBuf>,
     pub(crate) by_id: HashMap<String, FileIdentity>,
 }
 
@@ -48,6 +48,10 @@ struct Inner {
     dir: Option<PathBuf>,
     /// Monotonic per-store id counter; ids stay opaque and never repeat.
     next_id: u64,
+    /// (dev, inode) -> id: unchanged files keep their id across rescans so
+    /// the phone's id-keyed tiles never churn on a poll. Pruned to the
+    /// current scan's survivors each pass (bounded by MAX_ENTRIES).
+    ids: HashMap<(u64, u64), String>,
     cached: Option<(Instant, Arc<CatalogSnapshot>)>,
 }
 
@@ -56,10 +60,12 @@ pub struct PreviewStore {
 }
 
 /// FNV-1a over the identity tuple: replacement (new inode/size/mtime) is a
-/// new revision, so caches can never serve stale bytes for an id.
-fn revision_of(dev: u64, inode: u64, size: u64, mtime_secs: u64) -> String {
+/// new revision, so caches can never serve stale bytes for an id. The mtime
+/// participates at nanosecond resolution — a same-size in-place rewrite
+/// within one second still moves the revision.
+fn revision_of(dev: u64, inode: u64, size: u64, mtime_nanos: u64) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for value in [dev, inode, size, mtime_secs] {
+    for value in [dev, inode, size, mtime_nanos] {
         for byte in value.to_le_bytes() {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
@@ -68,11 +74,11 @@ fn revision_of(dev: u64, inode: u64, size: u64, mtime_secs: u64) -> String {
     format!("{hash:016x}")
 }
 
-fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+fn mtime_nanos(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -82,6 +88,7 @@ impl PreviewStore {
             inner: Mutex::new(Inner {
                 dir,
                 next_id: 1,
+                ids: HashMap::new(),
                 cached: None,
             }),
         }
@@ -102,7 +109,8 @@ impl PreviewStore {
             }
         }
         let dir = inner.dir.clone();
-        let snap = Arc::new(scan(dir, &mut inner.next_id));
+        let inner = &mut *inner;
+        let snap = Arc::new(scan(dir, &mut inner.next_id, &mut inner.ids));
         inner.cached = Some((Instant::now(), Arc::clone(&snap)));
         snap
     }
@@ -113,12 +121,15 @@ fn unavailable() -> CatalogSnapshot {
         available: false,
         entries: Vec::new(),
         dir_handle: None,
-        dir_path: None,
         by_id: HashMap::new(),
     }
 }
 
-fn scan(dir: Option<PathBuf>, next_id: &mut u64) -> CatalogSnapshot {
+fn scan(
+    dir: Option<PathBuf>,
+    next_id: &mut u64,
+    ids: &mut HashMap<(u64, u64), String>,
+) -> CatalogSnapshot {
     let Some(dir) = dir else { return unavailable() };
     let Ok(handle) = std::fs::File::open(&dir) else {
         return unavailable();
@@ -144,21 +155,30 @@ fn scan(dir: Option<PathBuf>, next_id: &mut u64) -> CatalogSnapshot {
         if !meta.is_file() {
             continue;
         }
-        found.push((mtime_secs(&meta), name.to_string(), meta));
+        found.push((mtime_nanos(&meta), name.to_string(), meta));
     }
     found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     found.truncate(MAX_ENTRIES);
     let mut entries = Vec::with_capacity(found.len());
     let mut by_id = HashMap::with_capacity(found.len());
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     for (mtime, name, meta) in found {
-        let id = format!("p{next_id}");
-        *next_id += 1;
+        let identity_key = (meta.dev(), meta.ino());
+        seen.insert(identity_key);
+        let id = ids
+            .entry(identity_key)
+            .or_insert_with(|| {
+                let id = format!("p{next_id}");
+                *next_id += 1;
+                id
+            })
+            .clone();
         let revision = revision_of(meta.dev(), meta.ino(), meta.len(), mtime);
         entries.push(PreviewEntry {
             id: id.clone(),
             name: name.clone(),
             revision: revision.clone(),
-            modified_at: mtime,
+            modified_at: mtime / 1_000_000_000,
             bytes: meta.len(),
         });
         by_id.insert(
@@ -168,15 +188,17 @@ fn scan(dir: Option<PathBuf>, next_id: &mut u64) -> CatalogSnapshot {
                 dev: meta.dev(),
                 inode: meta.ino(),
                 size: meta.len(),
+                mtime_nanos: mtime,
                 revision,
             },
         );
     }
+    // Bound the id map to this scan's survivors.
+    ids.retain(|key, _| seen.contains(key));
     CatalogSnapshot {
         available: true,
         entries,
         dir_handle: Some(handle),
-        dir_path: Some(dir),
         by_id,
     }
 }
@@ -250,6 +272,7 @@ impl CatalogSnapshot {
             || meta.dev() != identity.dev
             || meta.ino() != identity.inode
             || meta.len() != identity.size
+            || mtime_nanos(&meta) != identity.mtime_nanos
         {
             return None;
         }
@@ -264,11 +287,13 @@ impl CatalogSnapshot {
         })
     }
 
-    /// Absolute source path for the thumbnailer (sips reads a path; the
-    /// name was verified this scan and the revision key bounds staleness).
-    pub fn source_path(&self, id: &str) -> Option<PathBuf> {
-        let identity = self.by_id.get(id)?;
-        Some(self.dir_path.clone()?.join(&identity.name))
+    /// Cheap identity check for conditional requests: true iff the id is in
+    /// this snapshot AND carries exactly this revision. A 304 must never be
+    /// minted for an id/revision the catalog no longer vouches for.
+    pub fn revision_matches(&self, id: &str, revision: &str) -> bool {
+        self.by_id
+            .get(id)
+            .is_some_and(|identity| identity.revision == revision)
     }
 }
 
@@ -421,6 +446,69 @@ mod tests {
         assert_eq!(sniff_content_type(b"GIF89a\0\0\0\0\0\0"), Some("image/gif"));
         assert_eq!(sniff_content_type(b"RIFF\0\0\0\0WEBP"), Some("image/webp"));
         assert_eq!(sniff_content_type(b"MZ\0\0\0\0\0\0\0\0\0\0"), None);
+    }
+
+    #[test]
+    fn same_size_in_place_rewrite_changes_revision() {
+        let dir = scratch("nanos");
+        write_png(&dir, "a.png", 16);
+        let store = PreviewStore::new(Some(dir.clone()));
+        let first = store.snapshot().entries[0].revision.clone();
+        // Same byte count, different content, mtime bumped by one
+        // millisecond — a whole-seconds revision would collide here.
+        write_png(&dir, "a.png", 16);
+        set_mtime(
+            &dir.join("a.png"),
+            std::time::SystemTime::now() + std::time::Duration::from_millis(1),
+        );
+        store.set_dir(Some(dir));
+        let second = store.snapshot().entries[0].revision.clone();
+        assert_ne!(first, second, "nanosecond mtime must move the revision");
+    }
+
+    #[test]
+    fn ids_are_stable_across_rescans() {
+        let dir = scratch("stable");
+        write_png(&dir, "keep.png", 4);
+        let store = PreviewStore::new(Some(dir.clone()));
+        let first = store.snapshot().entries[0].id.clone();
+        store.set_dir(Some(dir.clone())); // force a rescan
+        write_png(&dir, "later.png", 8);
+        let snap = store.snapshot();
+        let keep = snap.entries.iter().find(|e| e.name == "keep.png").unwrap();
+        let later = snap.entries.iter().find(|e| e.name == "later.png").unwrap();
+        assert_eq!(keep.id, first, "unchanged files keep their id");
+        assert_ne!(later.id, first);
+    }
+
+    #[test]
+    fn open_verified_rejects_in_place_mtime_change() {
+        let dir = scratch("mtime");
+        write_png(&dir, "a.png", 4);
+        let store = PreviewStore::new(Some(dir.clone()));
+        let snap = store.snapshot();
+        let entry = snap.entries[0].clone();
+        // Same inode, same size, newer mtime: the old snapshot's identity
+        // no longer matches the bytes on disk.
+        set_mtime(
+            &dir.join("a.png"),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+        );
+        assert!(
+            snap.open_verified(&entry.id, &entry.revision).is_none(),
+            "stale mtime must fail closed"
+        );
+    }
+
+    #[test]
+    fn revision_matches_requires_both_id_and_revision() {
+        let dir = scratch("revmatch");
+        write_png(&dir, "a.png", 4);
+        let snap = PreviewStore::new(Some(dir)).snapshot();
+        let entry = &snap.entries[0];
+        assert!(snap.revision_matches(&entry.id, &entry.revision));
+        assert!(!snap.revision_matches(&entry.id, "0000000000000000"));
+        assert!(!snap.revision_matches("p424242", &entry.revision));
     }
 
     #[test]

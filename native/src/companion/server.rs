@@ -204,21 +204,24 @@ fn serve_preview<S: InputSink>(
         return;
     };
     let etag = format!("\"{revision}\"");
-    if request.header("if-none-match") == Some(etag.as_str()) {
+    let snap = shared.previews.snapshot();
+    // Conditional requests only AFTER the catalog vouches for this exact
+    // id+revision — an unknown or expired id must 404, never 304.
+    if snap.revision_matches(id, revision) && request.header("if-none-match") == Some(etag.as_str())
+    {
         let _ = respond(stream, "304 Not Modified", &[("ETag", &etag)], b"");
         return;
     }
-    let snap = shared.previews.snapshot();
     let Some(verified) = snap.open_verified(id, revision) else {
         let _ = respond(stream, "404 Not Found", &[], b"");
         return;
     };
     if request.query_param("thumb") == Some("1") {
-        let Some(source) = snap.source_path(id) else {
-            let _ = respond(stream, "404 Not Found", &[], b"");
+        if verified.len > super::previews::MAX_FULL_BYTES {
+            let _ = respond(stream, "413 Content Too Large", &[], b"");
             return;
-        };
-        match shared.thumbs.request(revision, source) {
+        }
+        match shared.thumbs.request(revision, verified.file, verified.len) {
             super::thumbs::ThumbState::Ready(path) => {
                 let Ok(file) = std::fs::File::open(&path) else {
                     let _ = respond(stream, "404 Not Found", &[], b"");
@@ -268,6 +271,9 @@ fn stream_file(
     if writer.write_all(head.as_bytes()).is_err() {
         return;
     }
+    // Never send past the advertised length: a file that grows mid-response
+    // must not overrun Content-Length (or the 64 MiB serving cap).
+    let mut file = file.take(len);
     let mut buf = [0u8; 64 * 1024];
     loop {
         match file.read(&mut buf) {
@@ -873,6 +879,16 @@ mod tests {
             &format!("/preview/{}?t={TOKEN}&rev=0000000000000000", entry.id),
         );
         assert!(stale.starts_with("HTTP/1.1 404"), "{stale}");
+        // An unknown id must 404 even when If-None-Match echoes the rev —
+        // conditionals only apply to ids the catalog vouches for.
+        let ghost = roundtrip(
+            &host,
+            &format!(
+                "GET /preview/p424242?t={TOKEN}&rev={} HTTP/1.1\r\nHost: {host}\r\nIf-None-Match: \"{}\"\r\n\r\n",
+                entry.revision, entry.revision
+            ),
+        );
+        assert!(ghost.starts_with("HTTP/1.1 404"), "{ghost}");
         handle.stop();
     }
 
