@@ -274,6 +274,30 @@ fn page_renders_the_history_tail_above_the_live_screen() {
 }
 
 #[test]
+fn page_flags_rooms_that_finished() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("function markAttention"),
+        "busy->idle transitions tracked"
+    );
+    assert!(page.contains("attnpulse"), "attention dots pulse");
+    assert!(
+        page.contains("id=\"attnbanner\""),
+        "in-terminal banner announces other rooms finishing"
+    );
+}
+
+#[test]
+fn page_has_a_jump_to_live_button() {
+    let page = include_str!("page.html");
+    assert!(page.contains("id=\"jumplive\""), "chevron exists");
+    assert!(
+        page.contains("function updateJumpLive"),
+        "visibility follows scroll position"
+    );
+}
+
+#[test]
 fn page_offers_terminal_rename() {
     let page = include_str!("page.html");
     assert!(

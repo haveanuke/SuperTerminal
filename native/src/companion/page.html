@@ -52,6 +52,15 @@
   #pfullwrap img { display:block; margin:auto; max-width:100%; }
   #pfullwrap img.zoomed { max-width:none; width:250%; }
   #pfullcap { padding:10px 14px; font-size:12px; color:var(--muted); text-align:center; }
+  .dot.attn { background:var(--accent); animation:attnpulse 1.2s ease-in-out infinite; }
+  @keyframes attnpulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.45; transform:scale(1.35); } }
+  #attnbanner { position:absolute; left:14px; right:14px; top:8px; z-index:3; background:var(--panel);
+    border:1px solid var(--accent); border-radius:8px; padding:10px 12px; font-size:13px; }
+  #jumplive { position:absolute; right:14px; bottom:14px; width:40px; height:40px; border-radius:50%;
+    background:var(--panel); border:1px solid var(--border); color:var(--accent); z-index:2;
+    display:flex; align-items:center; justify-content:center; }
+  #jumplive svg { width:18px; height:18px; }
+  #gridarea { position:relative; flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
 </style>
 </head>
 <body>
@@ -82,7 +91,13 @@
     <button class="back" id="zoomin" aria-label="larger text">A+</button>
     <div id="termdot" class="dot"></div>
   </header>
-  <div id="gridwrap"><div id="grid"><div id="cursor" class="hidden"></div></div></div>
+  <div id="gridarea">
+    <div id="gridwrap"><div id="grid"><div id="cursor" class="hidden"></div></div></div>
+    <button id="jumplive" class="hidden" aria-label="jump to live">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5l5 5 5-5"/><path d="M3 9l5 5 5-5" opacity=".45"/></svg>
+    </button>
+    <div id="attnbanner" class="hidden"></div>
+  </div>
   <div id="inputs">
     <div id="keys">
       <button data-key="enter">Enter</button>
@@ -151,6 +166,39 @@
 
   function api(path) { return path + (path.indexOf("?") < 0 ? "?" : "&") + "t=" + encodeURIComponent(token); }
 
+  // "Needs attention": a room that flipped busy -> idle while you weren't
+  // looking at it. Pulses its list dot until opened; while you're inside
+  // another terminal, a tappable banner announces it.
+  var lastBusy = {}, attention = {}, bannerTimer = null;
+  function showBanner(session) {
+    var banner = $("attnbanner");
+    banner.textContent = session.label + " finished — tap to switch";
+    banner.classList.remove("hidden");
+    banner.onclick = function () {
+      banner.classList.add("hidden");
+      close();
+      open(session);
+    };
+    clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(function () { banner.classList.add("hidden"); }, 8000);
+  }
+  function markAttention(sessions) {
+    sessions.forEach(function (s) {
+      var was = lastBusy[s.id];
+      lastBusy[s.id] = s.busy;
+      if (was && !s.busy && s.alive && (!current || current.id !== s.id)) {
+        attention[s.id] = true;
+        if (current) showBanner(s);
+      }
+    });
+    Object.keys(lastBusy).forEach(function (id) {
+      if (!sessions.some(function (s) { return s.id === id; })) {
+        delete lastBusy[id];
+        delete attention[id];
+      }
+    });
+  }
+
   function refreshSessions() {
     fetch(api("/sessions"), { headers: { "X-Companion-Token": token } })
       .then(function (r) {
@@ -160,12 +208,14 @@
         return r.json();
       })
       .then(function (sessions) {
+        markAttention(sessions);
         var list = $("sessions"); list.textContent = "";
         $("empty").classList.toggle("hidden", sessions.length > 0);
         sessions.forEach(function (s) {
           var li = document.createElement("li");
           var dot = document.createElement("div");
-          dot.className = "dot" + (s.busy ? " busy" : s.alive ? " on" : "");
+          dot.className = "dot" + (s.busy ? " busy" : s.alive ? " on" : "")
+            + (attention[s.id] ? " attn" : "");
           var label = document.createElement("div"); label.className = "label"; label.textContent = s.label;
           var edit = document.createElement("button");
           edit.className = "edit";
@@ -456,6 +506,8 @@
   var lastFrame = "";
   function open(session) {
     current = session;
+    delete attention[session.id];
+    $("attnbanner").classList.add("hidden");
     fitFor = 0; // re-fit: viewport may have rotated since the last view
     lastFrame = "";
     $("termtitle").textContent = session.label;
@@ -529,8 +581,24 @@
   // did not cause ourselves count as the user looking around. A scroll still
   // sitting at the programmed position is ours (events for one programmatic
   // move can be coalesced or duplicated, so match by position, not count).
+  // Floating chevron back to the live screen: visible whenever the view
+  // sits meaningfully above the bottom (history browsing), hidden at tail.
+  function updateJumpLive() {
+    var wrap = $("gridwrap");
+    var above = wrap.scrollHeight - wrap.clientHeight - wrap.scrollTop;
+    $("jumplive").classList.toggle("hidden", above < 40);
+  }
+  $("jumplive").addEventListener("click", function () {
+    var wrap = $("gridwrap");
+    // Clearing the touch suppression lets follow() re-engage immediately.
+    lastTouch = 0;
+    wrap.scrollTop = wrap.scrollHeight;
+    progScroll = { top: wrap.scrollTop, left: wrap.scrollLeft };
+    updateJumpLive();
+  });
   $("gridwrap").addEventListener("scroll", function () {
     var wrap = $("gridwrap");
+    updateJumpLive();
     if (progScroll
         && Math.abs(wrap.scrollTop - progScroll.top) < 1
         && Math.abs(wrap.scrollLeft - progScroll.left) < 1) return;
@@ -560,7 +628,9 @@
   });
 
   refreshSessions();
-  setInterval(function () { if (!current) refreshSessions(); }, 5000);
+  // Always poll: transition detection (markAttention) must keep running
+  // while a terminal is open, so other rooms' finishes surface as banners.
+  setInterval(refreshSessions, 5000);
 })();
 </script>
 </body>
