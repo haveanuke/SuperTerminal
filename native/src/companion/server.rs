@@ -205,17 +205,18 @@ fn serve_preview<S: InputSink>(
     };
     let etag = format!("\"{revision}\"");
     let snap = shared.previews.snapshot();
-    // Conditional requests only AFTER the catalog vouches for this exact
-    // id+revision — an unknown or expired id must 404, never 304.
-    if snap.revision_matches(id, revision) && request.header("if-none-match") == Some(etag.as_str())
-    {
-        let _ = respond(stream, "304 Not Modified", &[("ETag", &etag)], b"");
-        return;
-    }
+    // Full verification BEFORE any conditional answer: a 304 is a promise
+    // the bytes are still exactly what this revision named, so an unknown
+    // id, a stale revision, or a replaced/modified file all 404 — even
+    // when If-None-Match echoes the revision.
     let Some(verified) = snap.open_verified(id, revision) else {
         let _ = respond(stream, "404 Not Found", &[], b"");
         return;
     };
+    if request.header("if-none-match") == Some(etag.as_str()) {
+        let _ = respond(stream, "304 Not Modified", &[("ETag", &etag)], b"");
+        return;
+    }
     if request.query_param("thumb") == Some("1") {
         if verified.len > super::previews::MAX_FULL_BYTES {
             let _ = respond(stream, "413 Content Too Large", &[], b"");
@@ -889,6 +890,32 @@ mod tests {
             ),
         );
         assert!(ghost.starts_with("HTTP/1.1 404"), "{ghost}");
+        handle.stop();
+    }
+
+    #[test]
+    fn conditional_requests_revalidate_the_file_identity() {
+        let dir = std::env::temp_dir().join(format!("st-prevcond-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_png(&dir, "a.png");
+        let store = preview_store(&dir);
+        let entry = store.snapshot().entries[0].clone();
+        let handle = boot_with_previews(store);
+        let host = host_of(&handle);
+        // Replace the file under the same name: the 2s snapshot still lists
+        // the old revision, but the bytes it vouched for are gone — a
+        // conditional echoing that revision must 404, never 304.
+        std::fs::remove_file(dir.join("a.png")).unwrap();
+        write_test_png(&dir, "a.png");
+        let stale = roundtrip(
+            &host,
+            &format!(
+                "GET /preview/{}?t={TOKEN}&rev={} HTTP/1.1\r\nHost: {host}\r\nIf-None-Match: \"{}\"\r\n\r\n",
+                entry.id, entry.revision, entry.revision
+            ),
+        );
+        assert!(stale.starts_with("HTTP/1.1 404"), "{stale}");
         handle.stop();
     }
 

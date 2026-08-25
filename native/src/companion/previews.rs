@@ -48,10 +48,12 @@ struct Inner {
     dir: Option<PathBuf>,
     /// Monotonic per-store id counter; ids stay opaque and never repeat.
     next_id: u64,
-    /// (dev, inode) -> id: unchanged files keep their id across rescans so
-    /// the phone's id-keyed tiles never churn on a poll. Pruned to the
-    /// current scan's survivors each pass (bounded by MAX_ENTRIES).
-    ids: HashMap<(u64, u64), String>,
+    /// (dev, inode, name) -> id: unchanged files keep their id across
+    /// rescans so the phone's id-keyed tiles never churn on a poll, while
+    /// hard links (same inode, different names) stay distinct entries.
+    /// Pruned to the current scan's survivors each pass (bounded by
+    /// MAX_ENTRIES).
+    ids: HashMap<(u64, u64, String), String>,
     cached: Option<(Instant, Arc<CatalogSnapshot>)>,
 }
 
@@ -128,7 +130,7 @@ fn unavailable() -> CatalogSnapshot {
 fn scan(
     dir: Option<PathBuf>,
     next_id: &mut u64,
-    ids: &mut HashMap<(u64, u64), String>,
+    ids: &mut HashMap<(u64, u64, String), String>,
 ) -> CatalogSnapshot {
     let Some(dir) = dir else { return unavailable() };
     let Ok(handle) = std::fs::File::open(&dir) else {
@@ -161,10 +163,10 @@ fn scan(
     found.truncate(MAX_ENTRIES);
     let mut entries = Vec::with_capacity(found.len());
     let mut by_id = HashMap::with_capacity(found.len());
-    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(u64, u64, String)> = std::collections::HashSet::new();
     for (mtime, name, meta) in found {
-        let identity_key = (meta.dev(), meta.ino());
-        seen.insert(identity_key);
+        let identity_key = (meta.dev(), meta.ino(), name.clone());
+        seen.insert(identity_key.clone());
         let id = ids
             .entry(identity_key)
             .or_insert_with(|| {
@@ -285,15 +287,6 @@ impl CatalogSnapshot {
             len: meta.len(),
             content_type,
         })
-    }
-
-    /// Cheap identity check for conditional requests: true iff the id is in
-    /// this snapshot AND carries exactly this revision. A 304 must never be
-    /// minted for an id/revision the catalog no longer vouches for.
-    pub fn revision_matches(&self, id: &str, revision: &str) -> bool {
-        self.by_id
-            .get(id)
-            .is_some_and(|identity| identity.revision == revision)
     }
 }
 
@@ -501,14 +494,17 @@ mod tests {
     }
 
     #[test]
-    fn revision_matches_requires_both_id_and_revision() {
-        let dir = scratch("revmatch");
+    fn hard_links_get_distinct_ids_and_entries() {
+        let dir = scratch("hardlink");
         write_png(&dir, "a.png", 4);
+        std::fs::hard_link(dir.join("a.png"), dir.join("b.png")).unwrap();
         let snap = PreviewStore::new(Some(dir)).snapshot();
-        let entry = &snap.entries[0];
-        assert!(snap.revision_matches(&entry.id, &entry.revision));
-        assert!(!snap.revision_matches(&entry.id, "0000000000000000"));
-        assert!(!snap.revision_matches("p424242", &entry.revision));
+        assert_eq!(snap.entries.len(), 2, "both names are listed");
+        assert_ne!(
+            snap.entries[0].id, snap.entries[1].id,
+            "same inode under two names must not collide on one id"
+        );
+        assert_eq!(snap.by_id.len(), 2, "both identities are addressable");
     }
 
     #[test]

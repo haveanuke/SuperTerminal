@@ -93,19 +93,11 @@ impl Thumbnailer {
             return;
         }
         let mut source = job.source;
-        // Refuse absurd pixel counts BEFORE invoking sips (decompression-
-        // bomb guard); unknown or truncated headers refuse too.
-        let mut head = vec![0u8; 256 * 1024];
-        let read = match source.read(&mut head) {
-            Ok(read) => read,
-            Err(_) => return,
-        };
-        match image_dimensions(&head[..read]) {
-            Some((w, h)) if (w as u64) * (h as u64) <= MAX_PIXELS => {}
-            _ => return,
-        }
-        // Bounded copy FROM THE DESCRIPTOR: this copy, not the watched
-        // path, is what sips reads.
+        // Bounded private copy FIRST, from the verified descriptor: the
+        // dimension check and sips then read the SAME immutable bytes — a
+        // writer mutating the source mid-flight cannot desync check from
+        // use. A copy shorter than the verified length means the source
+        // changed underneath us: refuse.
         let copy_path = self
             .cache_dir
             .join(format!("{}.src.{}", job.revision, std::process::id()));
@@ -114,7 +106,25 @@ impl Thumbnailer {
             let mut copy = std::fs::File::create(&copy_path)?;
             std::io::copy(&mut (&mut source).take(job.len), &mut copy)
         })();
-        if copied.is_err() {
+        if copied.map(|n| n != job.len).unwrap_or(true) {
+            let _ = std::fs::remove_file(&copy_path);
+            return;
+        }
+        drop(source);
+        // Refuse absurd pixel counts BEFORE invoking sips (decompression-
+        // bomb guard); unknown or truncated headers refuse too. Read from
+        // the private copy, never the source.
+        let dims_ok = (|| -> std::io::Result<bool> {
+            let mut copy = std::fs::File::open(&copy_path)?;
+            let mut head = vec![0u8; 256 * 1024];
+            let read = copy.read(&mut head)?;
+            Ok(matches!(
+                image_dimensions(&head[..read]),
+                Some((w, h)) if (w as u64) * (h as u64) <= MAX_PIXELS
+            ))
+        })()
+        .unwrap_or(false);
+        if !dims_ok {
             let _ = std::fs::remove_file(&copy_path);
             return;
         }
@@ -359,6 +369,32 @@ mod tests {
         assert_eq!(
             image_dimensions(b"RIFF\0\0\0\0WEBPXXXX\0\0\0\0\0\0\0\0\0\0"),
             None
+        );
+    }
+
+    #[test]
+    fn length_mismatch_refuses_thumbnailing() {
+        // The worker requires the bounded copy to equal the fstat length a
+        // request was verified at — a source that shrank (or a len that
+        // lies) must never reach sips.
+        let dir = scratch("lenmismatch");
+        let cache = scratch("lenmismatch-cache");
+        let src = dir.join("a.png");
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        png.extend_from_slice(&[0, 0, 0, 64, 0, 0, 0, 64, 8, 6, 0, 0, 0]);
+        std::fs::write(&src, png).unwrap();
+        let real_len = std::fs::metadata(&src).unwrap().len();
+        let thumbs = Thumbnailer::new(cache.clone());
+        thumbs.request(
+            "deaddeaddeaddead",
+            std::fs::File::open(&src).unwrap(),
+            real_len + 5,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !cache.join("deaddeaddeaddead.jpg").is_file(),
+            "short copy must be refused, not thumbnailed"
         );
     }
 
