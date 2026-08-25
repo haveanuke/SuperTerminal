@@ -27,6 +27,9 @@ use super::input::{parse_body, symbolic_bytes, text_bytes, InputMsg};
 
 pub const MAX_CONNS: usize = 8;
 pub const MAX_SSE: usize = 4;
+/// Image responses get their own lane so a thumbnail grid can never starve
+/// sessions/input out of the connection budget.
+pub const MAX_IMG: usize = 2;
 const READ_DEADLINE: Duration = Duration::from_secs(10);
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
 const SSE_POLL: Duration = Duration::from_millis(50);
@@ -51,6 +54,8 @@ pub struct ServerConfig {
     pub bind: SocketAddr,
     pub token: String,
     pub page: &'static str,
+    pub previews: Arc<super::previews::PreviewStore>,
+    pub thumbs: Arc<super::thumbs::Thumbnailer>,
 }
 
 pub struct ServerHandle {
@@ -95,6 +100,9 @@ struct Shared<S: Clone> {
     cancel: Arc<AtomicBool>,
     conns: AtomicUsize,
     sse: AtomicUsize,
+    previews: Arc<super::previews::PreviewStore>,
+    thumbs: Arc<super::thumbs::Thumbnailer>,
+    img: AtomicUsize,
 }
 
 pub fn start<S: InputSink>(
@@ -115,6 +123,9 @@ pub fn start<S: InputSink>(
         cancel: Arc::clone(&cancel),
         conns: AtomicUsize::new(0),
         sse: AtomicUsize::new(0),
+        previews: cfg.previews,
+        thumbs: cfg.thumbs,
+        img: AtomicUsize::new(0),
     });
     let acceptor_workers = Arc::clone(&workers);
     let acceptor_shared = Arc::clone(&shared);
@@ -161,7 +172,7 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("X-Content-Type-Options", "nosniff"),
     (
         "Content-Security-Policy",
-        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'",
     ),
 ];
 
@@ -179,6 +190,96 @@ fn respond(
     head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)
+}
+
+fn serve_preview<S: InputSink>(
+    shared: &Shared<S>,
+    stream: &TcpStream,
+    request: &Request,
+    path: &str,
+) {
+    let id = &path["/preview/".len()..];
+    let Some(revision) = request.query_param("rev") else {
+        let _ = respond(stream, "400 Bad Request", &[], b"");
+        return;
+    };
+    let etag = format!("\"{revision}\"");
+    if request.header("if-none-match") == Some(etag.as_str()) {
+        let _ = respond(stream, "304 Not Modified", &[("ETag", &etag)], b"");
+        return;
+    }
+    let snap = shared.previews.snapshot();
+    let Some(verified) = snap.open_verified(id, revision) else {
+        let _ = respond(stream, "404 Not Found", &[], b"");
+        return;
+    };
+    if request.query_param("thumb") == Some("1") {
+        let Some(source) = snap.source_path(id) else {
+            let _ = respond(stream, "404 Not Found", &[], b"");
+            return;
+        };
+        match shared.thumbs.request(revision, source) {
+            super::thumbs::ThumbState::Ready(path) => {
+                let Ok(file) = std::fs::File::open(&path) else {
+                    let _ = respond(stream, "404 Not Found", &[], b"");
+                    return;
+                };
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                stream_file(stream, file, len, "image/jpeg", &etag);
+            }
+            super::thumbs::ThumbState::Pending => {
+                let _ = respond(stream, "202 Accepted", &[("Retry-After", "1")], b"");
+            }
+        }
+        return;
+    }
+    if verified.len > super::previews::MAX_FULL_BYTES {
+        let _ = respond(stream, "413 Content Too Large", &[], b"");
+        return;
+    }
+    stream_file(
+        stream,
+        verified.file,
+        verified.len,
+        verified.content_type,
+        &etag,
+    );
+}
+
+/// 64 KiB chunks; the socket's write deadline bounds every chunk, never the
+/// whole body — a stalled phone cannot pin a worker past the deadline.
+fn stream_file(
+    stream: &TcpStream,
+    mut file: std::fs::File,
+    len: u64,
+    content_type: &str,
+    etag: &str,
+) {
+    use std::io::Read;
+    let mut writer = stream;
+    let _ = writer.set_write_timeout(Some(WRITE_DEADLINE));
+    let mut head = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+    for (name, value) in SECURITY_HEADERS {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Type: {content_type}\r\nETag: {etag}\r\nContent-Length: {len}\r\n\r\n"
+    ));
+    if writer.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if writer.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn token_of(req: &Request) -> &str {
@@ -251,6 +352,46 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 &[("Content-Type", "application/json")],
                 json.as_bytes(),
             );
+        }
+        (Method::Get, "/previews") => {
+            let snap = shared.previews.snapshot();
+            let entries: Vec<serde_json::Value> = snap
+                .entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.id, "kind": "image", "name": e.name,
+                        "revision": e.revision, "modifiedAt": e.modified_at,
+                        "bytes": e.bytes,
+                    })
+                })
+                .collect();
+            let json = serde_json::json!({
+                "state": if snap.available { "ok" } else { "unavailable" },
+                "entries": entries,
+            })
+            .to_string();
+            let _ = respond(
+                &stream,
+                "200 OK",
+                &[("Content-Type", "application/json")],
+                json.as_bytes(),
+            );
+        }
+        (Method::Get, _) if path.starts_with("/preview/") => {
+            // CAS admission, same shape as the SSE cap.
+            let admitted = shared
+                .img
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_IMG).then_some(n + 1)
+                })
+                .is_ok();
+            if !admitted {
+                let _ = respond(&stream, "503 Service Unavailable", &[], b"");
+                return;
+            }
+            serve_preview(shared, &stream, &request, &path);
+            shared.img.fetch_sub(1, Ordering::AcqRel);
         }
         (Method::Get, _) if path.starts_with("/stream/") => {
             let id = path["/stream/".len()..].to_string();
@@ -404,6 +545,12 @@ mod tests {
         crate::themes::default_theme()
     }
 
+    fn test_thumbs() -> Arc<crate::companion::thumbs::Thumbnailer> {
+        crate::companion::thumbs::Thumbnailer::new(
+            std::env::temp_dir().join(format!("st-thumbcache-{}", std::process::id())),
+        )
+    }
+
     fn boot(hub: Arc<TestHub>) -> ServerHandle {
         start(
             hub,
@@ -412,9 +559,40 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 token: TOKEN.into(),
                 page: PAGE,
+                previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+                thumbs: test_thumbs(),
             },
         )
         .expect("server starts on loopback")
+    }
+
+    fn preview_store(dir: &std::path::Path) -> Arc<crate::companion::previews::PreviewStore> {
+        Arc::new(crate::companion::previews::PreviewStore::new(Some(
+            dir.to_path_buf(),
+        )))
+    }
+
+    fn boot_with_previews(previews: Arc<crate::companion::previews::PreviewStore>) -> ServerHandle {
+        let (hub, _rx) = seeded_hub(false);
+        start(
+            hub,
+            theme(),
+            ServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token: TOKEN.into(),
+                page: PAGE,
+                previews,
+                thumbs: test_thumbs(),
+            },
+        )
+        .expect("server starts")
+    }
+
+    fn write_test_png(dir: &std::path::Path, name: &str) {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(&[0, 0, 0, 13, b'I', b'H', b'D', b'R']);
+        bytes.extend_from_slice(&[0, 0, 0, 64, 0, 0, 0, 64, 8, 6, 0, 0, 0]);
+        std::fs::write(dir.join(name), bytes).unwrap();
     }
 
     fn host_of(handle: &ServerHandle) -> String {
@@ -435,6 +613,19 @@ mod tests {
         let mut out = String::new();
         let _ = stream.read_to_string(&mut out);
         out
+    }
+
+    /// Like roundtrip, but body-safe for binary responses: reads raw bytes
+    /// and returns them lossily decoded (headers are always ASCII).
+    fn roundtrip_lossy(host: &str, raw: &str) -> String {
+        let mut stream = TcpStream::connect(host).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     fn get(host: &str, target: &str) -> String {
@@ -616,6 +807,109 @@ mod tests {
             vec![0x1b, b'O', b'A']
         );
         handle2.stop();
+    }
+
+    #[test]
+    fn previews_list_is_token_gated_and_reports_state() {
+        let dir = std::env::temp_dir().join(format!("st-prevroute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_png(&dir, "render.png");
+        let handle = boot_with_previews(preview_store(&dir));
+        let host = host_of(&handle);
+        assert!(
+            get(&host, "/previews").starts_with("HTTP/1.1 404"),
+            "no token"
+        );
+        let ok = get(&host, &format!("/previews?t={TOKEN}"));
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("\"state\":\"ok\""), "{ok}");
+        assert!(ok.contains("\"name\":\"render.png\""), "{ok}");
+        assert!(ok.contains("\"kind\":\"image\""), "{ok}");
+        handle.stop();
+
+        let gone = boot_with_previews(Arc::new(crate::companion::previews::PreviewStore::new(
+            Some("/nonexistent/x".into()),
+        )));
+        let host = host_of(&gone);
+        let out = get(&host, &format!("/previews?t={TOKEN}"));
+        assert!(out.contains("\"state\":\"unavailable\""), "{out}");
+        gone.stop();
+    }
+
+    #[test]
+    fn preview_bytes_respect_etag_and_stale_revisions() {
+        let dir = std::env::temp_dir().join(format!("st-prevetag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_png(&dir, "a.png");
+        let store = preview_store(&dir);
+        let entry = store.snapshot().entries[0].clone();
+        let handle = boot_with_previews(store);
+        let host = host_of(&handle);
+        let ok = roundtrip_lossy(
+            &host,
+            &format!(
+                "GET /preview/{}?t={TOKEN}&rev={} HTTP/1.1\r\nHost: {host}\r\n\r\n",
+                entry.id, entry.revision
+            ),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok:?}");
+        assert!(ok.contains("Content-Type: image/png"), "{ok}");
+        assert!(
+            ok.contains(&format!("ETag: \"{}\"", entry.revision)),
+            "{ok}"
+        );
+        let not_modified = roundtrip(
+            &host,
+            &format!(
+                "GET /preview/{}?t={TOKEN}&rev={} HTTP/1.1\r\nHost: {host}\r\nIf-None-Match: \"{}\"\r\n\r\n",
+                entry.id, entry.revision, entry.revision
+            ),
+        );
+        assert!(not_modified.starts_with("HTTP/1.1 304"), "{not_modified}");
+        let stale = get(
+            &host,
+            &format!("/preview/{}?t={TOKEN}&rev=0000000000000000", entry.id),
+        );
+        assert!(stale.starts_with("HTTP/1.1 404"), "{stale}");
+        handle.stop();
+    }
+
+    #[test]
+    fn oversized_full_file_is_listed_but_refused() {
+        let dir = std::env::temp_dir().join(format!("st-prevbig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sparse-write a >64MiB png-magic file without materializing 64MiB.
+        let path = dir.join("huge.png");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(65 * 1024 * 1024).unwrap();
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .unwrap();
+        let store = preview_store(&dir);
+        let entry = store.snapshot().entries[0].clone();
+        let handle = boot_with_previews(store);
+        let host = host_of(&handle);
+        let out = get(
+            &host,
+            &format!("/preview/{}?t={TOKEN}&rev={}", entry.id, entry.revision),
+        );
+        assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+        handle.stop();
+    }
+
+    #[test]
+    fn csp_allows_self_images() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(hub);
+        let host = host_of(&handle);
+        let page = get(&host, "/");
+        assert!(page.contains("img-src 'self'"), "{page}");
+        handle.stop();
     }
 
     #[test]

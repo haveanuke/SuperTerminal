@@ -184,10 +184,7 @@ pub(crate) fn image_dimensions(head: &[u8]) -> Option<(u32, u32)> {
             }
             let marker = head[i + 1];
             let len = u16::from_be_bytes([head[i + 2], head[i + 3]]) as usize;
-            if (0xc0..=0xcf).contains(&marker)
-                && marker != 0xc4
-                && marker != 0xc8
-                && marker != 0xcc
+            if (0xc0..=0xcf).contains(&marker) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc
             {
                 let h = u16::from_be_bytes([head[i + 5], head[i + 6]]) as u32;
                 let w = u16::from_be_bytes([head[i + 7], head[i + 8]]) as u32;

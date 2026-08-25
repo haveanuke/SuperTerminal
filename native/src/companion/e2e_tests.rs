@@ -48,6 +48,10 @@ fn phone_input_round_trips_to_sse_snapshot() {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: TOKEN.into(),
             page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
+            ),
         },
     )
     .expect("server starts");

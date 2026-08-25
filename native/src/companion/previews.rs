@@ -325,7 +325,11 @@ mod tests {
         assert!(snap.available);
         assert_eq!(snap.entries.len(), 2, "txt is filtered by extension");
         assert_eq!(snap.entries[0].name, "new.png");
-        assert!(snap.entries[0].id.starts_with('p'), "{}", snap.entries[0].id);
+        assert!(
+            snap.entries[0].id.starts_with('p'),
+            "{}",
+            snap.entries[0].id
+        );
         assert_ne!(snap.entries[0].id, snap.entries[1].id);
     }
 

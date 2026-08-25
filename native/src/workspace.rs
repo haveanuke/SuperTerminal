@@ -1036,6 +1036,13 @@ impl Workspace {
             }
         }
         hub.bump_generation();
+        let previews = Arc::new(crate::companion::previews::PreviewStore::new(
+            crate::settings::resolved_preview_dir(&self.settings),
+        ));
+        let thumbs = crate::companion::thumbs::Thumbnailer::new(
+            crate::companion::thumbs::default_cache_dir()
+                .unwrap_or_else(|| std::env::temp_dir().join("st-thumbs")),
+        );
         let mut started = None;
         for port in 43110..43121u16 {
             match server::start(
@@ -1045,6 +1052,8 @@ impl Workspace {
                     bind: std::net::SocketAddr::from((ip, port)),
                     token: token.clone(),
                     page: include_str!("companion/page.html"),
+                    previews: Arc::clone(&previews),
+                    thumbs: Arc::clone(&thumbs),
                 },
             ) {
                 Ok(handle) => {
