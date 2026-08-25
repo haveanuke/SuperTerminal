@@ -252,13 +252,7 @@ fn serve_preview<S: InputSink>(
 
 /// 64 KiB chunks; the socket's write deadline bounds every chunk, never the
 /// whole body — a stalled phone cannot pin a worker past the deadline.
-fn stream_file(
-    stream: &TcpStream,
-    mut file: std::fs::File,
-    len: u64,
-    content_type: &str,
-    etag: &str,
-) {
+fn stream_file(stream: &TcpStream, file: std::fs::File, len: u64, content_type: &str, etag: &str) {
     use std::io::Read;
     let mut writer = stream;
     let _ = writer.set_write_timeout(Some(WRITE_DEADLINE));
