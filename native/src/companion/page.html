@@ -65,6 +65,21 @@
   #gridarea { position:relative; flex:1 1 0; display:flex; flex-direction:column; min-height:0; }
   #buildtag { padding:14px; font-size:11px; color:var(--muted);
     text-align:center; letter-spacing:.04em; }
+  /* Row actions: one tap opens, one tap acts. Collapsing rename and close
+     into a menu also means neither is reachable by a single stray tap. */
+  #rowmenu { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:5;
+    display:flex; align-items:flex-end; }
+  #rowmenucard { background:var(--panel); border-top:1px solid var(--border);
+    width:100%; padding:10px 10px calc(10px + env(safe-area-inset-bottom));
+    display:flex; flex-direction:column; gap:6px; }
+  #rowmenutitle { padding:8px 6px 2px; font-size:12px; color:var(--muted);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #rowmenubusy { padding:0 6px 6px; font-size:12px; color:var(--busy); }
+  #rowmenuerr { padding:0 6px 6px; font-size:12px; color:#f7768e; }
+  #rowmenucard button { width:100%; min-height:52px; border-radius:10px;
+    border:1px solid var(--border); background:var(--bg); color:var(--text);
+    font-size:15px; }
+  #rowmenucard button.danger { color:#f7768e; border-color:#f7768e55; }
 </style>
 </head>
 <body>
@@ -121,6 +136,17 @@
       <input id="textbox" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="type a command">
       <button id="send">Send</button>
     </div>
+  </div>
+</div>
+
+<div id="rowmenu" class="hidden">
+  <div id="rowmenucard">
+    <div id="rowmenutitle"></div>
+    <div id="rowmenubusy" class="hidden">Working right now.</div>
+    <div id="rowmenuerr" class="hidden"></div>
+    <button id="rowrename">Rename</button>
+    <button id="rowclose" class="danger">Close terminal</button>
+    <button id="rowcancel">Cancel</button>
   </div>
 </div>
 
@@ -229,6 +255,7 @@
       })
       .then(function (sessions) {
         markAttention(sessions);
+        syncRowMenu(sessions);
         var list = $("sessions"); list.textContent = "";
         $("empty").classList.toggle("hidden", sessions.length > 0);
         sessions.forEach(function (s) {
@@ -239,9 +266,9 @@
           var label = document.createElement("div"); label.className = "label"; label.textContent = s.label;
           var edit = document.createElement("button");
           edit.className = "edit";
-          edit.setAttribute("aria-label", "rename");
-          edit.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11.5 2.5l2 2L5 13l-2.7.7.7-2.7z"/></svg>';
-          edit.addEventListener("click", function (event) { event.stopPropagation(); promptRename(s); });
+          edit.setAttribute("aria-label", "actions");
+          edit.innerHTML = '<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/></svg>';
+          edit.addEventListener("click", function (event) { event.stopPropagation(); openRowMenu(s); });
           var chev = document.createElement("div"); chev.className = "chev"; chev.textContent = ">";
           li.appendChild(dot); li.appendChild(label); li.appendChild(edit); li.appendChild(chev);
           li.addEventListener("click", function () { open(s); });
@@ -400,6 +427,81 @@
   // ---- Rename ----------------------------------------------------------
   // Native prompt keeps this dependency-free; the Mac applies the rename on
   // its next tick, so the list refreshes shortly after the 202.
+  // Row actions. Two taps for either one: open, then choose. The busy
+  // warning lives here rather than behind a second confirm, so closing a
+  // working room still costs exactly two taps but can never be done blind.
+  var menuSession = null;
+  function paintRowMenu(session) {
+    $("rowmenutitle").textContent = session.label;
+    $("rowmenubusy").classList.toggle("hidden", !session.busy);
+  }
+  function openRowMenu(session) {
+    menuSession = session;
+    $("rowmenuerr").classList.add("hidden");
+    paintRowMenu(session);
+    $("rowmenu").classList.remove("hidden");
+  }
+  function closeRowMenu() {
+    menuSession = null;
+    $("rowmenu").classList.add("hidden");
+  }
+  // A close is answered asynchronously, by which time the sheet may have
+  // been cancelled or reopened on a DIFFERENT room. Without this, room A's
+  // late response would dismiss room B's menu or show A's error inside it.
+  function ownsMenu(session) {
+    return !!menuSession && menuSession.id === session.id;
+  }
+  function showRowMenuError(session, text) {
+    if (!ownsMenu(session)) return;
+    $("rowmenuerr").textContent = text;
+    $("rowmenuerr").classList.remove("hidden");
+  }
+  // An open sheet must not go stale: a room that starts working while the
+  // menu sits open would otherwise still show no warning, which is exactly
+  // the blind close the warning exists to prevent.
+  function syncRowMenu(sessions) {
+    if (!menuSession) return;
+    var live = null;
+    sessions.forEach(function (s) { if (s.id === menuSession.id) live = s; });
+    if (!live) { closeRowMenu(); return; }
+    menuSession = live;
+    paintRowMenu(live);
+  }
+  $("rowcancel").addEventListener("click", closeRowMenu);
+  $("rowmenu").addEventListener("click", function (event) {
+    if (event.target === $("rowmenu")) closeRowMenu();
+  });
+  $("rowrename").addEventListener("click", function () {
+    var session = menuSession;
+    closeRowMenu();
+    if (session) promptRename(session);
+  });
+  $("rowclose").addEventListener("click", function () {
+    var session = menuSession;
+    if (!session) return;
+    $("rowmenuerr").classList.add("hidden");
+    fetch("/close/" + encodeURIComponent(session.id), {
+      method: "POST",
+      headers: { "X-Companion-Token": token, "Content-Type": "application/companion-input" },
+    }).then(function (r) {
+      // ONLY 202 means the Mac queued it. Treating every response as
+      // success would dismiss the view on a 429 or 403 while nothing was
+      // actually closed.
+      if (r.status === 202 || r.status === 404 || r.status === 410) {
+        if (ownsMenu(session)) closeRowMenu();
+        // Leaving the room's own view would strand you on a dead terminal.
+        if (current && current.id === session.id) close();
+        setTimeout(refreshSessions, 900);
+        return;
+      }
+      showRowMenuError(session, r.status === 429
+        ? "Too many pending closes - try again in a moment."
+        : "Could not close (" + r.status + ").");
+    }).catch(function () {
+      showRowMenuError(session, "Could not reach the Mac.");
+    });
+  });
+
   function promptRename(session) {
     var name = window.prompt("Rename terminal", session.label);
     if (name === null) return;
@@ -576,11 +678,17 @@
 
   function post(body) {
     if (!current) return;
-    fetch("/input/" + encodeURIComponent(current.id), {
+    // Capture the room: this answers asynchronously, and switching rooms
+    // (the attention banner does it in one tap) while input is in flight
+    // would otherwise let room A's 410 close whatever you moved to.
+    var session = current;
+    fetch("/input/" + encodeURIComponent(session.id), {
       method: "POST",
       headers: { "X-Companion-Token": token, "Content-Type": "application/companion-input" },
       body: JSON.stringify(body),
-    }).then(function (r) { if (r.status === 410 || r.status === 404) close(); }).catch(function () {});
+    }).then(function (r) {
+      if ((r.status === 410 || r.status === 404) && current && current.id === session.id) close();
+    }).catch(function () {});
   }
 
   $("back").addEventListener("click", close);

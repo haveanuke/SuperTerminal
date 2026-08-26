@@ -323,9 +323,16 @@ fn page_offers_terminal_rename() {
         "rename prompt exists"
     );
     assert!(page.contains("/rename/"), "rename posts to the route");
+    // Rename is reached through the row's action menu now, not a dedicated
+    // pencil — see page_collapses_row_actions_into_one_menu.
     assert!(
-        page.contains("setAttribute(\"aria-label\", \"rename\")"),
-        "list rows carry a rename affordance"
+        page.contains(r#"$("rowrename").addEventListener"#),
+        "rename is reachable from the row menu"
+    );
+    // The terminal view's own title stays directly tappable.
+    assert!(
+        page.contains("if (current) promptRename(current);"),
+        "the open terminal's title still renames"
     );
 }
 
@@ -384,4 +391,101 @@ fn page_shows_the_running_build() {
     let page = include_str!("page.html");
     assert!(page.contains(r#"id="buildtag""#), "build tag element");
     assert!(page.contains("/version"), "page fetches the version route");
+}
+
+#[test]
+fn page_collapses_row_actions_into_one_menu() {
+    // Rename and close both cost two taps: open the menu, choose. Neither
+    // destructive nor renaming actions sit under a single stray tap.
+    let page = include_str!("page.html");
+    assert!(page.contains(r#"id="rowmenu""#), "row action sheet");
+    assert!(
+        page.contains(r#"id="rowrename""#),
+        "rename lives in the menu"
+    );
+    assert!(page.contains(r#"id="rowclose""#), "close lives in the menu");
+    assert!(
+        page.contains("openRowMenu"),
+        "the row button opens the menu"
+    );
+    assert!(
+        page.contains(r#"setAttribute("aria-label", "actions")"#),
+        "the row button is the menu, not a bare rename"
+    );
+    // The busy warning is in the menu itself, not a second confirm step.
+    assert!(page.contains(r#"id="rowmenubusy""#), "busy warning");
+    assert!(
+        page.contains(r#"classList.toggle("hidden", !session.busy)"#),
+        "the warning must be driven by the room's reported busy state"
+    );
+    // Closing posts with the same content type every mutating route uses.
+    assert!(page.contains(r#"fetch("/close/""#), "close route");
+    assert!(page.contains("application/companion-input"));
+}
+
+#[test]
+fn page_keeps_the_open_row_menu_in_sync() {
+    // A room that starts working WHILE the menu sits open must update its
+    // warning, or the two-tap close becomes blind after all.
+    let page = include_str!("page.html");
+    assert!(page.contains("function syncRowMenu"), "menu reconciliation");
+    assert!(
+        page.contains("syncRowMenu(sessions)"),
+        "reconciliation must run on every /sessions refresh"
+    );
+    assert!(
+        page.contains("if (!live) { closeRowMenu(); return; }"),
+        "a room that disappeared must dismiss its menu"
+    );
+}
+
+#[test]
+fn page_only_treats_202_as_a_queued_close() {
+    // Treating every response as success would dismiss the terminal view on
+    // a 429 or 403 while nothing was actually closed.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("r.status === 202 || r.status === 404 || r.status === 410"),
+        "only accepted/gone responses may dismiss the view"
+    );
+    assert!(page.contains(r#"id="rowmenuerr""#), "failures are surfaced");
+    assert!(
+        page.contains("Too many pending closes"),
+        "429 gets its own explanation rather than a bare code"
+    );
+}
+
+#[test]
+fn a_late_close_response_cannot_hijack_another_rooms_menu() {
+    // Closes are answered asynchronously. If room A's response lands after
+    // the sheet was cancelled or reopened on room B, it must not dismiss
+    // B's menu nor show A's error inside it.
+    let page = include_str!("page.html");
+    assert!(page.contains("function ownsMenu"), "ownership guard");
+    assert!(
+        page.contains("return !!menuSession && menuSession.id === session.id;"),
+        "ownership is decided by id, not by the menu merely being open"
+    );
+    assert!(
+        page.contains("if (ownsMenu(session)) closeRowMenu();"),
+        "success may only dismiss the menu it belongs to"
+    );
+    assert!(
+        page.contains("if (!ownsMenu(session)) return;"),
+        "errors may only paint into the menu they belong to"
+    );
+}
+
+#[test]
+fn a_late_input_response_cannot_close_a_different_room() {
+    // Same class as the menu race, on the input path: a 410 for room A must
+    // not dismiss room B just because you switched while it was in flight
+    // (the attention banner switches rooms in one tap).
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(
+            "if ((r.status === 410 || r.status === 404) && current && current.id === session.id)"
+        ),
+        "input responses must be scoped to the room that sent them"
+    );
 }

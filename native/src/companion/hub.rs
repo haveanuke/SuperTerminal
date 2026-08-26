@@ -27,6 +27,10 @@ pub const MAX_PENDING_SPAWNS: usize = 4;
 /// Phone-requested renames waiting for the main-thread tick.
 pub const MAX_PENDING_RENAMES: usize = 8;
 
+/// Queued closes. Small: one per visible room is already generous, and a
+/// flood would just be the same rooms named twice.
+pub const MAX_PENDING_CLOSES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInfo {
     pub id: String,
@@ -58,6 +62,7 @@ pub struct CompanionHub<S: Clone> {
     /// (terminal id, new label) renames from the phone; drained by the
     /// workspace tick (tab state is main-thread-only).
     pending_renames: Mutex<Vec<(String, String)>>,
+    pending_closes: Mutex<Vec<String>>,
     cache: Mutex<HashMap<String, (u64, Arc<String>)>>,
 }
 
@@ -68,6 +73,7 @@ impl<S: Clone> Default for CompanionHub<S> {
             generation: AtomicU64::new(1),
             pending_spawns: Mutex::new(0),
             pending_renames: Mutex::new(Vec::new()),
+            pending_closes: Mutex::new(Vec::new()),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -247,6 +253,27 @@ impl<S: Clone> CompanionHub<S> {
     /// Drain queued renames (main-thread tick).
     pub fn take_renames(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.pending_renames.lock().unwrap())
+    }
+
+    /// Queue one phone-requested close. Idempotent per id: asking twice
+    /// before the tick drains is the same request, not two. False when the
+    /// cap is reached (the server answers 429).
+    pub fn request_close(&self, id: &str) -> bool {
+        let mut pending = self.pending_closes.lock().unwrap();
+        if pending.iter().any(|queued| queued == id) {
+            return true;
+        }
+        if pending.len() >= MAX_PENDING_CLOSES {
+            return false;
+        }
+        pending.push(id.to_string());
+        true
+    }
+
+    /// Drain queued closes (main-thread tick — killing a PTY is main-thread
+    /// work, same as spawning one).
+    pub fn take_closes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_closes.lock().unwrap())
     }
 
     pub fn bump_generation(&self) {
@@ -458,5 +485,22 @@ mod tests {
         snap.bracketed_paste = true;
         hub.publish_snapshot("t1", Arc::new(snap));
         assert!(hub.bracketed_paste("t1"));
+    }
+
+    #[test]
+    fn close_requests_dedupe_and_cap() {
+        let (hub, _rx) = hub_with("t1", "work");
+        // Asking twice before the tick drains is one request, not two —
+        // a double-tap must not queue two closes.
+        assert!(hub.request_close("t1"));
+        assert!(hub.request_close("t1"));
+        assert_eq!(hub.take_closes(), vec!["t1".to_string()]);
+        assert!(hub.take_closes().is_empty(), "draining empties the queue");
+
+        for i in 0..MAX_PENDING_CLOSES {
+            assert!(hub.request_close(&format!("id{i}")), "under the cap");
+        }
+        assert!(!hub.request_close("one-too-many"), "cap answers 429");
+        assert_eq!(hub.take_closes().len(), MAX_PENDING_CLOSES);
     }
 }

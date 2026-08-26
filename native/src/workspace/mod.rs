@@ -683,6 +683,11 @@ impl Workspace {
                     }
                 }
             }
+            // Phone-requested closes: tearing down a PTY is main-thread work,
+            // so it goes through the same path as closing from the Mac.
+            for terminal_id in hub.take_closes() {
+                self.close_terminal(&terminal_id, cx);
+            }
         }
         if self.pet_tick_count.is_multiple_of(3) {
             if let (Some(hub), Some(handle)) = (&self.companion_hub, &self.companion_server) {

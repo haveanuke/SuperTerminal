@@ -516,6 +516,39 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 }
             }
         }
+        (Method::Post, _) if path.starts_with("/close/") => {
+            let our_origin = format!("http://{}", shared.host);
+            if let Some(origin) = request.header("origin") {
+                if origin != our_origin {
+                    let _ = respond(&stream, "403 Forbidden", &[], b"");
+                    return;
+                }
+            }
+            if request.header("content-type") != Some(INPUT_CONTENT_TYPE) {
+                let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
+                return;
+            }
+            let id = path["/close/".len()..].to_string();
+            match shared.hub.input_sender(&id) {
+                None => {
+                    let _ = respond(&stream, "404 Not Found", &[], b"");
+                }
+                Some((false, _)) => {
+                    // Already dead: the room is going away on its own, so
+                    // this is success from the phone's point of view.
+                    let _ = respond(&stream, "410 Gone", &[], b"");
+                }
+                Some((true, _)) => {
+                    if shared.hub.request_close(&id) {
+                        // Killing a PTY is main-thread work; the tick does
+                        // it and the room leaves the phone's next poll.
+                        let _ = respond(&stream, "202 Accepted", &[], b"");
+                    } else {
+                        let _ = respond(&stream, "429 Too Many Requests", &[], b"");
+                    }
+                }
+            }
+        }
         (Method::Post, _) if path.starts_with("/input/") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
@@ -994,6 +1027,93 @@ mod tests {
         // Retired sessions answer 410 like /input.
         hub.retire("t1");
         let gone = post_rename(&host, "t1", r#"{"label":"x"}"#, INPUT_CONTENT_TYPE);
+        assert!(gone.starts_with("HTTP/1.1 410"), "{gone}");
+        handle.stop();
+    }
+
+    fn post_close_raw(
+        host: &str,
+        id: &str,
+        content_type: &str,
+        origin: Option<&str>,
+        token: Option<&str>,
+    ) -> String {
+        let origin_header = origin
+            .map(|o| format!("Origin: {o}\r\n"))
+            .unwrap_or_default();
+        let token_header = token
+            .map(|t| format!("X-Companion-Token: {t}\r\n"))
+            .unwrap_or_default();
+        roundtrip(
+            host,
+            &format!(
+                "POST /close/{id} HTTP/1.1\r\nHost: {host}\r\n{token_header}{origin_header}Content-Type: {content_type}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+    }
+
+    fn post_close(host: &str, id: &str, content_type: &str) -> String {
+        roundtrip(
+            host,
+            &format!(
+                "POST /close/{id} HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {content_type}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn close_route_guards_queue_and_lifecycle() {
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(Arc::clone(&hub));
+        let host = host_of(&handle);
+        // Token and exact-Host are enforced globally before routing (see
+        // missing_or_wrong_token_is_404_and_correct_token_lists_sessions
+        // and wrong_host_is_400); asserted here for this route specifically
+        // because it is the only DESTRUCTIVE one.
+        assert!(
+            post_close_raw(&host, "t1", INPUT_CONTENT_TYPE, None, Some("wrong"))
+                .starts_with("HTTP/1.1 404"),
+            "bad token"
+        );
+        assert!(
+            post_close_raw(&host, "t1", INPUT_CONTENT_TYPE, None, None).starts_with("HTTP/1.1 404"),
+            "no token"
+        );
+        assert!(get(&host, "/close/t1").starts_with("HTTP/1.1 404"), "GET");
+        let plain = post_close(&host, "t1", "text/plain");
+        assert!(plain.starts_with("HTTP/1.1 415"), "{plain}");
+        let unknown = post_close(&host, "ghost", INPUT_CONTENT_TYPE);
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        let cross = roundtrip(
+            &host,
+            &format!(
+                "POST /close/t1 HTTP/1.1\r\nHost: {host}\r\nOrigin: http://evil.example\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
+            ),
+        );
+        assert!(cross.starts_with("HTTP/1.1 403"), "{cross}");
+        assert!(hub.take_closes().is_empty(), "no guard failure may queue");
+        // Accepted: queued for the Mac tick, which owns PTY teardown.
+        let ok = post_close(&host, "t1", INPUT_CONTENT_TYPE);
+        assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+        assert_eq!(hub.take_closes(), vec!["t1".to_string()]);
+        // A double tap before the tick drains is ONE close, not two.
+        assert!(post_close(&host, "t1", INPUT_CONTENT_TYPE).starts_with("HTTP/1.1 202"));
+        assert!(post_close(&host, "t1", INPUT_CONTENT_TYPE).starts_with("HTTP/1.1 202"));
+        assert_eq!(hub.take_closes(), vec!["t1".to_string()], "deduped");
+        // The cap answers 429 rather than growing without bound.
+        for i in 0..crate::companion::hub::MAX_PENDING_CLOSES {
+            hub.register(&format!("c{i}"), "x", mpsc::channel().0);
+            assert!(
+                post_close(&host, &format!("c{i}"), INPUT_CONTENT_TYPE).starts_with("HTTP/1.1 202")
+            );
+        }
+        hub.register("overflow", "x", mpsc::channel().0);
+        let full = post_close(&host, "overflow", INPUT_CONTENT_TYPE);
+        assert!(full.starts_with("HTTP/1.1 429"), "{full}");
+        let _ = hub.take_closes();
+        // Already-retired rooms are gone, not an error to retry.
+        hub.retire("t1");
+        let gone = post_close(&host, "t1", INPUT_CONTENT_TYPE);
         assert!(gone.starts_with("HTTP/1.1 410"), "{gone}");
         handle.stop();
     }
