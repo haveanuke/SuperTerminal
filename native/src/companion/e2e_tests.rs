@@ -489,3 +489,120 @@ fn a_late_input_response_cannot_close_a_different_room() {
         "input responses must be scoped to the room that sent them"
     );
 }
+
+#[test]
+fn the_full_view_does_not_blame_size_for_every_failure() {
+    // onerror fires for a stale revision, a dropped connection or a decode
+    // failure too. Reporting all of those as "too large" sent people to the
+    // Mac for problems that a refresh fixes.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("function diagnoseFull"),
+        "failures are diagnosed"
+    );
+    assert!(
+        page.contains("r.status === 413"),
+        "413 is the only size verdict"
+    );
+    assert!(
+        page.contains("file changed - go back and reopen"),
+        "a stale revision says so"
+    );
+    assert!(
+        page.contains("could not reach the Mac"),
+        "a network failure before headers says so"
+    );
+    // Cancelling the diagnostic body to avoid a second full transfer means
+    // a drop AFTER headers is indistinguishable from an undecodable image,
+    // so the 200 copy must not claim to know which it was.
+    assert!(
+        page.contains("could not load this image - try again"),
+        "the 200 case stays honest about not knowing the cause"
+    );
+    assert!(
+        !page.contains("could not display this image"),
+        "that wording claimed knowledge the status-only design cannot have"
+    );
+    // A late diagnosis must not paint over whatever is open now.
+    assert!(
+        page.contains("if (pfullEntry !== entry) return;"),
+        "diagnosis is scoped to the entry that failed"
+    );
+}
+
+#[test]
+fn oversized_files_are_known_before_the_attempt() {
+    // The catalog carries `bytes`, so an oversized file never costs a
+    // transfer and the message can name the actual size.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("if (entry.bytes > MAX_FULL_BYTES)"),
+        "size is checked up front"
+    );
+    assert!(page.contains("megabytes(entry.bytes)"), "the size is shown");
+    // Pinned to the server's cap; drifting apart would resurrect the guess.
+    let expected = crate::companion::previews::MAX_FULL_BYTES;
+    assert_eq!(expected, 64 * 1024 * 1024);
+    assert!(
+        page.contains("var MAX_FULL_BYTES = 64 * 1024 * 1024;"),
+        "page cap must equal previews::MAX_FULL_BYTES ({expected})"
+    );
+}
+
+#[test]
+fn the_full_image_src_and_its_error_handler_move_together() {
+    // Setting src without rebinding onerror leaves the handler blaming the
+    // PREVIOUS entry; the identity guard then swallows the result and the
+    // user sees no message at all. The live viewport advancing frames is
+    // the path that hits this.
+    let page = include_str!("page.html");
+    assert!(page.contains("function loadFull"), "one helper owns both");
+    // Exactly one place assigns the full image's src, and it is that helper.
+    assert_eq!(
+        page.matches("img.src = imgSrc(entry, false);").count(),
+        1,
+        "src must be assigned in loadFull and nowhere else"
+    );
+    assert!(
+        !page.contains(r#"$("pfullimg").src = imgSrc"#),
+        "the live-frame path must go through loadFull, not assign src directly"
+    );
+    assert!(
+        page.contains("pfullEntry = entry;\n        loadFull(entry);"),
+        "a new live revision reloads through the helper"
+    );
+}
+
+#[test]
+fn closing_the_full_view_cannot_start_a_diagnostic_request() {
+    // An empty src can itself fire onerror; with the handler still attached
+    // that would fetch on the way out, and the identity guard only stops
+    // the painting, not the request.
+    let page = include_str!("page.html");
+    assert!(page.contains("function clearFullImage"), "shared teardown");
+    assert!(
+        page.contains("img.onerror = null;\n    img.removeAttribute(\"src\");"),
+        "handler is dropped BEFORE the src, and src is removed not emptied"
+    );
+    assert!(
+        !page.contains(r#"$("pfullimg").src = "";"#),
+        "an empty src assignment is exactly what fires the stray error"
+    );
+}
+
+#[test]
+fn a_failed_image_is_not_transferred_twice() {
+    // A decode failure on a 60 MiB file must not pull the body down again;
+    // only the status is wanted.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("if (r.body && r.body.cancel)"),
+        "the diagnostic body is cancelled once the status is known"
+    );
+    // cancel() returns a promise; a bare try/catch leaves its rejection
+    // unhandled.
+    assert!(
+        page.contains("cancelled.catch(function () {})"),
+        "the cancellation promise's rejection is consumed"
+    );
+}

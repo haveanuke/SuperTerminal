@@ -583,7 +583,7 @@
       // A full view open on the live tile follows each new frame.
       if (pfullEntry && pfullEntry.id === entry.id && pfullEntry.revision !== entry.revision) {
         pfullEntry = entry;
-        $("pfullimg").src = imgSrc(entry, false);
+        loadFull(entry);
       }
     });
     Object.keys(tileEls).forEach(function (id) {
@@ -609,23 +609,79 @@
     refreshSessions();
   }
   var pfullEntry = null;
+  // Pinned to previews::MAX_FULL_BYTES; a test fails if the two drift.
+  var MAX_FULL_BYTES = 64 * 1024 * 1024;
+  function megabytes(bytes) { return (bytes / (1024 * 1024)).toFixed(1) + " MB"; }
+
+  // Why a failure happened, rather than assuming the worst case. onerror
+  // fires for a stale revision, a dropped connection or a decode failure
+  // just as readily as for an oversized file, and reporting all of them as
+  // "too large" sent people to the Mac for problems a refresh would fix.
+  function diagnoseFull(entry) {
+    fetch(imgSrc(entry, false), { headers: { "X-Companion-Token": token } })
+      .then(function (r) {
+        // The status is all we need; leaving the body to stream would cost
+        // a second full transfer of a file that already failed once.
+        // cancel() RETURNS A PROMISE — the try/catch only covers a
+        // synchronous throw, so the rejection needs consuming too.
+        if (r.body && r.body.cancel) {
+          try {
+            var cancelled = r.body.cancel();
+            if (cancelled && cancelled.catch) cancelled.catch(function () {});
+          } catch (e) {}
+        }
+        if (pfullEntry !== entry) return; // moved on while this was in flight
+        $("pfullcap").textContent =
+          r.status === 413 ? "too large to view here - open on Mac"
+          : r.status === 404 || r.status === 410 ? "file changed - go back and reopen"
+          : r.ok ? "could not load this image - try again"
+          : "could not load (" + r.status + ")";
+      })
+      .catch(function () {
+        if (pfullEntry !== entry) return;
+        $("pfullcap").textContent = "could not reach the Mac";
+      });
+  }
+
+  // src and onerror are set together, always. Setting one without the
+  // other leaves the handler blaming the wrong entry — which the identity
+  // guard then silently swallows, showing no message at all.
+  function loadFull(entry) {
+    var img = $("pfullimg");
+    // The catalog carries the size, so an oversized file is known BEFORE
+    // the attempt — no wasted transfer, and an honest number to look at.
+    if (entry.bytes > MAX_FULL_BYTES) {
+      clearFullImage();
+      $("pfullcap").textContent =
+        "too large to view here (" + megabytes(entry.bytes) + ") - open on Mac";
+      return;
+    }
+    $("pfullcap").textContent = new Date(entry.modifiedAt * 1000).toLocaleString();
+    img.onerror = function () { diagnoseFull(entry); };
+    img.src = imgSrc(entry, false);
+  }
+
+  // Drop the handler BEFORE the src: an empty src can itself fire onerror,
+  // which would start a pointless diagnostic request on the way out.
+  function clearFullImage() {
+    var img = $("pfullimg");
+    img.onerror = null;
+    img.removeAttribute("src");
+  }
+
   function openFull(entry) {
     pfullEntry = entry;
     $("pfull").classList.remove("hidden");
     $("pfulltitle").textContent = entry.name;
-    $("pfullcap").textContent = new Date(entry.modifiedAt * 1000).toLocaleString();
-    var img = $("pfullimg");
-    img.classList.remove("zoomed");
-    // Over-64MiB sources answer 413: show the spec's copy instead.
-    img.onerror = function () { $("pfullcap").textContent = "too large — open on Mac"; };
-    img.src = imgSrc(entry, false);
+    $("pfullimg").classList.remove("zoomed");
+    loadFull(entry);
   }
   $("previewsbtn").addEventListener("click", openPreviews);
   $("pback").addEventListener("click", closePreviews);
   $("pfullclose").addEventListener("click", function () {
     pfullEntry = null;
     $("pfull").classList.add("hidden");
-    $("pfullimg").src = "";
+    clearFullImage();
   });
   // Double-tap toggles fit/2.5x (the viewport meta pins page zoom off).
   var lastTap = 0;
