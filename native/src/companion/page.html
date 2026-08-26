@@ -742,31 +742,76 @@
   });
 
   var lastFrame = "";
+  // Long enough for a lingering SSE slot to be reclaimed (one heartbeat),
+  // short enough that a refused switch feels like a hiccup, not a failure.
+  var RECONNECT_MS = 2500;
+  var reconnectTimer = null;
+  function cancelReconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  }
   function open(session) {
+    // Ownership discipline. A pending retry plus a stream we did not close
+    // is how one room's output ends up painted under another room's name:
+    // back out and reopen the same room inside the retry window and the
+    // stale timer opens a third stream, orphaning the second with live
+    // handlers. Cancel the timer, close the old stream, and make every
+    // handler prove it still owns `source` before touching anything.
+    cancelReconnect();
+    if (source) { source.close(); source = null; }
     current = session;
     delete attention[session.id];
     $("attnbanner").classList.add("hidden");
     fitFor = 0; // re-fit: viewport may have rotated since the last view
     lastFrame = "";
+    // Blank the previous session BEFORE connecting. render() only resets on
+    // a shape change, and two terminals of the same width share a shape —
+    // without this the old grid stays painted under the new name until the
+    // new stream's first frame lands, which is showing you the wrong
+    // terminal's output with no indication that is what you are seeing.
+    lastSnap = null;
+    gridShape = "";
+    resetGrid();
     $("termtitle").textContent = session.label;
     $("list").classList.add("hidden");
     $("term").classList.remove("hidden");
-    source = new EventSource(api("/stream/" + encodeURIComponent(session.id)));
-    source.onopen = function () { $("termdot").classList.add("on"); };
-    source.onerror = function () {
+    var mine = new EventSource(api("/stream/" + encodeURIComponent(session.id)));
+    source = mine;
+    mine.onopen = function () {
+      if (source !== mine) return;
+      $("termdot").classList.add("on");
+    };
+    mine.onerror = function () {
+      if (source !== mine) return;
       $("termdot").classList.remove("on");
       // A revoked token ("new link") must not strand this view on stale
       // output: probe the API and surface the bad-link state on 404.
       fetch(api("/sessions"), { headers: { "X-Companion-Token": token } }).then(function (r) {
+        // The probe is asynchronous: the view may have moved on, and this
+        // stream may no longer be the one on screen.
+        if (source !== mine) return;
         if (r.status === 404) {
-          if (source) { source.close(); source = null; }
+          source.close(); source = null;
           $("term").classList.add("hidden");
           $("list").classList.add("hidden");
           $("badlink").classList.remove("hidden");
+          return;
         }
+        // The link is fine, so this was the stream itself failing. A non-200
+        // stream response — the SSE slot cap answers 503 — is FATAL to an
+        // EventSource: the browser closes it and never retries. Rebuild it
+        // ourselves, or the view sits blank until you back out and re-enter.
+        if (mine.readyState !== 2 || !current || current.id !== session.id) return;
+        cancelReconnect();
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          // Still OUR stream and still this room: anything else means a
+          // newer open() already owns the view.
+          if (source === mine && current && current.id === session.id) open(current);
+        }, RECONNECT_MS);
       }).catch(function () {});
     };
-    source.onmessage = function (event) {
+    mine.onmessage = function (event) {
+      if (source !== mine) return;
       if (event.data === lastFrame) return; // reconnect can replay a frame
       lastFrame = event.data;
       try { render(JSON.parse(event.data)); } catch (e) {}
@@ -774,6 +819,7 @@
   }
 
   function close() {
+    cancelReconnect();
     if (source) { source.close(); source = null; }
     current = null;
     lastSnap = null;

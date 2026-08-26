@@ -682,3 +682,86 @@ fn the_pad_can_clear_a_typed_but_unsent_message() {
         "and it is labelled for what it does, not for its byte"
     );
 }
+
+#[test]
+fn switching_terminals_never_shows_the_previous_ones_output() {
+    // render() only resets the grid when its SHAPE changes, and two
+    // terminals of the same width share a shape — so on a switch the old
+    // session's rows stay painted until the new stream's first frame
+    // lands, under the new session's name.
+    let page = include_str!("page.html");
+    let body = page
+        .split("function open(session) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  }").next())
+        .expect("open() body");
+    assert!(body.contains("resetGrid()"), "open() blanks the grid");
+    assert!(
+        body.contains(r#"gridShape = """#),
+        "and forgets the shape, so the next frame rebuilds rather than patching"
+    );
+    assert!(
+        body.find("resetGrid()") < body.find("new EventSource"),
+        "the grid must be blank BEFORE the new stream connects, not after"
+    );
+}
+
+#[test]
+fn a_stale_reconnect_cannot_paint_over_a_newer_stream() {
+    // Reconnecting on a room-id match alone is not enough: back out and
+    // reopen the SAME room inside the retry window and the stale timer
+    // opens a THIRD stream, orphaning the second one with live handlers
+    // still able to render. That orphan paints its room's output under
+    // whatever room you moved to next — the very bug being fixed.
+    let page = include_str!("page.html");
+    let body = page
+        .split("function open(session) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  }").next())
+        .expect("open() body");
+    assert!(
+        body.contains("cancelReconnect()"),
+        "opening a room cancels any pending retry"
+    );
+    assert!(
+        body.find("source.close()") < body.find("new EventSource"),
+        "and closes the previous stream before creating another"
+    );
+    // Every handler must prove it still owns the shared source.
+    let guards = page.matches("source !== mine").count();
+    assert!(
+        guards >= 4,
+        "onopen, onerror, its async continuation and onmessage must each \
+         confirm ownership before touching shared state; found {guards}"
+    );
+    assert!(
+        page.contains("function close()")
+            && page
+                .split("function close() {")
+                .nth(1)
+                .is_some_and(|rest| rest.starts_with("\n    cancelReconnect();")),
+        "leaving a room cancels the retry too"
+    );
+}
+
+#[test]
+fn a_stream_refused_by_the_slot_cap_reconnects_itself() {
+    // MAX_SSE is 4 and a slot lingers up to one heartbeat after you switch
+    // away, so switching between terminals quickly can be refused with 503.
+    // A non-200 response is FATAL to an EventSource — the browser never
+    // retries it — so without this the view stays dead until you back out.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("mine.readyState !== 2"),
+        "a fatally-closed stream is told apart from a transient blip the \
+         browser will retry on its own"
+    );
+    assert!(
+        page.contains("RECONNECT_MS"),
+        "the retry delay is named, not a bare magic number"
+    );
+    assert!(
+        page.contains("current.id === session.id"),
+        "and it only reconnects the room still on screen"
+    );
+}
