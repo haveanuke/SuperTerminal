@@ -606,3 +606,79 @@ fn a_failed_image_is_not_transferred_twice() {
         "the cancellation promise's rejection is consumed"
     );
 }
+
+#[test]
+fn page_groups_previews_by_project() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(r#"id="pchips""#),
+        "the project chip row exists"
+    );
+    assert!(
+        page.contains("categoryOf"),
+        "entries are bucketed by their category"
+    );
+    assert!(
+        page.contains("ALL_PROJECTS"),
+        "an explicit all-projects filter, not a magic empty string"
+    );
+}
+
+#[test]
+fn a_flat_gallery_shows_no_chip_row() {
+    // Tomas's gallery is one flat folder today; categorizing must not put a
+    // pointless one-button filter on his screen until he makes a folder.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(r#"$("pchips").classList.toggle("hidden", names.length < 2)"#),
+        "the chip row hides itself until there are at least two projects"
+    );
+}
+
+#[test]
+fn the_live_tile_is_pinned_above_every_project_filter() {
+    // The Blender viewport belongs to no project; filtering it away would
+    // silently break the live preview Tomas actually watches.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(r#"entry.kind === "viewport" || project === ALL_PROJECTS"#),
+        "the viewport bypasses the project filter"
+    );
+}
+
+#[test]
+fn the_selected_project_survives_a_reload() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(r#"loadPref("st-project")"#),
+        "selection is read back"
+    );
+    assert!(
+        page.contains(r#"storePref("st-project""#),
+        "selection is stored"
+    );
+}
+
+#[test]
+fn a_vanished_project_falls_back_to_all() {
+    // Renaming or deleting a folder on the Mac must not leave the phone
+    // filtered to a project that no longer exists, showing nothing forever.
+    let page = include_str!("page.html");
+    assert!(
+        page.contains("names.indexOf(project) < 0"),
+        "an unknown stored project resets the filter"
+    );
+}
+
+#[test]
+fn the_pad_can_clear_a_typed_but_unsent_message() {
+    let page = include_str!("page.html");
+    assert!(
+        page.contains(r#"data-key="ctrl-u""#),
+        "a kill-line key exists on the pad"
+    );
+    assert!(
+        page.contains(">Clear<"),
+        "and it is labelled for what it does, not for its byte"
+    );
+}

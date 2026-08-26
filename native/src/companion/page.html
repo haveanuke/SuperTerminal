@@ -43,6 +43,11 @@
   .notice { padding:32px 20px; color:var(--muted); text-align:center; }
   #previews { display:flex; flex-direction:column; height:100dvh; }
   #pwrap { flex:1 1 0; overflow:auto; -webkit-overflow-scrolling:touch; }
+  #pchips { display:flex; gap:6px; padding:8px 8px 0; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  #pchips button { flex:0 0 auto; min-height:36px; padding:0 12px; border-radius:18px;
+    border:1px solid var(--border); background:var(--bg); color:var(--muted);
+    font:13px -apple-system,system-ui,sans-serif; white-space:nowrap; }
+  #pchips button.on { border-color:var(--accent); color:var(--accent); }
   #pgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:8px; }
   #pgrid .tile { background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   #pgrid .tile img { width:100%; aspect-ratio:1; object-fit:cover; display:block; background:var(--bg); }
@@ -122,6 +127,7 @@
     <div id="keys">
       <button data-key="enter">Enter</button>
       <button data-key="ctrl-c">Ctrl+C</button>
+      <button data-key="ctrl-u">Clear</button>
       <button data-key="up" aria-label="up"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10l5-5 5 5"/></svg></button>
       <button data-key="down" aria-label="down"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l5 5 5-5"/></svg></button>
       <button data-key="left" aria-label="left"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 3 5 8l5 5"/></svg></button>
@@ -159,6 +165,7 @@
     <div id="pdot" class="dot"></div>
   </header>
   <div id="pwrap">
+    <div id="pchips" class="hidden"></div>
     <div id="pgrid"></div>
     <div id="pempty" class="notice hidden">No images yet.</div>
     <div id="punavailable" class="notice hidden"></div>
@@ -546,6 +553,33 @@
     // Viewport frames are already small and live in memory: no thumb.
     img.src = imgSrc(entry, entry.kind !== "viewport") + "&a=" + attempt;
   }
+  // Project filter. ALL_PROJECTS is a sentinel no folder name can collide
+  // with, so "show everything" never has to be spelled as an empty string.
+  var ALL_PROJECTS = "\u0000all";
+  var project = loadPref("st-project") || ALL_PROJECTS;
+  function categoryOf(entry) { return entry.category || ""; }
+  function visibleInProject(entry) {
+    return entry.kind === "viewport" || project === ALL_PROJECTS
+      || categoryOf(entry) === project;
+  }
+  function paintChips(names) {
+    // One project is not a choice: a flat gallery gets no filter row at all.
+    $("pchips").classList.toggle("hidden", names.length < 2);
+    var row = $("pchips");
+    row.textContent = "";
+    [ALL_PROJECTS].concat(names).forEach(function (name) {
+      var chip = document.createElement("button");
+      chip.className = name === project ? "on" : "";
+      chip.textContent = name === ALL_PROJECTS ? "All" : name;
+      chip.addEventListener("click", function () {
+        if (project === name) return;
+        project = name;
+        storePref("st-project", name);
+        refreshPreviews();
+      });
+      row.appendChild(chip);
+    });
+  }
   function renderPreviews(data) {
     $("pdot").classList.add("on");
     var unavailable = data.state !== "ok";
@@ -554,11 +588,27 @@
       $("punavailable").textContent =
         "Preview folder unavailable. Save renders into Pictures/SuperTerminal on the Mac (or set a folder in settings).";
     }
+    // Projects are the gallery's direct subfolders; loose files carry the
+    // host's "Unsorted". The viewport belongs to none of them.
+    var names = [];
+    data.entries.forEach(function (entry) {
+      var name = categoryOf(entry);
+      if (entry.kind !== "viewport" && name && names.indexOf(name) < 0) names.push(name);
+    });
+    names.sort();
+    // A folder can be renamed or deleted on the Mac; never strand the phone
+    // filtered to a project that no longer exists, showing nothing forever.
+    if (project !== ALL_PROJECTS && names.indexOf(project) < 0) {
+      project = ALL_PROJECTS;
+      storePref("st-project", project);
+    }
+    paintChips(names);
+    var shown = data.entries.filter(visibleInProject);
     // Entries render regardless of folder state: the live viewport tile
     // rides the list even when the watched folder is unavailable.
-    $("pempty").classList.toggle("hidden", unavailable || data.entries.length > 0);
+    $("pempty").classList.toggle("hidden", unavailable || shown.length > 0);
     var grid = $("pgrid"), seen = {};
-    data.entries.forEach(function (entry) {
+    shown.forEach(function (entry) {
       seen[entry.id] = true;
       var tile = tileEls[entry.id];
       if (!tile) {

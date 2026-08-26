@@ -80,6 +80,9 @@ pub fn symbolic_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
     Some(match key {
         "enter" => vec![b'\r'],
         "ctrl-c" => vec![0x03],
+        // Kill-line: the phone's only way to take back text that landed in
+        // an agent's compose box and is sitting there unsent.
+        "ctrl-u" => vec![0x15],
         "tab" => vec![b'\t'],
         "esc" => vec![0x1b],
         "up" => arrow(b'A'),
@@ -110,6 +113,14 @@ mod tests {
         assert_eq!(symbolic_bytes("ctrl-c", false), Some(vec![0x03]));
         assert_eq!(symbolic_bytes("tab", false), Some(vec![b'\t']));
         assert_eq!(symbolic_bytes("esc", false), Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn kill_line_clears_a_typed_but_unsent_message() {
+        // Phone-sent text can land in an agent's compose box and sit there;
+        // without a kill-line the phone has no way to take it back.
+        assert_eq!(symbolic_bytes("ctrl-u", false), Some(vec![0x15]));
+        assert_eq!(symbolic_bytes("ctrl-u", true), Some(vec![0x15]));
     }
 
     #[test]

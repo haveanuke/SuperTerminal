@@ -412,6 +412,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             entries.extend(snap.entries.iter().map(|e| {
                 serde_json::json!({
                     "id": e.id, "kind": "image", "name": e.name,
+                    "category": e.category,
                     "revision": e.revision, "modifiedAt": e.modified_at,
                     "bytes": e.bytes,
                 })
@@ -1144,6 +1145,36 @@ mod tests {
         let out = get(&host, &format!("/previews?t={TOKEN}"));
         assert!(out.contains("\"state\":\"unavailable\""), "{out}");
         gone.stop();
+    }
+
+    #[test]
+    fn previews_list_carries_each_entrys_project() {
+        let dir = std::env::temp_dir().join(format!("st-prevcat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Hollowward")).unwrap();
+        write_test_png(&dir, "loose.png");
+        write_test_png(&dir.join("Hollowward"), "b1_lair.png");
+        let handle = boot_with_previews(preview_store(&dir));
+        let host = host_of(&handle);
+        let out = get(&host, &format!("/previews?t={TOKEN}"));
+        let body = out.rsplit("\r\n\r\n").next().unwrap_or("");
+        let json: serde_json::Value = serde_json::from_str(body).expect("previews json");
+        let entries = json["entries"].as_array().expect("entries");
+        let category_of = |name: &str| -> String {
+            entries
+                .iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["category"].as_str())
+                .unwrap_or("<missing>")
+                .to_string()
+        };
+        assert_eq!(category_of("b1_lair.png"), "Hollowward", "{body}");
+        assert_eq!(
+            category_of("loose.png"),
+            crate::companion::previews::UNSORTED,
+            "{body}"
+        );
+        handle.stop();
     }
 
     #[test]
