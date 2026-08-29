@@ -654,7 +654,11 @@ impl Workspace {
             let was_held = self.caffeinate_child.is_some();
             self.awake.tick(
                 self.settings.auto_caffeinate,
-                any_busy,
+                if any_busy {
+                    superterminal_core::activity::Activity::Busy
+                } else {
+                    superterminal_core::activity::Activity::Idle
+                },
                 std::time::Instant::now(),
             );
             self.sync_caffeinate();
