@@ -471,7 +471,15 @@ impl Workspace {
             let (busy, bell) =
                 pane.update(cx, |pane, _| (pane.foreground_busy(), pane.take_bell()));
             let gate = self.cue_gates.entry(id.clone()).or_default();
-            let outcome = gate.tick(now, busy, bell && audio_on);
+            let outcome = gate.tick(
+                now,
+                if busy {
+                    superterminal_core::activity::Activity::Busy
+                } else {
+                    superterminal_core::activity::Activity::Idle
+                },
+                bell && audio_on,
+            );
             if outcome.long_job_finished {
                 if self.focused_terminal.as_ref() == Some(id) {
                     focused_long_job = true;

@@ -4,6 +4,7 @@
 //! wrappers) and the native gpui app (`native`). Everything here is free of
 //! UI-framework dependencies.
 
+pub mod activity;
 pub mod buddy;
 pub mod buddy_gate;
 pub mod buddy_probe;
