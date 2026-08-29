@@ -134,6 +134,17 @@ impl PanelTarget {
     }
 }
 
+/// Whether a panel retarget is same-repo `Local` cwd churn (`cd src`)
+/// rather than a change of KIND (Local <-> Remote, Local <-> Detached, or
+/// a Remote host change). Only cwd churn may skip the eager retarget
+/// wipe — a real repo-identity check, made once the new cwd resolves,
+/// decides whether that case needs a wipe too. Every other transition is
+/// a kind change and must always wipe immediately; this predicate must
+/// never be used to weaken that.
+pub fn is_local_cwd_move(prev: &PanelTarget, next: &PanelTarget) -> bool {
+    matches!((prev, next), (PanelTarget::Local(_), PanelTarget::Local(_)))
+}
+
 /// Whether an async completion still owns the panel. Checked BEFORE any
 /// field is written, `busy` included — a stale completion from a target
 /// that has since been switched away from must not touch panel state.
@@ -406,6 +417,30 @@ mod tests {
         let t = PanelTarget::from_pane(&remote, Some("/tmp/repo".into()), "pc1");
         assert_eq!(t, PanelTarget::Remote("pc1".to_string()));
         assert_eq!(t.local_path(), None, "remote pane leaked a local path");
+    }
+
+    #[test]
+    fn local_to_local_is_cwd_move_everything_else_is_a_kind_change() {
+        let local_a = PanelTarget::Local("/tmp/repo-a".into());
+        let local_b = PanelTarget::Local("/tmp/repo-b".into());
+        assert!(is_local_cwd_move(&local_a, &local_b));
+
+        let remote_a = PanelTarget::Remote("host-a".to_string());
+        let remote_b = PanelTarget::Remote("host-b".to_string());
+        assert!(!is_local_cwd_move(&local_a, &remote_a), "Local -> Remote");
+        assert!(!is_local_cwd_move(&remote_a, &local_a), "Remote -> Local");
+        assert!(
+            !is_local_cwd_move(&local_a, &PanelTarget::Detached),
+            "Local -> Detached"
+        );
+        assert!(
+            !is_local_cwd_move(&PanelTarget::Detached, &local_a),
+            "Detached -> Local"
+        );
+        assert!(
+            !is_local_cwd_move(&remote_a, &remote_b),
+            "Remote -> Remote, different host"
+        );
     }
 
     #[test]

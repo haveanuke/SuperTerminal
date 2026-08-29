@@ -242,7 +242,14 @@ impl FilesPanel {
                     cx.listener(move |panel, _, _, cx| {
                         if is_dir {
                             panel.toggle_dir(path.clone(), cx);
-                        } else {
+                        } else if panel.target.is_local() {
+                            // gpui dispatches against the last painted
+                            // frame, so the target may have moved on since
+                            // this row was drawn — re-check here, same as
+                            // `toggle_dir` and `refresh`, rather than
+                            // trusting the frame this click was queued
+                            // against.
+                            //
                             // The workspace opens the real viewer beside
                             // the terminals.
                             cx.emit(OpenFile(path.clone()));

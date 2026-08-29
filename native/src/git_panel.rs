@@ -144,17 +144,27 @@ impl GitPanel {
     /// live and actionable, this ALWAYS applies: Detached and Remote both
     /// clear the panel out from under whatever was there before, including
     /// any armed destructive action.
+    ///
+    /// A change of KIND (Local <-> Remote, Local <-> Detached, or a Remote
+    /// host change) always wipes immediately — that is the safety path.
+    /// A Local -> Local cwd move (`cd src` inside the same repo) does not:
+    /// it behaves like the pre-slice `set_target_cwd`, which only wiped
+    /// once the resolved repo identity actually differed. Same-repo cwd
+    /// churn is local behaviour this slice has no license to change.
     pub fn set_target(&mut self, target: PanelTarget, cx: &mut Context<Self>) {
         if self.target == target {
             return;
         }
+        let kind_changed = !crate::hosts::is_local_cwd_move(&self.target, &target);
         self.generation = self.generation.wrapping_add(1);
         self.busy = false;
-        self.clear_for_retarget();
+        if kind_changed {
+            self.clear_for_retarget();
+        }
         self.target = target;
         cx.notify();
         if let PanelTarget::Local(path) = self.target.clone() {
-            self.resolve_repo(path, cx);
+            self.resolve_repo(path, kind_changed, cx);
         }
     }
 
@@ -172,7 +182,15 @@ impl GitPanel {
     }
 
     /// Resolve a local cwd to a repo (off-thread) and refresh once it lands.
-    fn resolve_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    ///
+    /// `force_refresh` is set when the caller already ran
+    /// `clear_for_retarget()` synchronously (a kind change): the repo is
+    /// already gone, so the resolution always counts as a change. When it
+    /// is unset (a same-repo cwd move), nothing was cleared up front, so
+    /// this compares the newly resolved repo's identity against the one
+    /// still live in `self.repo` and only wipes/refreshes when they
+    /// actually differ — matching the pre-slice `set_target_cwd` guard.
+    fn resolve_repo(&mut self, path: PathBuf, force_refresh: bool, cx: &mut Context<Self>) {
         let cwd = path.to_string_lossy().into_owned();
         let state = Arc::clone(&self.state);
         let generation = self.generation;
@@ -187,9 +205,19 @@ impl GitPanel {
                 if !crate::hosts::accepts_completion(panel.generation, generation) {
                     return;
                 }
+                let changed = force_refresh
+                    || panel.repo.as_ref().map(|r| &r.repo_id)
+                        != resolved.as_ref().map(|r| &r.repo_id);
                 panel.repo = resolved;
-                panel.refresh_status(cx);
-                panel.refresh_graph(cx);
+                if changed {
+                    panel.report = None;
+                    panel.graph = None;
+                    panel.pending_discard = None;
+                    panel.expanded.clear();
+                    panel.file_diffs.clear();
+                    panel.refresh_status(cx);
+                    panel.refresh_graph(cx);
+                }
             });
             Ok::<(), ()>(())
         })

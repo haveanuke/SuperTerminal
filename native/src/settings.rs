@@ -51,8 +51,10 @@ pub struct Settings {
     /// blender-mcp addon on localhost, only while the phone is watching).
     pub blender_viewport: bool,
     /// Raw, so a malformed entry can never fail whole-settings serde and
-    /// trip the `unwrap_or_default()` fallback at load.
-    #[serde(default)]
+    /// trip the `unwrap_or_default()` fallback at load. Skipped when null
+    /// so an untouched settings file doesn't grow a `"remoteProfiles":
+    /// null` line on every save.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub remote_profiles: serde_json::Value,
 }
 

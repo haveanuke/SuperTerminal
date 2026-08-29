@@ -2047,8 +2047,21 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Open (or replace) the docked file viewer.
+    /// Open (or replace) the docked file viewer. Refuses unless the
+    /// currently focused pane's target is local: gpui dispatches against
+    /// the last painted frame, so the row click that produced `path` can
+    /// be stale by the time this runs — re-checking here is the D6 guard
+    /// against reading a locally-derived path through a pane that has
+    /// since gone remote (or unfocused).
     fn open_file_viewer(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let target_is_local = self
+            .focused_terminal
+            .as_ref()
+            .and_then(|id| self.panes.get(id))
+            .is_some_and(|pane| pane.read(cx).target().is_local());
+        if !target_is_local {
+            return;
+        }
         let theme = self.theme;
         let family = self.settings.font_family.clone();
         let size = self.settings.font_size;
@@ -2937,6 +2950,15 @@ impl Workspace {
         let Some(pane) = self.panes.get(&id) else {
             return;
         };
+        // Same hazard class as the folder-picker guard: a locally-derived
+        // note must never be typed into a pane running on another
+        // machine. The `or_else` fallback above can land on
+        // `focused_terminal` even when that pane isn't the local one the
+        // note was drafted about, so the target is re-checked here right
+        // before the write, not assumed from where the note came from.
+        if !may_write_cd(pane.read(cx).target(), pane.read(cx).foreground_activity()) {
+            return;
+        }
         pane.update(cx, |pane, _| pane.write(note.into_bytes()));
         self.focus_terminal_by_id(&id, window, cx);
     }
@@ -4222,29 +4244,49 @@ mod tests {
         // The pattern deliberately has no trailing space: three of the
         // original fourteen sites assigned across a line break and a
         // trailing-space grep missed them.
-        let source = include_str!("mod.rs");
-        // Anchor on the tests module itself, not on `#[cfg(test)]`, which
-        // is also the idiom for test-only helpers inline in production
-        // code — a future one of those above this module would truncate
-        // the scan and hide raw assignments below it. The count assertion
-        // makes that assumption enforced rather than assumed: if the
-        // anchor ever goes missing or duplicates, this fails loudly
-        // instead of silently letting the scan below go unchecked (or
-        // scan the wrong span).
+        //
+        // `focused_terminal` is a private field of `Workspace`, but
+        // `settings_ui.rs` and `companion_ui.rs` are CHILD MODULES that
+        // can write it directly (settings_ui.rs already reads it, at
+        // line ~156) — a raw assignment added in either file is invisible
+        // to a scan of mod.rs alone. So all three are scanned.
         let marker = "\nmod tests {";
+        // Each entry: (file, source, expected `mod tests {}` anchors in
+        // that file). mod.rs and settings_ui.rs each have their own test
+        // module; companion_ui.rs has none — verified here, not assumed,
+        // so a future test module added there fails loudly instead of
+        // silently hiding raw assignments below it.
+        let sources = [
+            ("mod.rs", include_str!("mod.rs"), 1),
+            ("settings_ui.rs", include_str!("settings_ui.rs"), 1),
+            ("companion_ui.rs", include_str!("companion_ui.rs"), 0),
+        ];
+
+        let mut total = 0usize;
+        let mut by_file = Vec::new();
+        for (name, source, expected_anchors) in sources {
+            let anchor_count = source.matches(marker).count();
+            assert_eq!(
+                anchor_count, expected_anchors,
+                "expected {expected_anchors} `mod tests {{` anchor(s) in \
+                 {name}; the scan below depends on this"
+            );
+            let production = if expected_anchors == 1 {
+                source.split(marker).next().expect("anchor present")
+            } else {
+                source
+            };
+            let count = production.matches("focused_terminal =").count();
+            total += count;
+            by_file.push((name, count));
+        }
+
         assert_eq!(
-            source.matches(marker).count(),
-            1,
-            "expected exactly one `mod tests {{` anchor; the scan below \
-             depends on it"
-        );
-        let production = source.split(marker).next().expect("anchor present");
-        let assignments = production.matches("focused_terminal =").count();
-        assert_eq!(
-            assignments, 1,
-            "found {assignments} raw `focused_terminal =` assignments in \
-             production code; exactly one may exist, inside \
-             set_focused_terminal"
+            total, 1,
+            "found {total} raw `focused_terminal =` assignments in \
+             production code across mod.rs, settings_ui.rs, and \
+             companion_ui.rs; exactly one may exist, inside \
+             set_focused_terminal; by file: {by_file:?}"
         );
     }
 
