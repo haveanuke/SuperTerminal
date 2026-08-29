@@ -1132,7 +1132,7 @@ impl Workspace {
                         }
                     }
                 }
-                self.focused_terminal = Some(pane_id);
+                self.set_focused_terminal(Some(pane_id), cx);
                 self.push_git_cwd(cx);
                 cx.notify();
             }
@@ -1166,7 +1166,7 @@ impl Workspace {
         tab.windows.push(PaneNode::terminal(&terminal_id));
         tab.active_window = tab.windows.len() - 1;
         self.active_tab = tab_index;
-        self.focused_terminal = Some(terminal_id);
+        self.set_focused_terminal(Some(terminal_id), cx);
         self.push_git_cwd(cx);
         cx.notify();
     }
@@ -1182,7 +1182,7 @@ impl Workspace {
             PaneNode::terminal(&terminal_id),
         ));
         self.active_tab = self.tabs.len() - 1;
-        self.focused_terminal = Some(terminal_id);
+        self.set_focused_terminal(Some(terminal_id), cx);
         cx.notify();
     }
 
@@ -1207,7 +1207,7 @@ impl Workspace {
         let tab = &mut self.tabs[self.active_tab];
         let split = insert_split(tab.active_pane(), &target, direction, &new_id);
         *tab.active_pane_mut() = split;
-        self.focused_terminal = Some(new_id);
+        self.set_focused_terminal(Some(new_id), cx);
         cx.notify();
     }
 
@@ -1255,10 +1255,10 @@ impl Workspace {
             Some(rest) => {
                 self.tabs[tab_index].windows[window_index] = rest;
                 if self.focused_terminal.as_deref() == Some(terminal_id) {
-                    let tab = &self.tabs[tab_index];
-                    self.focused_terminal = collect_terminal_ids(&tab.windows[window_index])
+                    let next = collect_terminal_ids(&self.tabs[tab_index].windows[window_index])
                         .into_iter()
                         .next();
+                    self.set_focused_terminal(next, cx);
                 }
             }
             None if self.tabs[tab_index].windows.len() > 1 => {
@@ -1271,10 +1271,10 @@ impl Workspace {
                 }
                 tab.active_window = tab.active_window.min(tab.windows.len() - 1);
                 if was_focused {
-                    self.focused_terminal =
-                        collect_terminal_ids(self.tabs[tab_index].active_pane())
-                            .into_iter()
-                            .next();
+                    let next = collect_terminal_ids(self.tabs[tab_index].active_pane())
+                        .into_iter()
+                        .next();
+                    self.set_focused_terminal(next, cx);
                 }
             }
             None => {
@@ -1294,10 +1294,10 @@ impl Workspace {
                     }
                     self.active_tab = self.active_tab.min(self.tabs.len() - 1);
                     if was_active {
-                        self.focused_terminal =
-                            collect_terminal_ids(self.tabs[self.active_tab].active_pane())
-                                .into_iter()
-                                .next();
+                        let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
+                            .into_iter()
+                            .next();
+                        self.set_focused_terminal(next, cx);
                     }
                 }
             }
@@ -1339,10 +1339,10 @@ impl Workspace {
             }
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
             if was_active {
-                self.focused_terminal =
-                    collect_terminal_ids(self.tabs[self.active_tab].active_pane())
-                        .into_iter()
-                        .next();
+                let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
+                    .into_iter()
+                    .next();
+                self.set_focused_terminal(next, cx);
             }
         }
         cx.notify();
@@ -1396,9 +1396,10 @@ impl Workspace {
     fn select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.active_tab = index;
-            self.focused_terminal = collect_terminal_ids(self.tabs[index].active_pane())
+            let next = collect_terminal_ids(self.tabs[index].active_pane())
                 .into_iter()
                 .next();
+            self.set_focused_terminal(next, cx);
             self.push_git_cwd(cx);
             cx.notify();
         }
@@ -1985,7 +1986,7 @@ impl Workspace {
             self.tabs[tab_index].active_window = window_index;
         }
         self.active_tab = tab_index;
-        self.focused_terminal = Some(terminal_id.to_string());
+        self.set_focused_terminal(Some(terminal_id.to_string()), cx);
         self.push_git_cwd(cx);
         self.focus_active_pane(window, cx);
         cx.notify();
@@ -2126,46 +2127,85 @@ impl Workspace {
         .detach();
     }
 
-    /// Keep the git and files panels pointed at the focused terminal: a
-    /// local pane's cwd, or (once the focus is on another host) that
-    /// pane's remote label — never the previous pane's local path.
-    fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
-        let focused = self
+    /// Resolve a profile id to its display label. A missing profile still
+    /// yields a string that names the id — never anything that could read
+    /// as local (that's the safety property Task 7 established with
+    /// `ResolvedTarget::MissingProfile`) and never a bare opaque id that
+    /// looks fine at a glance when the host it names is actually gone.
+    fn profile_label(&self, id: &crate::hosts::ProfileId) -> String {
+        let (profiles, _problems) = self.settings.profiles();
+        profiles
+            .iter()
+            .find(|profile| &profile.id == id)
+            .map(|profile| profile.label.clone())
+            .unwrap_or_else(|| format!("missing host ({})", id.0))
+    }
+
+    /// The ONLY writer of `focused_terminal`. Focus and panel identity
+    /// change together, in one update, before any other UI action can
+    /// dispatch — the periodic refresh at `pet_tick_count % 3` is gated on
+    /// the sidebar being open and must never be responsible for identity.
+    fn set_focused_terminal(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.focused_terminal = id;
+        self.retarget_panels(cx);
+    }
+
+    /// Point both panels (and the docked file viewer) at the focused
+    /// pane's target: a local pane's cwd, or (once the focus is on
+    /// another host) that pane's remote label — never the previous pane's
+    /// local path.
+    fn retarget_panels(&mut self, cx: &mut Context<Self>) {
+        let target = self
             .focused_terminal
             .as_ref()
             .and_then(|id| self.panes.get(id))
-            .cloned();
-        let panel_target = match &focused {
-            Some(pane) => {
-                let target = pane.read(cx).target().clone();
-                let cwd = pane.read(cx).cwd();
-                let label = match &target {
+            .map(|pane| {
+                let pane = pane.read(cx);
+                let pane_target = pane.target().clone();
+                let cwd = pane.cwd();
+                let label = match &pane_target {
                     crate::hosts::Target::Local => String::new(),
-                    crate::hosts::Target::Remote(_) => {
-                        let (profiles, _problems) = self.settings.profiles();
-                        match crate::hosts::resolve_target(&target, &profiles) {
-                            crate::hosts::ResolvedTarget::Remote(profile) => profile.label.clone(),
-                            crate::hosts::ResolvedTarget::MissingProfile(id) => {
-                                format!("missing host ({})", id.0)
-                            }
-                            crate::hosts::ResolvedTarget::Local => String::new(),
-                        }
-                    }
+                    crate::hosts::Target::Remote(id) => self.profile_label(id),
                 };
-                crate::hosts::PanelTarget::from_pane(&target, cwd, &label)
-            }
-            None => crate::hosts::PanelTarget::Detached,
-        };
+                // `from_pane` is the only place a `PanelTarget` is derived
+                // — it's what guarantees a remote pane can never produce a
+                // local path, whatever cwd it reports.
+                crate::hosts::PanelTarget::from_pane(&pane_target, cwd, &label)
+            })
+            .unwrap_or(crate::hosts::PanelTarget::Detached);
         if let Some(panel) = self.git_panel.clone() {
             panel.update(cx, |panel, panel_cx| {
-                panel.set_target(panel_target.clone(), panel_cx)
+                panel.set_target(target.clone(), panel_cx)
             });
         }
         if let Some(panel) = self.files_panel.clone() {
             panel.update(cx, |panel, panel_cx| {
-                panel.set_target(panel_target.clone(), panel_cx)
+                panel.set_target(target.clone(), panel_cx)
             });
         }
+        // A retarget away from Local must not leave a file opened under
+        // the previous local pane sitting in the docked viewer, readable
+        // and actionable, once the panels have moved on.
+        if !matches!(target, crate::hosts::PanelTarget::Local(_)) {
+            self.close_file_viewer(cx);
+        }
+    }
+
+    /// Close the docked file viewer the same way its own `ViewerClosed`
+    /// event does: drop the entity and notify. No other cleanup exists on
+    /// that path today, so this stays a two-line mirror of it rather than
+    /// a second implementation to keep in sync.
+    fn close_file_viewer(&mut self, cx: &mut Context<Self>) {
+        self.file_viewer = None;
+        cx.notify();
+    }
+
+    /// Kept for the six existing call sites that refresh panel CONTENT
+    /// (e.g. the periodic tick while the sidebar is open) without a focus
+    /// change of their own. No longer owns identity — just forwards to
+    /// the single source of truth.
+    fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
+        self.retarget_panels(cx);
     }
 
     fn refresh_sessions(&mut self) {
@@ -2256,9 +2296,10 @@ impl Workspace {
         } else {
             let wanted = layout.active_tab_id;
             self.active_tab = self.tabs.iter().position(|t| t.id == wanted).unwrap_or(0);
-            self.focused_terminal = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
+            let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
                 .into_iter()
                 .next();
+            self.set_focused_terminal(next, cx);
         }
         self.overlay = Overlay::None;
         cx.notify();
@@ -2348,7 +2389,7 @@ impl Workspace {
                             .child(pane_btn("split-h").on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {
-                                    ws.focused_terminal = Some(id_split_h.clone());
+                                    ws.set_focused_terminal(Some(id_split_h.clone()), cx);
                                     ws.split_focused(SplitDirection::Horizontal, cx);
                                     ws.focus_active_pane(window, cx);
                                 }),
@@ -2356,7 +2397,7 @@ impl Workspace {
                             .child(pane_btn("split-v").on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {
-                                    ws.focused_terminal = Some(id_split_v.clone());
+                                    ws.set_focused_terminal(Some(id_split_v.clone()), cx);
                                     ws.split_focused(SplitDirection::Vertical, cx);
                                     ws.focus_active_pane(window, cx);
                                 }),
@@ -2379,7 +2420,7 @@ impl Workspace {
                                     // Clear highlights BEFORE retargeting
                                     // focus, or the wrong pane gets cleared.
                                     ws.leave_search_highlights(cx);
-                                    ws.focused_terminal = Some(id_timer.clone());
+                                    ws.set_focused_terminal(Some(id_timer.clone()), cx);
                                     ws.overlay = if ws.overlay == Overlay::AutoRun {
                                         Overlay::None
                                     } else {
@@ -4125,6 +4166,58 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_helper_assigns_focus() {
+        // Focus and panel identity must change together. The periodic
+        // refresh is gated on `sidebar_open && pet_tick_count % 3`, so any
+        // raw assignment reintroduces a window where a remote pane is
+        // focused while the panels still hold local authority — including
+        // the git panel's destructive actions.
+        //
+        // The pattern deliberately has no trailing space: three of the
+        // original fourteen sites assigned across a line break and a
+        // trailing-space grep missed them.
+        let source = include_str!("mod.rs");
+        // Anchor on the tests module itself, not on `#[cfg(test)]`, which
+        // is also the idiom for test-only helpers inline in production
+        // code — a future one of those above this module would truncate
+        // the scan and hide raw assignments below it. The count assertion
+        // makes that assumption enforced rather than assumed: if the
+        // anchor ever goes missing or duplicates, this fails loudly
+        // instead of silently letting the scan below go unchecked (or
+        // scan the wrong span).
+        let marker = "\nmod tests {";
+        assert_eq!(
+            source.matches(marker).count(),
+            1,
+            "expected exactly one `mod tests {{` anchor; the scan below \
+             depends on it"
+        );
+        let production = source.split(marker).next().expect("anchor present");
+        let assignments = production.matches("focused_terminal =").count();
+        assert_eq!(
+            assignments, 1,
+            "found {assignments} raw `focused_terminal =` assignments in \
+             production code; exactly one may exist, inside \
+             set_focused_terminal"
+        );
+    }
+
+    #[test]
+    fn the_helper_retargets_the_panels() {
+        // Guards against the helper being reduced to a bare assignment.
+        let source = include_str!("mod.rs");
+        let helper = source
+            .split("fn set_focused_terminal")
+            .nth(1)
+            .expect("set_focused_terminal must exist");
+        let body_end = helper.find("\n    fn ").unwrap_or(helper.len());
+        assert!(
+            helper[..body_end].contains("retarget_panels"),
+            "set_focused_terminal must retarget the panels in the same update"
+        );
+    }
 
     #[test]
     fn voice_names_survive_spaces_and_variants() {
