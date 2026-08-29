@@ -20,6 +20,16 @@ impl Activity {
         matches!(self, Activity::Idle)
     }
 
+    /// A local PTY probe is always definite: tcgetpgrp answers, or the
+    /// session is gone. Local panes therefore never produce `Unknown`.
+    pub fn from_local_busy(busy: bool) -> Activity {
+        if busy {
+            Activity::Busy
+        } else {
+            Activity::Idle
+        }
+    }
+
     /// Workspace-wide reduction: any Busy wins; otherwise any Unknown wins;
     /// otherwise Idle. An empty set is Idle (nothing is running).
     pub fn aggregate(items: impl Iterator<Item = Activity>) -> Activity {
@@ -72,5 +82,11 @@ mod tests {
         assert_ne!(Activity::Unknown, Activity::Idle);
         assert!(!Activity::Unknown.is_idle());
         assert!(!Activity::Unknown.is_busy());
+    }
+
+    #[test]
+    fn local_busy_maps_to_two_states_only() {
+        assert_eq!(Activity::from_local_busy(true), Activity::Busy);
+        assert_eq!(Activity::from_local_busy(false), Activity::Idle);
     }
 }

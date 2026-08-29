@@ -32,6 +32,7 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
+use superterminal_core::activity::Activity;
 
 extern "C" {
     fn tcgetpgrp(fd: c_int) -> c_int;
@@ -658,6 +659,13 @@ impl TermSession {
         fg > 0 && fg != self.shell_pid
     }
 
+    /// Tri-state form of [`Self::foreground_busy`]. A local session is
+    /// always definite; `Unknown` is produced only by a remote target,
+    /// which has no local process group to probe.
+    pub fn foreground_activity(&self) -> Activity {
+        Activity::from_local_busy(self.foreground_busy())
+    }
+
     /// What the instrumented agent in this session last reported, if any.
     /// None means "nothing has reported" — the caller falls back to its
     /// heuristic rather than assuming either state.
@@ -697,6 +705,12 @@ impl TermSession {
         let cwd = superterminal_core::proc_cwd::pid_cwd(pid)
             .or_else(|| superterminal_core::proc_cwd::pid_cwd(self.shell_pid));
         (cwd, busy)
+    }
+
+    /// Tri-state form of [`Self::status`].
+    pub fn status_activity(&self) -> (Option<String>, Activity) {
+        let (cwd, busy) = self.status();
+        (cwd, Activity::from_local_busy(busy))
     }
 
     /// Where the focused terminal is (foreground process's directory,

@@ -16,6 +16,7 @@ use gpui::{
 
 use crate::keys::{self, KeyInput};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
+use superterminal_core::activity::Activity;
 
 /// Shared broadcast state: when enabled, keystrokes from any member pane fan
 /// out to every member's PTY.
@@ -430,6 +431,15 @@ impl TerminalPane {
         self.session.as_ref().is_some_and(|s| s.foreground_busy())
     }
 
+    /// Tri-state foreground probe: cues, `finished`, caffeinate, sidebar
+    /// dots, and the folder-write guard all read THIS, not the boolean.
+    pub fn foreground_activity(&self) -> Activity {
+        match self.session.as_ref() {
+            Some(session) => session.foreground_activity(),
+            None => Activity::Idle,
+        }
+    }
+
     /// The phone's busy dot. A foreground app alone is not "working" —
     /// claude parked at its prompt owns the tty for hours, which painted
     /// every session orange — but output activity alone is not "working"
@@ -451,12 +461,27 @@ impl TerminalPane {
         )
     }
 
+    /// Tri-state form of the phone's dot. Local behaviour is unchanged:
+    /// the agent/output heuristic in [`busy_dot`] still decides, and is
+    /// deliberately NOT merged with [`Self::foreground_activity`].
+    pub fn companion_activity(&self) -> Activity {
+        Activity::from_local_busy(self.companion_busy())
+    }
+
     /// (cwd, foreground-job-running) in one probe.
     pub fn status(&self) -> (Option<String>, bool) {
         self.session
             .as_ref()
             .map(|s| s.status())
             .unwrap_or((None, false))
+    }
+
+    /// Tri-state form of [`Self::status`].
+    pub fn status_activity(&self) -> (Option<String>, Activity) {
+        match self.session.as_ref() {
+            Some(session) => session.status_activity(),
+            None => (None, Activity::Idle),
+        }
     }
 
     pub fn focus(&self, window: &mut Window) {
