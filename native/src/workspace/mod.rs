@@ -1081,6 +1081,39 @@ impl Workspace {
         pane
     }
 
+    /// A pane for a saved `target` that this slice cannot (or can no
+    /// longer) reach: constructed through `TerminalPane::dead`, which never
+    /// touches a local shell, unlike `spawn_pane`/`TerminalPane::new`.
+    fn spawn_dead_pane(
+        &mut self,
+        id: String,
+        target: crate::hosts::Target,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalPane> {
+        let theme = self.theme;
+        let family = self.settings.font_family.clone();
+        let size = self.settings.font_size;
+        let translucent = self.settings.background_image.is_some();
+        let pane_id = id.clone();
+        let hub = Arc::clone(&self.broadcast);
+        let pane = cx
+            .new(|pane_cx| TerminalPane::dead(pane_id, target, theme, family, size, hub, pane_cx));
+        pane.update(cx, |pane, pane_cx| {
+            pane.set_appearance(
+                theme,
+                &self.settings.font_family,
+                size,
+                translucent,
+                pane_cx,
+            )
+        });
+        cx.subscribe(&pane, Self::on_pane_event).detach();
+        // No session, so no input sender to register with the companion hub —
+        // a dead pane has nothing to mirror or type into.
+        self.panes.insert(id, pane.clone());
+        pane
+    }
+
     fn on_pane_event(
         &mut self,
         pane: Entity<TerminalPane>,
@@ -2159,11 +2192,25 @@ impl Workspace {
             }
         }
         self.tabs.clear();
+        // Resolved once per load: a saved target whose profile is gone must
+        // restore as a dead pane, never silently as a local shell.
+        let (profiles, _problems) = self.settings.profiles();
         for tab in layout.tabs {
             let mut mapping = HashMap::new();
-            for old_id in tab.all_terminal_ids() {
+            for (old_id, target) in tab.all_terminal_targets() {
                 let new_id = self.fresh_id();
-                self.spawn_pane(new_id.clone(), None, cx);
+                match crate::hosts::resolve_target(&target, &profiles) {
+                    crate::hosts::ResolvedTarget::Local => {
+                        self.spawn_pane(new_id.clone(), None, cx);
+                    }
+                    crate::hosts::ResolvedTarget::Remote(_)
+                    | crate::hosts::ResolvedTarget::MissingProfile(_) => {
+                        // Slice 2 gives a resolved Remote a real connection;
+                        // here both restore dead rather than ever spawning
+                        // a local shell for a non-local target.
+                        self.spawn_dead_pane(new_id.clone(), target, cx);
+                    }
+                }
                 mapping.insert(old_id, new_id);
             }
             let windows: Vec<PaneNode> = tab
@@ -2202,7 +2249,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match node {
-            PaneNode::Terminal { terminal_id } => {
+            PaneNode::Terminal { terminal_id, .. } => {
                 let Some(pane) = self.panes.get(terminal_id) else {
                     return div().size_full().into_any_element();
                 };
@@ -3759,11 +3806,15 @@ impl Workspace {
 
 fn remap_ids(node: &PaneNode, mapping: &HashMap<String, String>) -> PaneNode {
     match node {
-        PaneNode::Terminal { terminal_id } => PaneNode::Terminal {
+        PaneNode::Terminal {
+            terminal_id,
+            target,
+        } => PaneNode::Terminal {
             terminal_id: mapping
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_else(|| terminal_id.clone()),
+            target: target.clone(),
         },
         PaneNode::Split {
             direction,

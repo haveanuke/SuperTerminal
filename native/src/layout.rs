@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::Target;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitDirection {
@@ -25,6 +27,10 @@ pub enum SplitDirection {
 pub enum PaneNode {
     Terminal {
         terminal_id: String,
+        /// Omitted when Local, so existing saved layouts are byte-identical
+        /// and older files load as Local.
+        #[serde(default, skip_serializing_if = "Target::is_local")]
+        target: Target,
     },
     Split {
         direction: SplitDirection,
@@ -39,6 +45,7 @@ impl PaneNode {
     pub fn terminal(terminal_id: impl Into<String>) -> Self {
         PaneNode::Terminal {
             terminal_id: terminal_id.into(),
+            target: Target::Local,
         }
     }
 
@@ -66,7 +73,7 @@ pub fn insert_split(
     new_id: &str,
 ) -> PaneNode {
     match pane {
-        PaneNode::Terminal { terminal_id } if terminal_id == target => PaneNode::Split {
+        PaneNode::Terminal { terminal_id, .. } if terminal_id == target => PaneNode::Split {
             direction,
             children: vec![pane.clone(), PaneNode::terminal(new_id)],
             sizes: None,
@@ -93,7 +100,9 @@ pub fn insert_split(
 /// split's direction/sizes); removing the last terminal yields `None`.
 pub fn remove_terminal(pane: &PaneNode, terminal_id: &str) -> Option<PaneNode> {
     match pane {
-        PaneNode::Terminal { terminal_id: id } => {
+        PaneNode::Terminal {
+            terminal_id: id, ..
+        } => {
             if id == terminal_id {
                 None
             } else {
@@ -124,18 +133,61 @@ pub fn remove_terminal(pane: &PaneNode, terminal_id: &str) -> Option<PaneNode> {
     }
 }
 
+/// The target currently attached to `id` in the tree, if `id` appears.
+fn target_of(pane: &PaneNode, id: &str) -> Option<Target> {
+    match pane {
+        PaneNode::Terminal {
+            terminal_id,
+            target,
+        } => (terminal_id == id).then(|| target.clone()),
+        PaneNode::Split { children, .. } => children.iter().find_map(|c| target_of(c, id)),
+    }
+}
+
 /// Swap the positions of terminals `a` and `b` in the tree.
 ///
 /// If only one of the two ids is present, that node is relabeled with the
 /// other id (matching the TS store's behavior).
+///
+/// A terminal's target belongs to its id, not to its tree position: the
+/// node that becomes `b` must carry `b`'s own target (found elsewhere in
+/// the tree before either id is relabeled), and likewise for `a`. Reusing
+/// the position's OLD target here would silently attach the wrong target
+/// to a relabeled id — the same "becomes Local by accident" bug this slice
+/// exists to prevent, just approached from the other direction.
 #[allow(dead_code)] // pane-swap UI is v1.x; logic + tests kept for parity
 pub fn swap_terminals(pane: &PaneNode, a: &str, b: &str) -> PaneNode {
+    let target_a = target_of(pane, a);
+    let target_b = target_of(pane, b);
+    swap_terminals_inner(pane, a, b, target_a.as_ref(), target_b.as_ref())
+}
+
+fn swap_terminals_inner(
+    pane: &PaneNode,
+    a: &str,
+    b: &str,
+    target_a: Option<&Target>,
+    target_b: Option<&Target>,
+) -> PaneNode {
     match pane {
-        PaneNode::Terminal { terminal_id } => {
+        PaneNode::Terminal {
+            terminal_id,
+            target,
+        } => {
             if terminal_id == a {
-                PaneNode::terminal(b)
+                PaneNode::Terminal {
+                    terminal_id: b.to_string(),
+                    // b's own target moves in with it; if b doesn't exist
+                    // anywhere in the tree, there is nothing to swap with,
+                    // so this node keeps its own target rather than
+                    // inventing one.
+                    target: target_b.cloned().unwrap_or_else(|| target.clone()),
+                }
             } else if terminal_id == b {
-                PaneNode::terminal(a)
+                PaneNode::Terminal {
+                    terminal_id: a.to_string(),
+                    target: target_a.cloned().unwrap_or_else(|| target.clone()),
+                }
             } else {
                 pane.clone()
             }
@@ -148,21 +200,36 @@ pub fn swap_terminals(pane: &PaneNode, a: &str, b: &str) -> PaneNode {
             direction: *direction,
             children: children
                 .iter()
-                .map(|child| swap_terminals(child, a, b))
+                .map(|child| swap_terminals_inner(child, a, b, target_a, target_b))
                 .collect(),
             sizes: *sizes,
         },
     }
 }
 
-/// All terminal ids in the tree, depth-first, left to right.
-pub fn collect_terminal_ids(pane: &PaneNode) -> Vec<String> {
+/// All (terminal id, target) pairs in the tree, depth-first, left to right.
+/// Used on restore, where each leaf must be resolved against the live
+/// profile list rather than unconditionally respawned locally. The sole
+/// recursion over the tree for this purpose — `collect_terminal_ids` is
+/// defined in terms of it below so the two can never drift apart.
+pub fn collect_terminal_targets(pane: &PaneNode) -> Vec<(String, Target)> {
     match pane {
-        PaneNode::Terminal { terminal_id } => vec![terminal_id.clone()],
+        PaneNode::Terminal {
+            terminal_id,
+            target,
+        } => vec![(terminal_id.clone(), target.clone())],
         PaneNode::Split { children, .. } => {
-            children.iter().flat_map(collect_terminal_ids).collect()
+            children.iter().flat_map(collect_terminal_targets).collect()
         }
     }
+}
+
+/// All terminal ids in the tree, depth-first, left to right.
+pub fn collect_terminal_ids(pane: &PaneNode) -> Vec<String> {
+    collect_terminal_targets(pane)
+        .into_iter()
+        .map(|(terminal_id, _)| terminal_id)
+        .collect()
 }
 
 /// A project: one or more full-pane WINDOWS (each its own split tree), with
@@ -204,6 +271,14 @@ impl Tab {
     /// Every terminal in every window of this project.
     pub fn all_terminal_ids(&self) -> Vec<String> {
         self.windows.iter().flat_map(collect_terminal_ids).collect()
+    }
+
+    /// Every (terminal id, target) pair in every window of this project.
+    pub fn all_terminal_targets(&self) -> Vec<(String, Target)> {
+        self.windows
+            .iter()
+            .flat_map(collect_terminal_targets)
+            .collect()
     }
 
     /// Index of the window containing `terminal_id`.
@@ -296,7 +371,38 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosts::ProfileId;
     use serde_json::json;
+
+    #[test]
+    fn a_local_terminal_serialises_exactly_as_before() {
+        // Existing saved layouts must round-trip byte-identically.
+        let node = PaneNode::terminal("t1");
+        let json = serde_json::to_string(&node).unwrap();
+        assert_eq!(json, r#"{"type":"terminal","terminalId":"t1"}"#);
+    }
+
+    #[test]
+    fn a_layout_without_a_target_loads_as_local() {
+        let node: PaneNode =
+            serde_json::from_str(r#"{"type":"terminal","terminalId":"t1"}"#).unwrap();
+        match node {
+            PaneNode::Terminal { target, .. } => assert!(target.is_local()),
+            _ => panic!("expected a terminal"),
+        }
+    }
+
+    #[test]
+    fn a_remote_target_round_trips() {
+        let node = PaneNode::Terminal {
+            terminal_id: "t1".to_string(),
+            target: Target::Remote(ProfileId("abc".to_string())),
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""target""#), "{json}");
+        let back: PaneNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, node);
+    }
 
     fn term(id: &str) -> PaneNode {
         PaneNode::terminal(id)
@@ -453,6 +559,52 @@ mod tests {
     fn swap_with_uninvolved_ids_leaves_tree_unchanged() {
         let pane = split(SplitDirection::Horizontal, term("a"), term("b"));
         assert_eq!(swap_terminals(&pane, "x", "y"), pane);
+    }
+
+    #[test]
+    fn swapping_terminals_carries_each_target_with_its_terminal() {
+        // A remote pane that silently became Local on a swap would inherit
+        // local authority — the exact failure this slice exists to prevent.
+        let remote = Target::Remote(ProfileId("p1".into()));
+        let tree = PaneNode::Split {
+            direction: SplitDirection::Horizontal,
+            children: vec![
+                PaneNode::Terminal {
+                    terminal_id: "a".into(),
+                    target: Target::Local,
+                },
+                PaneNode::Terminal {
+                    terminal_id: "b".into(),
+                    target: remote.clone(),
+                },
+            ],
+            sizes: None,
+        };
+        let swapped = swap_terminals(&tree, "a", "b");
+        let PaneNode::Split { children, .. } = &swapped else {
+            panic!("expected a split")
+        };
+        match (&children[0], &children[1]) {
+            (
+                PaneNode::Terminal {
+                    terminal_id: first,
+                    target: first_target,
+                },
+                PaneNode::Terminal {
+                    terminal_id: second,
+                    target: second_target,
+                },
+            ) => {
+                assert_eq!(first, "b");
+                assert_eq!(
+                    first_target, &remote,
+                    "the remote target did not travel with 'b'"
+                );
+                assert_eq!(second, "a");
+                assert_eq!(second_target, &Target::Local);
+            }
+            other => panic!("expected two terminals, got {other:?}"),
+        }
     }
 
     // collect_terminal_ids

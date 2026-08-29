@@ -48,6 +48,53 @@ pub struct ProfileProblem {
     pub reason: String,
 }
 
+/// Where a pane's shell runs. `Local` is the default and is omitted from
+/// serialized layouts so existing session files are unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+// Adjacent (not internal) tagging: `ProfileId` serializes as a bare JSON
+// string, and serde cannot internally-tag a newtype variant whose payload
+// isn't a map. `content` puts the payload in its own field instead.
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum Target {
+    #[default]
+    Local,
+    Remote(ProfileId),
+}
+
+impl Target {
+    pub fn is_local(&self) -> bool {
+        matches!(self, Target::Local)
+    }
+
+    pub fn profile_id(&self) -> Option<&ProfileId> {
+        match self {
+            Target::Local => None,
+            Target::Remote(id) => Some(id),
+        }
+    }
+}
+
+/// The outcome of resolving a saved `Target` against the currently loaded
+/// profiles.
+#[derive(Debug, PartialEq)]
+pub enum ResolvedTarget<'a> {
+    Local,
+    Remote(&'a RemoteProfile),
+    /// The pane restores dead, labelled with the missing id, reconnect
+    /// disabled. It must never silently fall back to a local shell.
+    MissingProfile(ProfileId),
+}
+
+pub fn resolve_target<'a>(target: &Target, profiles: &'a [RemoteProfile]) -> ResolvedTarget<'a> {
+    match target {
+        Target::Local => ResolvedTarget::Local,
+        Target::Remote(id) => match profiles.iter().find(|p| &p.id == id) {
+            Some(profile) => ResolvedTarget::Remote(profile),
+            None => ResolvedTarget::MissingProfile(id.clone()),
+        },
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum DestinationError {
     Empty,
@@ -278,5 +325,34 @@ mod tests {
         assert_eq!(ok.len(), 1, "only the non-colliding profile survives");
         assert_eq!(ok[0].label, "three");
         assert_eq!(problems.len(), 2, "both colliding profiles are reported");
+    }
+
+    #[test]
+    fn a_target_whose_profile_is_missing_does_not_become_local() {
+        let profiles: Vec<RemoteProfile> = Vec::new();
+        let target = Target::Remote(ProfileId("gone".into()));
+        assert_eq!(
+            resolve_target(&target, &profiles),
+            ResolvedTarget::MissingProfile(ProfileId("gone".into()))
+        );
+        // The critical assertion: it is not Local.
+        assert_ne!(resolve_target(&target, &profiles), ResolvedTarget::Local);
+    }
+
+    #[test]
+    fn a_target_with_a_live_profile_resolves_to_it() {
+        let profiles = vec![RemoteProfile {
+            id: ProfileId("p1".into()),
+            label: "pc1".into(),
+            destination: "pc1".into(),
+            user: None,
+            port: None,
+            os: HostOs::Linux,
+            shell: ShellKind::Bash,
+        }];
+        match resolve_target(&Target::Remote(ProfileId("p1".into())), &profiles) {
+            ResolvedTarget::Remote(profile) => assert_eq!(profile.label, "pc1"),
+            other => panic!("expected a resolved profile, got {other:?}"),
+        }
     }
 }

@@ -14,6 +14,7 @@ use gpui::{
     SharedString, Window,
 };
 
+use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use superterminal_core::activity::Activity;
@@ -63,6 +64,10 @@ pub enum PaneEvent {
 
 pub struct TerminalPane {
     pub id: String,
+    /// Where this pane's shell runs. Local panes behave exactly as before;
+    /// a non-local target with no session is a dead pane (Slice 1 does not
+    /// connect anywhere yet).
+    target: Target,
     session: Option<TermSession>,
     snapshot: RenderableSnapshot,
     focus_handle: FocusHandle,
@@ -167,6 +172,63 @@ impl TerminalPane {
         )
         .ok();
 
+        Self::from_parts(
+            id,
+            Target::Local,
+            session,
+            cell_width,
+            line_height,
+            theme,
+            font_family,
+            font_size,
+            broadcast,
+            cx,
+        )
+    }
+
+    /// A pane for a target that isn't (yet, or no longer) reachable: never
+    /// attempts a local shell, unlike `new`. Renders and tears down exactly
+    /// like a pane whose local spawn failed — the existing, already-safe
+    /// "no session" path. Slice 2 gives a resolved remote target a real
+    /// connection; here every non-local target restores dead.
+    pub fn dead(
+        id: String,
+        target: Target,
+        theme: &'static Theme,
+        font_family: String,
+        font_size: f32,
+        broadcast: std::sync::Arc<BroadcastHub>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cell_width = px(font_size * 0.6);
+        let line_height = px((font_size * 1.4).round());
+        Self::from_parts(
+            id,
+            target,
+            None,
+            cell_width,
+            line_height,
+            theme,
+            font_family,
+            font_size,
+            broadcast,
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        id: String,
+        target: Target,
+        session: Option<TermSession>,
+        cell_width: Pixels,
+        line_height: Pixels,
+        theme: &'static Theme,
+        font_family: String,
+        font_size: f32,
+        broadcast: std::sync::Arc<BroadcastHub>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Dirty-flag pump (spike-proven): PTY thread flips the flag, this task
         // turns it into re-renders; bounded by construction.
         cx.spawn(async move |pane, cx| {
@@ -347,6 +409,7 @@ impl TerminalPane {
 
         Self {
             id,
+            target,
             session,
             snapshot,
             focus_handle: cx.focus_handle(),
@@ -414,6 +477,11 @@ impl TerminalPane {
 
     pub fn cwd(&self) -> Option<String> {
         self.session.as_ref()?.cwd()
+    }
+
+    /// Where this pane's shell runs. Local panes behave exactly as before.
+    pub fn target(&self) -> &Target {
+        &self.target
     }
 
     /// Type text into this pane's PTY (bypasses broadcast).
