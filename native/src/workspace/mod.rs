@@ -713,8 +713,8 @@ impl Workspace {
                         }
                         found
                     };
-                    let busy = pane.read(cx).companion_busy();
-                    hub.set_meta(id, &label, true, busy);
+                    let activity = pane.read(cx).companion_activity();
+                    hub.set_meta_activity(id, &label, true, activity);
                 }
                 // Prune entries whose pane is gone: their streams end and
                 // further input turns 404 (they answered 410 since retire).

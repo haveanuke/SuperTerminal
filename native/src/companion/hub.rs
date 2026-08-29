@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::term_session::RenderableSnapshot;
 use crate::themes::Theme;
+use superterminal_core::activity::Activity;
 
 use super::wire::serialize_snapshot;
 
@@ -37,6 +38,10 @@ pub struct SessionInfo {
     pub label: String,
     pub alive: bool,
     pub busy: bool,
+    /// Tri-state successor to `busy`. Kept in lockstep with it: `busy` is
+    /// always `activity == Busy`, so a phone page that predates this field
+    /// can never read `Unknown` as working.
+    pub activity: Activity,
     /// Monotonic long-job completion counter (cue-gate semantics: a
     /// foreground job busy 5s+ returned to the prompt). The phone diffs it
     /// per poll — a counter cannot be missed the way a sampled busy flag
@@ -96,6 +101,7 @@ impl<S: Clone> CompanionHub<S> {
                     label: label.to_string(),
                     alive: true,
                     busy: false,
+                    activity: Activity::Idle,
                     finished: 0,
                 },
                 sender,
@@ -138,11 +144,23 @@ impl<S: Clone> CompanionHub<S> {
     }
 
     /// No-op for unknown ids (metadata refresh racing an unregister).
+    /// Delegates to [`Self::set_meta_activity`] so both stay in lockstep.
+    /// Kept for backward-compatible callers/tests; the workspace now calls
+    /// [`Self::set_meta_activity`] directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_meta(&self, id: &str, label: &str, alive: bool, busy: bool) {
+        self.set_meta_activity(id, label, alive, Activity::from_local_busy(busy));
+    }
+
+    /// Sets both the legacy boolean and the tri-state. `busy` stays
+    /// `activity == Busy`, so a page that predates the new field can never
+    /// read `Unknown` as working.
+    pub fn set_meta_activity(&self, id: &str, label: &str, alive: bool, activity: Activity) {
         if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
             entry.info.label = label.to_string();
             entry.info.alive = alive;
-            entry.info.busy = busy;
+            entry.info.busy = activity.is_busy();
+            entry.info.activity = activity;
         }
     }
 
@@ -388,6 +406,32 @@ mod tests {
         let hub = TestHub::new();
         hub.set_meta("ghost", "label", true, true);
         assert!(hub.sessions().is_empty());
+    }
+
+    #[test]
+    fn unknown_activity_never_reads_as_busy_on_the_legacy_flag() {
+        // The legacy boolean is what an already-loaded phone page reads.
+        // Unknown must present as not-busy there, or an untrusted pane
+        // paints orange on every old client.
+        let (hub, _rx) = hub_with("t1", "one");
+        hub.set_meta_activity("t1", "one", true, Activity::Unknown);
+        let info = hub.sessions().into_iter().next().unwrap();
+        assert!(!info.busy, "Unknown must not set the legacy busy flag");
+        assert_eq!(info.activity, Activity::Unknown);
+
+        hub.set_meta_activity("t1", "one", true, Activity::Busy);
+        let info = hub.sessions().into_iter().next().unwrap();
+        assert!(info.busy);
+        assert_eq!(info.activity, Activity::Busy);
+    }
+
+    #[test]
+    fn the_legacy_set_meta_still_maps_to_two_states() {
+        let (hub, _rx) = hub_with("t1", "one");
+        hub.set_meta("t1", "one", true, true);
+        assert_eq!(hub.sessions()[0].activity, Activity::Busy);
+        hub.set_meta("t1", "one", true, false);
+        assert_eq!(hub.sessions()[0].activity, Activity::Idle);
     }
 
     #[test]

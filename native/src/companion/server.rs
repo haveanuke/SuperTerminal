@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::themes::Theme;
+use superterminal_core::activity::Activity;
 
 use super::auth::token_matches;
 use super::http::{parse_request, Method, ParseError, Request};
@@ -382,9 +383,14 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 &sessions
                     .iter()
                     .map(|s| {
+                        let activity = match s.activity {
+                            Activity::Busy => "busy",
+                            Activity::Idle => "idle",
+                            Activity::Unknown => "unknown",
+                        };
                         serde_json::json!({
                             "id": s.id, "label": s.label, "alive": s.alive,
-                            "busy": s.busy, "finished": s.finished
+                            "busy": s.busy, "activity": activity, "finished": s.finished
                         })
                     })
                     .collect::<Vec<_>>(),

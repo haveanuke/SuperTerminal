@@ -274,6 +274,27 @@ fn page_renders_the_history_tail_above_the_live_screen() {
 }
 
 #[test]
+fn the_page_reads_activity_by_value_not_truthiness() {
+    // `s.busy ? ...` treats the string "idle" as busy. The new page must
+    // compare against a value, so a page that DOES get the new field can
+    // never mispaint.
+    let page = include_str!("page.html");
+    assert!(page.contains("s.activity"), "page ignores the new field");
+    assert!(
+        !page.contains(r#"(s.activity ? "#),
+        "page must not test s.activity for truthiness"
+    );
+    assert!(
+        page.contains(r#"act === "busy""#),
+        "page must compare activity by value"
+    );
+    assert!(
+        page.contains(r#"act === "unknown""#),
+        "page must render the unknown state"
+    );
+}
+
+#[test]
 fn page_treats_the_live_viewport_tile_specially() {
     let page = include_str!("page.html");
     assert!(

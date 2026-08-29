@@ -15,6 +15,7 @@
   .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:none; }
   .dot.on { background:#9ece6a; }
   .dot.busy { background:var(--busy); }
+  .dot.unk { background:none; border:1px solid var(--border); }
   button.back { background:none; border:none; color:var(--accent); font-size:15px; padding:8px; min-width:44px; min-height:44px; }
   #sessions { list-style:none; }
   #sessions li { display:flex; align-items:center; gap:12px; padding:16px 14px; border-bottom:1px solid var(--border); min-height:56px; }
@@ -268,7 +269,8 @@
         sessions.forEach(function (s) {
           var li = document.createElement("li");
           var dot = document.createElement("div");
-          dot.className = "dot" + (s.busy ? " busy" : s.alive ? " on" : "")
+          var act = s.activity || (s.busy ? "busy" : "idle");
+          dot.className = "dot" + (act === "busy" ? " busy" : act === "unknown" ? " unk" : s.alive ? " on" : "")
             + (attention[s.id] ? " attn" : "");
           var label = document.createElement("div"); label.className = "label"; label.textContent = s.label;
           var edit = document.createElement("button");
