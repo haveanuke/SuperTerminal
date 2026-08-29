@@ -16,6 +16,7 @@ use gpui::{
     MouseUpEvent, Pixels, SharedString, Window,
 };
 
+use superterminal_core::activity::Activity;
 use superterminal_core::session::SessionManager;
 
 use crate::buddy_pet::Companion;
@@ -245,9 +246,9 @@ pub struct Workspace {
     file_viewer: Option<Entity<crate::file_viewer::FileViewer>>,
     sidebar_open: bool,
     sidebar_view: SidebarView,
-    /// (cwd, busy) per terminal for the projects view, refreshed on the
+    /// (cwd, activity) per terminal for the projects view, refreshed on the
     /// sidebar poll — rendering must never do per-pane process queries.
-    sidebar_status_cache: HashMap<String, (String, bool)>,
+    sidebar_status_cache: HashMap<String, (String, Activity)>,
     /// Projects collapsed in the sidebar (by tab id).
     collapsed_projects: std::collections::HashSet<String>,
     /// Per-terminal cue gates (bell → Ping, long-job finish → Glass).
@@ -468,18 +469,10 @@ impl Workspace {
         let mut cue_kinds: Vec<&'static str> = Vec::new();
         let mut focused_long_job = false;
         for (id, pane) in &self.panes {
-            let (busy, bell) =
-                pane.update(cx, |pane, _| (pane.foreground_busy(), pane.take_bell()));
+            let (activity, bell) =
+                pane.update(cx, |pane, _| (pane.foreground_activity(), pane.take_bell()));
             let gate = self.cue_gates.entry(id.clone()).or_default();
-            let outcome = gate.tick(
-                now,
-                if busy {
-                    superterminal_core::activity::Activity::Busy
-                } else {
-                    superterminal_core::activity::Activity::Idle
-                },
-                bell && audio_on,
-            );
+            let outcome = gate.tick(now, activity, bell && audio_on);
             if outcome.long_job_finished {
                 if self.focused_terminal.as_ref() == Some(id) {
                     focused_long_job = true;
@@ -646,19 +639,19 @@ impl Workspace {
         // skipped entirely while the setting is off). The hold machine keeps
         // a 10s idle grace so back-to-back commands don't flap caffeinate.
         if self.pet_tick_count.is_multiple_of(3) {
-            let any_busy = self.settings.auto_caffeinate
-                && self
-                    .panes
-                    .values()
-                    .any(|pane| pane.read(cx).foreground_busy());
+            let activity = if self.settings.auto_caffeinate {
+                Activity::aggregate(
+                    self.panes
+                        .values()
+                        .map(|pane| pane.read(cx).foreground_activity()),
+                )
+            } else {
+                Activity::Idle
+            };
             let was_held = self.caffeinate_child.is_some();
             self.awake.tick(
                 self.settings.auto_caffeinate,
-                if any_busy {
-                    superterminal_core::activity::Activity::Busy
-                } else {
-                    superterminal_core::activity::Activity::Idle
-                },
+                activity,
                 std::time::Instant::now(),
             );
             self.sync_caffeinate();
@@ -761,9 +754,9 @@ impl Workspace {
                     .panes
                     .iter()
                     .map(|(id, pane)| {
-                        let (cwd, busy) = pane.read(cx).status();
+                        let (cwd, activity) = pane.read(cx).status_activity();
                         let cwd = cwd.map(|cwd| cwd.replace(&home, "~")).unwrap_or_default();
-                        (id.clone(), (cwd, busy))
+                        (id.clone(), (cwd, activity))
                     })
                     .collect();
                 cx.notify();
@@ -1792,11 +1785,11 @@ impl Workspace {
                     let pane_ref = pane.read(cx);
                     let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
                     let title = pane_ref.title();
-                    let (cwd, busy) = self
+                    let (cwd, activity) = self
                         .sidebar_status_cache
                         .get(&terminal_id)
                         .cloned()
-                        .unwrap_or_default();
+                        .unwrap_or((String::new(), Activity::Idle));
                     let cwd: SharedString = cwd.into();
                     // Quick status dot, Orca-style. tcgetpgrp alone can't
                     // tell "computing" from "interactive program awaiting
@@ -1806,15 +1799,18 @@ impl Workspace {
                     //   green  = shell prompt, ready for commands
                     //   yellow = foreground job producing output (working)
                     //   cyan   = foreground job quiet - awaiting input
+                    //   hollow = no trustworthy signal (Unknown; remote
+                    //            panes in a later slice — unreachable for
+                    //            local panes today)
                     let quiet =
                         pane_ref.last_activity.elapsed() >= std::time::Duration::from_secs(3);
-                    let dot_color = if !busy {
-                        theme.green
-                    } else if quiet {
-                        theme.cyan
-                    } else {
-                        theme.yellow
+                    let dot_color = match activity {
+                        Activity::Idle => theme.green,
+                        Activity::Busy if quiet => theme.cyan,
+                        Activity::Busy => theme.yellow,
+                        Activity::Unknown => theme.ui_text_muted,
                     };
+                    let dot_hollow = matches!(activity, Activity::Unknown);
                     let jump_id = terminal_id.clone();
                     rows.push(
                         div()
@@ -1835,7 +1831,8 @@ impl Workspace {
                                     .w(px(6.0))
                                     .h(px(6.0))
                                     .rounded(px(3.0))
-                                    .bg(rgb(dot_color)),
+                                    .when(dot_hollow, |d| d.border_1().border_color(rgb(dot_color)))
+                                    .when(!dot_hollow, |d| d.bg(rgb(dot_color))),
                             )
                             .child(
                                 div()
