@@ -536,15 +536,7 @@ impl TerminalPane {
         Activity::from_local_busy(self.companion_busy())
     }
 
-    /// (cwd, foreground-job-running) in one probe.
-    pub fn status(&self) -> (Option<String>, bool) {
-        self.session
-            .as_ref()
-            .map(|s| s.status())
-            .unwrap_or((None, false))
-    }
-
-    /// Tri-state form of [`Self::status`].
+    /// Tri-state (cwd, foreground-job-running) probe.
     pub fn status_activity(&self) -> (Option<String>, Activity) {
         match self.session.as_ref() {
             Some(session) => session.status_activity(),

@@ -203,6 +203,22 @@ fn play_sound(name: &str) -> Option<std::process::Child> {
         .ok()
 }
 
+/// Whether a picked LOCAL path may be typed into this pane.
+///
+/// Two independent guards. The activity check is the old best-effort race
+/// gate, tightened so `Unknown` never authorises. The target check does not
+/// depend on the activity signal being honest at all, which is what makes
+/// this safe once a remote host can report its own state.
+fn may_write_cd(target: &crate::hosts::Target, activity: Activity) -> bool {
+    target.is_local() && activity.is_idle()
+}
+
+/// Whether this pane gives the app a usable LOCAL directory: the gate for
+/// buddy repo probing and the focused-bar directory control.
+fn local_context_available(target: &crate::hosts::Target, cwd: Option<String>) -> bool {
+    target.is_local() && cwd.is_some()
+}
+
 struct DragState {
     tab_index: usize,
     /// The window this drag started in — resizes must never follow an
@@ -787,7 +803,7 @@ impl Workspace {
     /// working diff, a review of a fresh commit, or an in-character reaction
     /// to a finished job.
     fn buddy_tick(&mut self, cx: &mut Context<Self>) {
-        use superterminal_core::buddy_gate::{ProbeResult, Trigger, Utterance};
+        use superterminal_core::buddy_gate::{Trigger, Utterance};
         if !self.settings.buddy_enabled || self.settings.buddy_command.trim().is_empty() {
             return;
         }
@@ -799,35 +815,35 @@ impl Workspace {
         let Some(pane) = focused_id.as_ref().and_then(|id| self.panes.get(id)) else {
             return;
         };
-        let (quiet, cwd, text) = {
+        let (quiet, cwd, target, text) = {
             let pane_ref = pane.read(cx);
             // Quiet = no PTY output AND no keystrokes for 3s. The input clock
             // covers echo-less typing (password prompts) that the output
             // clock cannot see.
             let quiet = pane_ref.last_activity.elapsed() >= Duration::from_secs(3)
                 && pane_ref.last_input.elapsed() >= Duration::from_secs(3);
-            (quiet, pane_ref.cwd(), pane_ref.visible_text())
+            (
+                quiet,
+                pane_ref.cwd(),
+                pane_ref.target().clone(),
+                pane_ref.visible_text(),
+            )
         };
         // Observation never stops for an in-flight utterance; probes are
         // single-flight on their own (one can outlive several ticks on a
         // slow repo; the gate drops stale generations).
-        if quiet {
+        //
+        // A remote pane has no local repo to probe: skip entirely rather
+        // than probing the Mac's tree while the user is on another host,
+        // which would produce confidently wrong buddy notes.
+        if quiet && local_context_available(&target, cwd.clone()) {
             if let Some(generation) = self.buddy_gate.want_probe() {
+                let cwd = cwd.expect("local_context_available guarantees a cwd");
                 cx.spawn(async move |ws, cx| {
                     let result = cx
                         .background_executor()
                         .spawn(async move {
-                            match cwd {
-                                Some(cwd) => superterminal_core::buddy_probe::observe(
-                                    std::path::Path::new(&cwd),
-                                ),
-                                None => ProbeResult {
-                                    repo_root: None,
-                                    head: None,
-                                    head_committed: false,
-                                    snapshot_hash: None,
-                                },
-                            }
+                            superterminal_core::buddy_probe::observe(std::path::Path::new(&cwd))
                         })
                         .await;
                     let _ = ws.update(cx, |ws: &mut Workspace, cx| {
@@ -2090,27 +2106,40 @@ impl Workspace {
                 .await;
             let _ = ws.update_in(cx, |ws: &mut Workspace, window, cx| {
                 let Some(path) = picked else { return };
+                // Focus can change while the native dialog was open, so the
+                // guard is re-checked here rather than trusted from before
+                // the await.
                 let focused = ws
                     .focused_terminal
                     .as_ref()
                     .and_then(|id| ws.panes.get(id))
                     .cloned();
                 match focused {
-                    Some(pane) if pane.read(cx).has_live_shell() && !pane.read(cx).status().1 => {
+                    Some(pane)
+                        if pane.read(cx).has_live_shell()
+                            && may_write_cd(
+                                pane.read(cx).target(),
+                                pane.read(cx).foreground_activity(),
+                            ) =>
+                    {
                         // Shell at its prompt: Ctrl+U first, so any
                         // half-typed input is cleared instead of being
                         // SUBMITTED with the cd appended; then a plain cd,
                         // single-quoted with the POSIX '\'' escape.
-                        // Best-effort: a job starting between the busy probe
+                        // Best-effort: a job starting between the idle probe
                         // and this write can still receive the text — full
                         // certainty needs shell integration.
                         let quoted = path.replace('\'', "'\\''");
                         pane.read(cx).send_text(&format!("\u{15}cd '{quoted}'\r"));
                         ws.focus_active_pane(window, cx);
                     }
+                    Some(pane) if !pane.read(cx).target().is_local() => {
+                        // A remote focused pane must never fall through to
+                        // opening a new LOCAL window at the picked path.
+                    }
                     _ => {
-                        // Busy (or no) terminal: open a new window in the
-                        // current project at that directory.
+                        // Busy (or no) local terminal: open a new window in
+                        // the current project at that directory.
                         let index = ws.active_tab;
                         if index < ws.tabs.len() {
                             ws.new_window(index, Some(PathBuf::from(path)), cx);
@@ -2675,7 +2704,9 @@ impl Workspace {
         let focused = self.focused_terminal.clone()?;
         let pane = self.panes.get(&focused)?;
         let title = pane.read(cx).title();
+        let target = pane.read(cx).target().clone();
         let cwd = pane.read(cx).cwd();
+        let has_local_dir = local_context_available(&target, cwd.clone());
         Some(
             div()
                 .flex()
@@ -2686,17 +2717,23 @@ impl Workspace {
                 .text_color(rgb(theme.ui_text_muted))
                 .child(SharedString::from(title))
                 .child({
-                    // Directory control: shows the focused terminal's cwd and
+                    // Directory control: for a local pane, shows the cwd and
                     // opens a folder picker (new tab at the chosen folder).
-                    let display: SharedString = match &cwd {
-                        Some(cwd) => cwd
+                    // A remote pane has no local directory to show or move
+                    // — the control is disabled rather than silently
+                    // opening a new LOCAL window at a picked path.
+                    let display: SharedString = if has_local_dir {
+                        cwd.expect("has_local_dir guarantees a cwd")
                             .replace(&std::env::var("HOME").unwrap_or_default(), "~")
-                            .into(),
-                        None => "choose folder".into(),
+                            .into()
+                    } else {
+                        match &target {
+                            crate::hosts::Target::Local => "choose folder".into(),
+                            crate::hosts::Target::Remote(id) => self.profile_label(id).into(),
+                        }
                     };
-                    div()
+                    let control = div()
                         .id("bar-cwd")
-                        .cursor_pointer()
                         .max_w(px(280.0))
                         .px(px(6.0))
                         .rounded(px(4.0))
@@ -2706,13 +2743,19 @@ impl Workspace {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .text_color(rgb(theme.ui_accent))
-                        .hover(|style| style.border_color(rgb(theme.ui_accent)))
-                        .child(SharedString::from(format!("dir: {display}")))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|ws, _, window, cx| ws.open_folder(window, cx)),
-                        )
+                        .child(SharedString::from(format!("dir: {display}")));
+                    if target.is_local() {
+                        control
+                            .cursor_pointer()
+                            .text_color(rgb(theme.ui_accent))
+                            .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|ws, _, window, cx| ws.open_folder(window, cx)),
+                            )
+                    } else {
+                        control.text_color(rgb(theme.ui_text_muted))
+                    }
                 })
                 .children(self.swap_source.is_some().then(|| {
                     div()
@@ -4166,6 +4209,7 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosts::{ProfileId, Target};
 
     #[test]
     fn only_the_helper_assigns_focus() {
@@ -4271,5 +4315,51 @@ mod tests {
         assert!(!neutralize_say_commands("[[[[volm 1]]").contains("[["));
         assert!(!neutralize_say_commands("[[[").contains("[["));
         assert_eq!(neutralize_say_commands("plain [text]"), "plain [text]");
+    }
+
+    #[test]
+    fn the_folder_picker_refuses_a_remote_pane_even_when_idle() {
+        // Two independent guards. This one does not trust the activity
+        // signal at all, so a forged remote report cannot defeat it.
+        assert!(!may_write_cd(
+            &Target::Remote(ProfileId("p1".into())),
+            Activity::Idle
+        ));
+        assert!(!may_write_cd(
+            &Target::Remote(ProfileId("p1".into())),
+            Activity::Busy
+        ));
+        assert!(!may_write_cd(
+            &Target::Remote(ProfileId("p1".into())),
+            Activity::Unknown
+        ));
+    }
+
+    #[test]
+    fn the_folder_picker_requires_a_positively_idle_local_pane() {
+        assert!(may_write_cd(&Target::Local, Activity::Idle));
+        assert!(!may_write_cd(&Target::Local, Activity::Busy));
+        assert!(
+            !may_write_cd(&Target::Local, Activity::Unknown),
+            "Unknown must never authorise a write"
+        );
+    }
+
+    #[test]
+    fn a_remote_pane_offers_no_local_directory_context() {
+        // Buddy probing and the focused-bar control both key off this.
+        assert!(!local_context_available(
+            &Target::Remote(ProfileId("p1".into())),
+            None
+        ));
+        assert!(!local_context_available(
+            &Target::Remote(ProfileId("p1".into())),
+            Some("/tmp/repo".to_string())
+        ));
+        assert!(local_context_available(
+            &Target::Local,
+            Some("/tmp/repo".to_string())
+        ));
+        assert!(!local_context_available(&Target::Local, None));
     }
 }
