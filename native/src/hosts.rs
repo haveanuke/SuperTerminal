@@ -95,6 +95,52 @@ pub fn resolve_target<'a>(target: &Target, profiles: &'a [RemoteProfile]) -> Res
     }
 }
 
+/// What a side panel (git, files) is pointed at. `Detached` is "nothing
+/// focused, or the focused pane has no cwd yet"; `Remote` is "the focused
+/// pane is on another host", which this slice renders as disabled rather
+/// than remoting. Unlike the old `Option<cwd>` panel setters — which
+/// treated `None` as "do nothing" and left the previous target's data live
+/// and actionable — every panel target change goes through here and is
+/// always applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PanelTarget {
+    Local(std::path::PathBuf),
+    Remote(String),
+    Detached,
+}
+
+impl PanelTarget {
+    /// The ONLY way a panel target is derived. A remote pane can never
+    /// produce a local path, regardless of what cwd it reports.
+    pub fn from_pane(target: &Target, cwd: Option<String>, label: &str) -> PanelTarget {
+        match target {
+            Target::Remote(_) => PanelTarget::Remote(label.to_string()),
+            Target::Local => match cwd {
+                Some(cwd) => PanelTarget::Local(cwd.into()),
+                None => PanelTarget::Detached,
+            },
+        }
+    }
+
+    pub fn local_path(&self) -> Option<&std::path::Path> {
+        match self {
+            PanelTarget::Local(path) => Some(path.as_path()),
+            _ => None,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, PanelTarget::Local(_))
+    }
+}
+
+/// Whether an async completion still owns the panel. Checked BEFORE any
+/// field is written, `busy` included — a stale completion from a target
+/// that has since been switched away from must not touch panel state.
+pub fn accepts_completion(current: u64, token: u64) -> bool {
+    current == token
+}
+
 #[derive(Debug, PartialEq)]
 pub enum DestinationError {
     Empty,
@@ -337,6 +383,38 @@ mod tests {
         );
         // The critical assertion: it is not Local.
         assert_ne!(resolve_target(&target, &profiles), ResolvedTarget::Local);
+    }
+
+    #[test]
+    fn a_local_pane_with_a_cwd_targets_that_path() {
+        let t = PanelTarget::from_pane(&Target::Local, Some("/tmp/repo".into()), "");
+        assert_eq!(t.local_path(), Some(std::path::Path::new("/tmp/repo")));
+    }
+
+    #[test]
+    fn a_local_pane_without_a_cwd_detaches() {
+        let t = PanelTarget::from_pane(&Target::Local, None, "");
+        assert_eq!(t, PanelTarget::Detached);
+        assert_eq!(t.local_path(), None);
+    }
+
+    #[test]
+    fn a_remote_pane_never_yields_a_local_path() {
+        // Even if a cwd string is somehow present, a remote pane must not
+        // hand the panels a local path to act on.
+        let remote = Target::Remote(ProfileId("p1".into()));
+        let t = PanelTarget::from_pane(&remote, Some("/tmp/repo".into()), "pc1");
+        assert_eq!(t, PanelTarget::Remote("pc1".to_string()));
+        assert_eq!(t.local_path(), None, "remote pane leaked a local path");
+    }
+
+    #[test]
+    fn a_stale_token_is_refused_and_the_current_one_accepted() {
+        // git_panel.rs:354 clears `busy` BEFORE checking generation, so a
+        // completion from a previous target could unbusy the new one.
+        assert!(!accepts_completion(7, 6), "stale token accepted");
+        assert!(!accepts_completion(7, 8), "future token accepted");
+        assert!(accepts_completion(7, 7));
     }
 
     #[test]

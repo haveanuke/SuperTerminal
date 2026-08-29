@@ -2126,20 +2126,45 @@ impl Workspace {
         .detach();
     }
 
-    /// Keep the git panel pointed at the focused terminal's directory.
+    /// Keep the git and files panels pointed at the focused terminal: a
+    /// local pane's cwd, or (once the focus is on another host) that
+    /// pane's remote label — never the previous pane's local path.
     fn push_git_cwd(&mut self, cx: &mut Context<Self>) {
-        let cwd = self
+        let focused = self
             .focused_terminal
             .as_ref()
             .and_then(|id| self.panes.get(id))
-            .and_then(|pane| pane.read(cx).cwd());
+            .cloned();
+        let panel_target = match &focused {
+            Some(pane) => {
+                let target = pane.read(cx).target().clone();
+                let cwd = pane.read(cx).cwd();
+                let label = match &target {
+                    crate::hosts::Target::Local => String::new(),
+                    crate::hosts::Target::Remote(_) => {
+                        let (profiles, _problems) = self.settings.profiles();
+                        match crate::hosts::resolve_target(&target, &profiles) {
+                            crate::hosts::ResolvedTarget::Remote(profile) => profile.label.clone(),
+                            crate::hosts::ResolvedTarget::MissingProfile(id) => {
+                                format!("missing host ({})", id.0)
+                            }
+                            crate::hosts::ResolvedTarget::Local => String::new(),
+                        }
+                    }
+                };
+                crate::hosts::PanelTarget::from_pane(&target, cwd, &label)
+            }
+            None => crate::hosts::PanelTarget::Detached,
+        };
         if let Some(panel) = self.git_panel.clone() {
             panel.update(cx, |panel, panel_cx| {
-                panel.set_target_cwd(cwd.clone(), panel_cx)
+                panel.set_target(panel_target.clone(), panel_cx)
             });
         }
         if let Some(panel) = self.files_panel.clone() {
-            panel.update(cx, |panel, panel_cx| panel.set_root(cwd, panel_cx));
+            panel.update(cx, |panel, panel_cx| {
+                panel.set_target(panel_target.clone(), panel_cx)
+            });
         }
     }
 

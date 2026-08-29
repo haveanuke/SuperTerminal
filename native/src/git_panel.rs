@@ -2,10 +2,11 @@
 //!
 //! Every git call shells out and can block, so all engine work runs on the
 //! background executor; the entity is updated from the async side. The panel
-//! follows the focused terminal's working directory (the workspace pushes
-//! cwd changes in via [`GitPanel::set_target_cwd`]).
+//! follows the focused terminal's target (the workspace pushes target
+//! changes in via [`GitPanel::set_target`]).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ use superterminal_core::git::graph::{CommitFileChange, GraphData};
 use superterminal_core::git::status::{StatusEntry, StatusReport};
 use superterminal_core::git::{self, GitState, RepoInfo};
 
+use crate::hosts::PanelTarget;
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::themes::Theme;
 
@@ -47,7 +49,7 @@ pub struct GitPanel {
     state: Arc<GitState>,
     theme: &'static Theme,
     repo: Option<RepoInfo>,
-    target_path: Option<String>,
+    target: PanelTarget,
     report: Option<StatusReport>,
     graph: Option<GraphData>,
     busy: bool,
@@ -115,7 +117,7 @@ impl GitPanel {
             state: Arc::new(GitState::default()),
             theme,
             repo: None,
-            target_path: None,
+            target: PanelTarget::Detached,
             report: None,
             graph: None,
             busy: false,
@@ -137,15 +139,42 @@ impl GitPanel {
         cx.notify();
     }
 
-    /// Follow the focused terminal: resolve its cwd to a repo (off-thread).
-    pub fn set_target_cwd(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
-        let Some(cwd) = cwd else { return };
-        if self.target_path.as_deref() == Some(cwd.as_str()) {
+    /// Point the panel at a new target. Unlike the old `Option<cwd>`
+    /// setter, which returned early on `None` and left the previous repo
+    /// live and actionable, this ALWAYS applies: Detached and Remote both
+    /// clear the panel out from under whatever was there before, including
+    /// any armed destructive action.
+    pub fn set_target(&mut self, target: PanelTarget, cx: &mut Context<Self>) {
+        if self.target == target {
             return;
         }
-        self.target_path = Some(cwd.clone());
+        self.generation = self.generation.wrapping_add(1);
+        self.busy = false;
+        self.clear_for_retarget();
+        self.target = target;
+        cx.notify();
+        if let PanelTarget::Local(path) = self.target.clone() {
+            self.resolve_repo(path, cx);
+        }
+    }
+
+    /// Reset everything that describes the previous target's repo. Called
+    /// on every target change so a Local -> Remote -> (same) Local detour
+    /// never resurrects stale status, diffs, or an armed discard.
+    fn clear_for_retarget(&mut self) {
+        self.repo = None;
+        self.report = None;
+        self.graph = None;
+        self.error = None;
+        self.pending_discard = None;
+        self.expanded.clear();
+        self.file_diffs.clear();
+    }
+
+    /// Resolve a local cwd to a repo (off-thread) and refresh once it lands.
+    fn resolve_repo(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let cwd = path.to_string_lossy().into_owned();
         let state = Arc::clone(&self.state);
-        self.generation += 1;
         let generation = self.generation;
         cx.spawn(async move |panel, cx| {
             let resolved = cx
@@ -153,21 +182,14 @@ impl GitPanel {
                 .spawn(async move { state.resolve(&cwd) })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation {
+                // A stale resolution from a target since switched away
+                // from must not write into the current one.
+                if !crate::hosts::accepts_completion(panel.generation, generation) {
                     return;
                 }
-                let changed = panel.repo.as_ref().map(|r| r.repo_id.clone())
-                    != resolved.as_ref().map(|r| r.repo_id.clone());
                 panel.repo = resolved;
-                if changed {
-                    panel.report = None;
-                    panel.graph = None;
-                    panel.pending_discard = None;
-                    panel.expanded.clear();
-                    panel.file_diffs.clear();
-                    panel.refresh_status(cx);
-                    panel.refresh_graph(cx);
-                }
+                panel.refresh_status(cx);
+                panel.refresh_graph(cx);
             });
             Ok::<(), ()>(())
         })
@@ -186,7 +208,7 @@ impl GitPanel {
                 .spawn(async move { git::status_guarded(&state, &repo.repo_id) })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation {
+                if !crate::hosts::accepts_completion(panel.generation, generation) {
                     return;
                 }
                 match result {
@@ -291,7 +313,9 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if panel.generation != generation || panel.graph_seq != seq {
+                if !crate::hosts::accepts_completion(panel.generation, generation)
+                    || panel.graph_seq != seq
+                {
                     return;
                 }
                 if let Ok(graph) = result {
@@ -305,6 +329,9 @@ impl GitPanel {
     }
 
     fn run(&mut self, op: GitOp, cx: &mut Context<Self>) {
+        if !self.target.is_local() {
+            return;
+        }
         let Some(repo) = self.repo.clone() else {
             return;
         };
@@ -352,10 +379,13 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                panel.busy = false;
-                if panel.generation != generation {
+                // Check the token BEFORE touching anything, `busy` included:
+                // a completion from a target since switched away from must
+                // not clear the busy flag of whatever is current now.
+                if !crate::hosts::accepts_completion(panel.generation, generation) {
                     return;
                 }
+                panel.busy = false;
                 match result {
                     Ok(action) => {
                         panel.report = Some(action.report);
@@ -394,7 +424,8 @@ impl GitPanel {
     /// the button and Enter in the field go through here, so the disabled
     /// look never lies.
     fn can_commit(&self, cx: &Context<Self>) -> bool {
-        !self.busy
+        self.target.is_local()
+            && !self.busy
             && !self.commit_field.read(cx).value.trim().is_empty()
             && self.report.as_ref().is_some_and(|r| {
                 r.entries
@@ -414,6 +445,9 @@ impl GitPanel {
     }
 
     fn toggle_commit(&mut self, hash: String, cx: &mut Context<Self>) {
+        if !self.target.is_local() {
+            return;
+        }
         if self.expanded.remove(&hash).is_some() {
             cx.notify();
             return;
@@ -423,6 +457,7 @@ impl GitPanel {
         let Some(repo) = self.repo.clone() else {
             return;
         };
+        let generation = self.generation;
         cx.notify();
         cx.spawn(async move |panel, cx| {
             let request_hash = hash.clone();
@@ -437,9 +472,13 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                // Attach only while the hash is still expanded. A repo change
-                // clears the map; per-hash file lists are immutable, so any
-                // surviving slot accepts the result safely.
+                // Check the token first, then attach only while the hash is
+                // still expanded. A repo change clears the map; per-hash
+                // file lists are immutable, so any surviving slot on the
+                // CURRENT target accepts the result safely.
+                if !crate::hosts::accepts_completion(panel.generation, generation) {
+                    return;
+                }
                 if let (Ok(files), Some(slot)) = (result, panel.expanded.get_mut(&hash)) {
                     *slot = Some(files);
                     cx.notify();
@@ -458,6 +497,9 @@ impl GitPanel {
         untracked: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.target.is_local() {
+            return;
+        }
         let key = (path.clone(), staged);
         if self.file_diffs.remove(&key).is_some() {
             cx.notify();
@@ -474,6 +516,9 @@ impl GitPanel {
         untracked: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.target.is_local() {
+            return;
+        }
         let key = (path.clone(), staged);
         if self.file_diffs.get(&key).is_some_and(|slot| slot.in_flight) {
             return;
@@ -619,7 +664,7 @@ impl GitPanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if !panel.busy {
+                    if panel.target.is_local() && !panel.busy {
                         panel.run(op.clone(), cx);
                     }
                 }),
@@ -655,7 +700,7 @@ impl GitPanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if !panel.busy {
+                    if panel.target.is_local() && !panel.busy {
                         panel.run(op.clone(), cx);
                     }
                 }),
@@ -710,7 +755,7 @@ impl GitPanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if panel.busy {
+                    if !panel.target.is_local() || panel.busy {
                         return;
                     }
                     if panel.pending_discard.as_ref() == Some(&target) {
@@ -1224,14 +1269,20 @@ impl Render for GitPanel {
             .text_color(rgb(theme.ui_text));
 
         let Some(repo) = self.repo.clone() else {
+            let message: SharedString = match &self.target {
+                PanelTarget::Local(path) => {
+                    format!("not a git repository: {}", path.display()).into()
+                }
+                PanelTarget::Remote(label) => {
+                    format!("{label}: remote git panel not available in this release").into()
+                }
+                PanelTarget::Detached => "focus a terminal inside a repository".into(),
+            };
             return base.child(
                 div()
                     .p(px(12.0))
                     .text_color(rgb(theme.ui_text_muted))
-                    .child(match &self.target_path {
-                        Some(path) => SharedString::from(format!("not a git repository: {path}")),
-                        None => "focus a terminal inside a repository".into(),
-                    }),
+                    .child(message),
             );
         };
 

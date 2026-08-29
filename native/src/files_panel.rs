@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use gpui::prelude::*;
 use gpui::{div, px, rgb, Context, SharedString, Window};
 
+use crate::hosts::PanelTarget;
 use crate::themes::Theme;
 
 /// Cap per directory so a node_modules can't flood the panel.
@@ -37,7 +38,7 @@ impl gpui::EventEmitter<OpenFile> for FilesPanel {}
 
 pub struct FilesPanel {
     theme: &'static Theme,
-    root: Option<PathBuf>,
+    target: PanelTarget,
     listings: HashMap<PathBuf, DirListing>,
     expanded: HashSet<PathBuf>,
     /// Bumped whenever the tree resets (root change, refresh); results from
@@ -81,7 +82,7 @@ impl FilesPanel {
     pub fn new(theme: &'static Theme, _cx: &mut Context<Self>) -> Self {
         Self {
             theme,
-            root: None,
+            target: PanelTarget::Detached,
             listings: HashMap::new(),
             expanded: HashSet::new(),
             root_gen: 0,
@@ -95,28 +96,34 @@ impl FilesPanel {
         cx.notify();
     }
 
-    /// Follow the focused terminal's cwd; a new root resets the tree.
-    pub fn set_root(&mut self, cwd: Option<String>, cx: &mut Context<Self>) {
-        let Some(cwd) = cwd.map(PathBuf::from) else {
-            return;
-        };
-        if self.root.as_ref() == Some(&cwd) {
+    /// Point the panel at a new target. Unlike the old `Option<cwd>`
+    /// setter, which returned early on `None` and left the previous tree
+    /// live and browsable, this ALWAYS applies: Detached and Remote both
+    /// reset the tree instead of leaving the previous root's listing up.
+    pub fn set_target(&mut self, target: PanelTarget, cx: &mut Context<Self>) {
+        if self.target == target {
             return;
         }
-        self.root = Some(cwd.clone());
+        self.target = target;
         self.listings.clear();
         self.expanded.clear();
         self.load_tokens.clear();
-        self.root_gen += 1;
-        self.load_dir(cwd, cx);
+        self.root_gen = self.root_gen.wrapping_add(1);
+        cx.notify();
+        if let PanelTarget::Local(path) = self.target.clone() {
+            self.load_dir(path, cx);
+        }
     }
 
     /// Re-list the root and every expanded directory.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.target.is_local() {
+            return;
+        }
         self.listings.clear();
         self.load_tokens.clear();
-        self.root_gen += 1;
-        if let Some(root) = self.root.clone() {
+        self.root_gen = self.root_gen.wrapping_add(1);
+        if let Some(root) = self.target.local_path().map(Path::to_path_buf) {
             self.load_dir(root, cx);
         }
         for dir in self.expanded.clone() {
@@ -149,6 +156,9 @@ impl FilesPanel {
     }
 
     fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.target.is_local() {
+            return;
+        }
         if self.expanded.remove(&path) {
             cx.notify();
             return;
@@ -277,12 +287,18 @@ impl Render for FilesPanel {
             .text_size(px(11.0))
             .text_color(rgb(theme.ui_text));
 
-        let Some(root) = self.root.clone() else {
+        let Some(root) = self.target.local_path().map(Path::to_path_buf) else {
+            let message: SharedString = match &self.target {
+                PanelTarget::Remote(label) => {
+                    format!("{label}: remote file browser not available in this release").into()
+                }
+                _ => "focus a terminal to browse its directory".into(),
+            };
             return base.child(
                 div()
                     .p(px(12.0))
                     .text_color(rgb(theme.ui_text_muted))
-                    .child("focus a terminal to browse its directory"),
+                    .child(message),
             );
         };
 
