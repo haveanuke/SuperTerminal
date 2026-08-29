@@ -197,6 +197,22 @@ pub fn panel_actionable(busy: bool, unresolved: bool) -> bool {
     !busy && !unresolved
 }
 
+/// Whether a repo-SCOPED async completion still belongs to the repo it was
+/// started against. Repo-scoped work (a status, graph, commit-file, or
+/// file-diff load — anything that calls into git against a specific
+/// `repo.repo_id`) must check THIS, not `accepts_completion(generation, ..)`:
+/// the panel can move between repos while the work is in flight, and a
+/// `generation` bump does not imply the repo changed (a same-repo cwd move
+/// bumps `generation` too), nor does the absence of a bump imply it didn't
+/// (`GitPanel::set_target`'s deferred `Local -> Local` window leaves
+/// `generation` climbing while `self.repo` still points at the OLD repo).
+/// `current` is `panel.repo`'s id at completion time; `started_for` is the
+/// id captured before the async work was spawned. `None` (no repo, e.g. the
+/// panel went Remote/Detached in the meantime) never accepts.
+pub fn still_on_repo(current: Option<&str>, started_for: &str) -> bool {
+    current == Some(started_for)
+}
+
 #[derive(Debug, PartialEq)]
 pub enum DestinationError {
     Empty,
@@ -595,6 +611,37 @@ mod tests {
             accepts_completion(current_generation, second_move_token),
             "the latest resolve must still be accepted"
         );
+    }
+
+    #[test]
+    fn still_on_repo_accepts_only_the_same_id() {
+        assert!(
+            still_on_repo(Some("repo-a"), "repo-a"),
+            "same repo id must be accepted"
+        );
+        assert!(
+            !still_on_repo(Some("repo-b"), "repo-a"),
+            "a different repo id must be rejected"
+        );
+        assert!(
+            !still_on_repo(None, "repo-a"),
+            "no current repo (Remote/Detached, or retargeted away) must be rejected"
+        );
+    }
+
+    #[test]
+    fn still_on_repo_catches_the_refresh_status_race() {
+        // Models the race a reviewer found in `refresh_status`: an action
+        // starts against repo A, the panel `cd`s A -> B (a same-KIND move,
+        // so `generation` bumps but `self.repo` stays A until `resolve_repo`
+        // reports back), B's resolve lands first and sets `self.repo = B`,
+        // then A's stale status poll lands. `accepts_completion` on
+        // `generation` alone would wrongly accept it (nothing bumped
+        // `generation` again after the cwd move); `still_on_repo` must
+        // reject it because the panel is no longer on repo A.
+        let started_for = "repo-a";
+        let current_repo_after_move = Some("repo-b");
+        assert!(!still_on_repo(current_repo_after_move, started_for));
     }
 
     #[test]

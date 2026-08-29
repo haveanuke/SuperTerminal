@@ -251,6 +251,19 @@ impl GitPanel {
         self.file_diffs.clear();
     }
 
+    /// True when `self.repo` is still the repo `repo_id` names. Repo-SCOPED
+    /// async work (status, graph, commit-file, and file-diff loads) must
+    /// check this at completion, not `generation`: the panel can move
+    /// between repos while the work is in flight, and a `generation` bump
+    /// does not imply the repo changed (nor does its absence imply it
+    /// didn't — see the deferred cwd-move window documented on `unresolved`
+    /// and `set_target`). `resolve_repo` is the one exception: it is
+    /// target-scoped ("which target is this panel pointed at"), not
+    /// repo-scoped, so it keeps its `generation` guard.
+    fn still_on_repo(&self, repo_id: &str) -> bool {
+        crate::hosts::still_on_repo(self.repo.as_ref().map(|r| r.repo_id.as_str()), repo_id)
+    }
+
     /// Resolve a local cwd to a repo (off-thread) and refresh once it lands.
     ///
     /// `force_refresh` is set when the caller already ran
@@ -320,14 +333,16 @@ impl GitPanel {
             return;
         };
         let state = Arc::clone(&self.state);
-        let generation = self.generation;
+        // Repo-scoped: guard on repo IDENTITY at completion, not
+        // `generation` — see `still_on_repo`.
+        let repo_id = repo.repo_id.clone();
         cx.spawn(async move |panel, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { git::status_guarded(&state, &repo.repo_id) })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if !crate::hosts::accepts_completion(panel.generation, generation) {
+                if !panel.still_on_repo(&repo_id) {
                     return;
                 }
                 match result {
@@ -421,7 +436,10 @@ impl GitPanel {
             return;
         };
         let state = Arc::clone(&self.state);
-        let generation = self.generation;
+        // Repo-scoped: guard on repo IDENTITY at completion, not
+        // `generation` — see `still_on_repo`. `graph_seq` is a SEPARATE
+        // concern (ordering among requests for the same repo), kept as-is.
+        let repo_id = repo.repo_id.clone();
         self.graph_seq += 1;
         let seq = self.graph_seq;
         cx.spawn(async move |panel, cx| {
@@ -432,9 +450,7 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                if !crate::hosts::accepts_completion(panel.generation, generation)
-                    || panel.graph_seq != seq
-                {
+                if !panel.still_on_repo(&repo_id) || panel.graph_seq != seq {
                     return;
                 }
                 if let Ok(graph) = result {
@@ -594,7 +610,9 @@ impl GitPanel {
         let Some(repo) = self.repo.clone() else {
             return;
         };
-        let generation = self.generation;
+        // Repo-scoped: guard on repo IDENTITY at completion, not
+        // `generation` — see `still_on_repo`.
+        let repo_id = repo.repo_id.clone();
         cx.notify();
         cx.spawn(async move |panel, cx| {
             let request_hash = hash.clone();
@@ -609,11 +627,11 @@ impl GitPanel {
                 })
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
-                // Check the token first, then attach only while the hash is
-                // still expanded. A repo change clears the map; per-hash
-                // file lists are immutable, so any surviving slot on the
-                // CURRENT target accepts the result safely.
-                if !crate::hosts::accepts_completion(panel.generation, generation) {
+                // Check repo identity first, then attach only while the
+                // hash is still expanded. A repo change clears the map;
+                // per-hash file lists are immutable, so any surviving slot
+                // on the CURRENT repo accepts the result safely.
+                if !panel.still_on_repo(&repo_id) {
                     return;
                 }
                 if let (Ok(files), Some(slot)) = (result, panel.expanded.get_mut(&hash)) {
@@ -704,8 +722,9 @@ impl GitPanel {
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
                 // Repo IDENTITY is the invariant (a same-repo cwd change
-                // bumps `generation` but must not strand this result).
-                if panel.repo.as_ref().map(|r| r.repo_id.as_str()) != Some(repo_id.as_str()) {
+                // bumps `generation` but must not strand this result) —
+                // see `still_on_repo`.
+                if !panel.still_on_repo(&repo_id) {
                     return;
                 }
                 if let Some(slot) = panel.file_diffs.get_mut(&key) {
