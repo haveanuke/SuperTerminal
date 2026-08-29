@@ -53,6 +53,22 @@ pub struct GitPanel {
     report: Option<StatusReport>,
     graph: Option<GraphData>,
     busy: bool,
+    /// Set the instant `set_target` defers a same-kind `Local -> Local`
+    /// cwd move to `resolve_repo` (the panel does not yet know whether it
+    /// landed in the same repo or a different one); cleared the instant
+    /// that specific `resolve_repo` call lands, either outcome. A kind
+    /// change clears it synchronously too — that path already wipes
+    /// `repo` to `None`, which independently blocks everything below.
+    ///
+    /// This is a bit deliberately SEPARATE from `busy`: `repo_generation`
+    /// (what gates whether an action's completion is trusted) does not
+    /// bump across a same-repo cwd move, so a completion for an action
+    /// started before the move can still land with a current token while
+    /// this is true. `crate::hosts::panel_actionable` combines both bits;
+    /// every place that starts a new action, or renders a control that
+    /// would, checks it (directly, or via `run`, which does) rather than
+    /// checking `busy` alone.
+    unresolved: bool,
     error: Option<String>,
     commit_field: Entity<TextField>,
     /// Monotonic guard for "which target do UI completions belong to":
@@ -133,6 +149,7 @@ impl GitPanel {
             report: None,
             graph: None,
             busy: false,
+            unresolved: false,
             error: None,
             commit_field,
             generation: 0,
@@ -175,6 +192,15 @@ impl GitPanel {
     /// same-kind case: if the newly resolved repo identity turns out to
     /// differ anyway, it bumps `repo_generation` and clears `busy` itself
     /// once that's known, rather than this duplicating the comparison.
+    ///
+    /// That deferral leaves a window: `repo_generation` not bumping means
+    /// an action started before the cwd move can still complete with a
+    /// token that reads as current, while the panel does not yet know if
+    /// the move landed in the same repo. `unresolved` is the answer: set
+    /// here on the deferred path, it independently blocks `run` and every
+    /// actionable control until `resolve_repo` reports back (see the
+    /// field doc and `crate::hosts::panel_actionable`) — a current
+    /// `repo_generation` token alone is never enough on its own.
     pub fn set_target(&mut self, target: PanelTarget, cx: &mut Context<Self>) {
         if self.target == target {
             return;
@@ -184,6 +210,14 @@ impl GitPanel {
         if kind_changed {
             self.retire_busy_operation();
             self.clear_for_retarget();
+            self.unresolved = false;
+        } else {
+            // Deferred Local -> Local cwd move: whether this is the same
+            // repo or a different one is unknown until `resolve_repo`
+            // (spawned below) reports back. Until then the panel must not
+            // be actionable — see the `unresolved` field doc and
+            // `crate::hosts::panel_actionable`.
+            self.unresolved = true;
         }
         self.target = target;
         cx.notify();
@@ -237,10 +271,19 @@ impl GitPanel {
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
                 // A stale resolution from a target since switched away
-                // from must not write into the current one.
+                // from must not write into the current one. This gate is
+                // also what makes clearing `unresolved` below safe against
+                // two quick cwd moves: only the resolve whose token still
+                // matches the CURRENT generation gets past it, so a stale
+                // resolve for a superseded move can never clear a newer
+                // unresolved state.
                 if !crate::hosts::accepts_completion(panel.generation, generation) {
                     return;
                 }
+                // This resolve is for the current target (the gate above),
+                // so it authoritatively answers "same repo or different" —
+                // clear the pending state regardless of which way it lands.
+                panel.unresolved = false;
                 let changed = force_refresh
                     || panel.repo.as_ref().map(|r| &r.repo_id)
                         != resolved.as_ref().map(|r| &r.repo_id);
@@ -411,7 +454,10 @@ impl GitPanel {
         let Some(repo) = self.repo.clone() else {
             return;
         };
-        if self.busy {
+        // Refuses while `unresolved`, not just `busy`: a same-repo cwd
+        // move mid-action leaves `busy` meaningful but the panel does not
+        // yet know which repo it is pointed at — see the field docs.
+        if !crate::hosts::panel_actionable(self.busy, self.unresolved) {
             return;
         }
         self.busy = true;
@@ -465,6 +511,17 @@ impl GitPanel {
                 if !crate::hosts::accepts_completion(panel.repo_generation, generation) {
                     return;
                 }
+                // Still writes `busy = false` and the result here even if
+                // `unresolved` is currently true: the process really did
+                // finish, and `busy` must stay a truthful "is something
+                // running" bit rather than getting wedged `true` forever
+                // over a repo that turned out to be the same one (the
+                // exact same-repo `cd` case this deferral protects). That
+                // is safe to do unconditionally because `unresolved` gates
+                // `run` and every actionable control INDEPENDENTLY of
+                // `busy` (see `crate::hosts::panel_actionable`) — clearing
+                // `busy` here does not, by itself, unblock anything while
+                // the panel still doesn't know which repo it is pointed at.
                 panel.busy = false;
                 match result {
                     Ok(action) => {
@@ -505,7 +562,7 @@ impl GitPanel {
     /// look never lies.
     fn can_commit(&self, cx: &Context<Self>) -> bool {
         self.target.is_local()
-            && !self.busy
+            && crate::hosts::panel_actionable(self.busy, self.unresolved)
             && !self.commit_field.read(cx).value.trim().is_empty()
             && self.report.as_ref().is_some_and(|r| {
                 r.entries
@@ -725,7 +782,7 @@ impl GitPanel {
     /// Bordered chip for header actions (fetch/pull/push/publish, bulk ops).
     fn chip(&self, label: &'static str, op: GitOp, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let disabled = self.busy;
+        let disabled = !crate::hosts::panel_actionable(self.busy, self.unresolved);
         div()
             .id(SharedString::from(format!("git-chip-{label}")))
             .cursor_pointer()
@@ -744,7 +801,9 @@ impl GitPanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if panel.target.is_local() && !panel.busy {
+                    if panel.target.is_local()
+                        && crate::hosts::panel_actionable(panel.busy, panel.unresolved)
+                    {
                         panel.run(op.clone(), cx);
                     }
                 }),
@@ -780,7 +839,9 @@ impl GitPanel {
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if panel.target.is_local() && !panel.busy {
+                    if panel.target.is_local()
+                        && crate::hosts::panel_actionable(panel.busy, panel.unresolved)
+                    {
                         panel.run(op.clone(), cx);
                     }
                 }),
@@ -796,7 +857,11 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = self.theme;
-        let armed = self.pending_discard.as_ref() == Some(&target);
+        // While unresolved (or busy), never show an armed confirm — a
+        // click cannot execute or re-arm it either (the click guard
+        // below), and the disabled look must not lie about that.
+        let disabled = !crate::hosts::panel_actionable(self.busy, self.unresolved);
+        let armed = !disabled && self.pending_discard.as_ref() == Some(&target);
         let id: SharedString = match &target {
             DiscardTarget::All => "git-discard-all".into(),
             DiscardTarget::Path(path) => format!("git-discard-{path}").into(),
@@ -829,13 +894,16 @@ impl GitPanel {
             } else {
                 theme.ui_text_muted
             }))
+            .opacity(if disabled { 0.4 } else { 1.0 })
             .hover(|style| style.bg(rgb(theme.ui_border)).text_color(rgb(theme.red)))
             .child(SharedString::from(label))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |panel, _, _, cx| {
                     cx.stop_propagation();
-                    if !panel.target.is_local() || panel.busy {
+                    if !panel.target.is_local()
+                        || !crate::hosts::panel_actionable(panel.busy, panel.unresolved)
+                    {
                         return;
                     }
                     if panel.pending_discard.as_ref() == Some(&target) {

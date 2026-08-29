@@ -177,6 +177,26 @@ pub fn accepts_completion(current: u64, token: u64) -> bool {
     current == token
 }
 
+/// Whether the git panel is safe to act on right now: not mid an
+/// operation, AND not mid resolving which repo a deferred `Local ->
+/// Local` cwd move actually landed in.
+///
+/// These are deliberately two independent bits, not one. `busy` and
+/// `unresolved` move on different clocks — `busy` follows the git
+/// process; `unresolved` follows repo-identity resolution — and an
+/// action's completion carrying a current `repo_generation` token is NOT
+/// sufficient to make the panel actionable on its own: `repo_generation`
+/// does not bump across a same-repo cwd move (see `GitPanel::set_target`),
+/// so a completion for an action started before the move can still read
+/// as current while the panel does not yet know whether the cwd move
+/// landed in the same repo or a different one. Gating on both bits here,
+/// at every place the panel decides whether to start or offer a new
+/// action, closes that window without needing the completion handler
+/// itself to know about `unresolved`.
+pub fn panel_actionable(busy: bool, unresolved: bool) -> bool {
+    !busy && !unresolved
+}
+
 #[derive(Debug, PartialEq)]
 pub enum DestinationError {
     Empty,
@@ -520,6 +540,61 @@ mod tests {
         assert!(!accepts_completion(7, 6), "stale token accepted");
         assert!(!accepts_completion(7, 8), "future token accepted");
         assert!(accepts_completion(7, 7));
+    }
+
+    #[test]
+    fn panel_actionable_requires_neither_busy_nor_unresolved() {
+        assert!(panel_actionable(false, false));
+        assert!(!panel_actionable(true, false), "busy alone must block");
+        assert!(
+            !panel_actionable(false, true),
+            "unresolved alone must block"
+        );
+        assert!(!panel_actionable(true, true));
+    }
+
+    #[test]
+    fn a_current_completion_token_is_not_enough_to_unblock_while_unresolved() {
+        // Models the race in GitPanel::run's completion handler: an action
+        // started against repo A, then a same-repo-kind `cd` to B leaves
+        // `repo_generation` UNCHANGED (by design — see `is_local_cwd_move`),
+        // so A's completion still carries a token that reads as current...
+        let repo_generation = 4;
+        let token = 4;
+        assert!(
+            accepts_completion(repo_generation, token),
+            "the completion's token reads as current"
+        );
+        // ...but a current token must not be sufficient on its own: while
+        // the panel is still resolving which repo the `cd` landed in, it
+        // must stay non-actionable regardless.
+        assert!(
+            !panel_actionable(false, true),
+            "a current token alone must not make the panel actionable while unresolved"
+        );
+    }
+
+    #[test]
+    fn a_stale_resolve_cannot_clear_a_newer_unresolved_state() {
+        // Models the guard in `GitPanel::resolve_repo`: two `Local -> Local`
+        // moves in quick succession each bump `generation` and spawn a
+        // resolve carrying that generation as its token. Only a resolve
+        // whose token still matches the CURRENT generation may act at all
+        // (accepts_completion gates the whole handler, `unresolved` included)
+        // — so the first move's now-stale resolve must be rejected once the
+        // second move has landed, leaving the newer unresolved state in
+        // place rather than being cleared by an outdated answer.
+        let first_move_token = 5;
+        let second_move_token = 6;
+        let current_generation = second_move_token;
+        assert!(
+            !accepts_completion(current_generation, first_move_token),
+            "the stale first resolve must be rejected, not clear `unresolved`"
+        );
+        assert!(
+            accepts_completion(current_generation, second_move_token),
+            "the latest resolve must still be accepted"
+        );
     }
 
     #[test]
