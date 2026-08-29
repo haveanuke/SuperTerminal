@@ -6,6 +6,7 @@ mod companion;
 mod file_viewer;
 mod files_panel;
 mod git_panel;
+mod hosts;
 mod icons;
 mod keys;
 mod layout;

@@ -50,6 +50,10 @@ pub struct Settings {
     /// Live Blender viewport tile in the phone gallery (captures via the
     /// blender-mcp addon on localhost, only while the phone is watching).
     pub blender_viewport: bool,
+    /// Raw, so a malformed entry can never fail whole-settings serde and
+    /// trip the `unwrap_or_default()` fallback at load.
+    #[serde(default)]
+    pub remote_profiles: serde_json::Value,
 }
 
 impl Default for Settings {
@@ -79,6 +83,7 @@ impl Default for Settings {
             custom_themes: Vec::new(),
             preview_dir: None,
             blender_viewport: false,
+            remote_profiles: serde_json::Value::Null,
         }
     }
 }
@@ -217,6 +222,16 @@ impl Settings {
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)
     }
+
+    /// Validated profiles plus anything that was rejected, for surfacing.
+    pub fn profiles(
+        &self,
+    ) -> (
+        Vec<crate::hosts::RemoteProfile>,
+        Vec<crate::hosts::ProfileProblem>,
+    ) {
+        crate::hosts::load_profiles(&self.remote_profiles)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +293,7 @@ mod tests {
             custom_themes: Vec::new(),
             preview_dir: Some("/tmp/renders".into()),
             blender_viewport: true,
+            remote_profiles: serde_json::Value::Null,
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
@@ -392,5 +408,24 @@ mod tests {
             !dir.exists(),
             "a vanished hand-picked folder stays vanished"
         );
+    }
+
+    #[test]
+    fn a_malformed_profile_does_not_reset_unrelated_settings() {
+        let dir = std::env::temp_dir().join(format!("st-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"audioCues":false,"remoteProfiles":[{"id":"x","label":"bad","destination":"a;id","os":"linux","shell":"bash"}]}"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(&path);
+        // The unrelated setting survives.
+        assert!(!settings.audio_cues);
+        let (ok, problems) = settings.profiles();
+        assert!(ok.is_empty());
+        assert_eq!(problems.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
