@@ -501,11 +501,15 @@ impl TerminalPane {
 
     /// Tri-state foreground probe: cues, `finished`, caffeinate, sidebar
     /// dots, and the folder-write guard all read THIS, not the boolean.
+    ///
+    /// With no session, the answer depends on `target`: a local pane with
+    /// no session is definitively `Idle` (the shell never started, or
+    /// exited); a remote pane with no session — e.g. a restored dead
+    /// `Target::Remote` pane, which has no telemetry — is `Unknown`. See
+    /// [`crate::hosts::pane_activity`].
     pub fn foreground_activity(&self) -> Activity {
-        match self.session.as_ref() {
-            Some(session) => session.foreground_activity(),
-            None => Activity::Idle,
-        }
+        let session_activity = self.session.as_ref().map(|s| s.foreground_activity());
+        crate::hosts::pane_activity(&self.target, session_activity)
     }
 
     /// The phone's busy dot. A foreground app alone is not "working" —
@@ -536,11 +540,13 @@ impl TerminalPane {
         Activity::from_local_busy(self.companion_busy())
     }
 
-    /// Tri-state (cwd, foreground-job-running) probe.
+    /// Tri-state (cwd, foreground-job-running) probe. With no session the
+    /// cwd is `None` either way; the activity half follows `target` — see
+    /// [`Self::foreground_activity`] and [`crate::hosts::pane_activity`].
     pub fn status_activity(&self) -> (Option<String>, Activity) {
         match self.session.as_ref() {
             Some(session) => session.status_activity(),
-            None => (None, Activity::Idle),
+            None => (None, crate::hosts::pane_activity(&self.target, None)),
         }
     }
 

@@ -55,8 +55,20 @@ pub struct GitPanel {
     busy: bool,
     error: Option<String>,
     commit_field: Entity<TextField>,
-    /// Monotonic guard: results only apply if the repo generation matches.
+    /// Monotonic guard for "which target do UI completions belong to":
+    /// bumped on EVERY target change, including a same-repo `cd`. Gates
+    /// resolve/status/graph/diff/expand completions so a result computed
+    /// for a cwd the panel has since moved away from never lands.
     generation: u64,
+    /// Monotonic guard for "is a git process's completion still trusted",
+    /// separate from `generation` on purpose: it must NOT bump on a
+    /// same-repo `cd` (a running process is still running), only when the
+    /// underlying repo identity actually changes — a target-kind change
+    /// (bumped synchronously in `set_target`) or a same-kind `Local` move
+    /// that `resolve_repo` discovers resolves to a different repo (bumped
+    /// there, once that's known). `run()` keys `busy`'s completion off
+    /// this, not `generation`.
+    repo_generation: u64,
     /// Monotonic guard for graph loads: an older in-flight request must not
     /// overwrite a newer one landing first.
     graph_seq: u64,
@@ -124,6 +136,7 @@ impl GitPanel {
             error: None,
             commit_field,
             generation: 0,
+            repo_generation: 0,
             graph_seq: 0,
             pending_discard: None,
             expanded: HashMap::new(),
@@ -151,14 +164,25 @@ impl GitPanel {
     /// it behaves like the pre-slice `set_target_cwd`, which only wiped
     /// once the resolved repo identity actually differed. Same-repo cwd
     /// churn is local behaviour this slice has no license to change.
+    ///
+    /// `generation` (which target UI completions belong to) always bumps
+    /// here, cwd move included. `repo_generation` (whether a running git
+    /// process's completion is still trusted) and `busy` only move on the
+    /// kind-change path: an in-flight action was started against a repo,
+    /// and a `cd` that stays inside that same repo doesn't stop it running
+    /// — clearing `busy` here would let a second destructive action fire
+    /// while the first is still executing. `resolve_repo` carries the
+    /// same-kind case: if the newly resolved repo identity turns out to
+    /// differ anyway, it bumps `repo_generation` and clears `busy` itself
+    /// once that's known, rather than this duplicating the comparison.
     pub fn set_target(&mut self, target: PanelTarget, cx: &mut Context<Self>) {
         if self.target == target {
             return;
         }
         let kind_changed = !crate::hosts::is_local_cwd_move(&self.target, &target);
         self.generation = self.generation.wrapping_add(1);
-        self.busy = false;
         if kind_changed {
+            self.retire_busy_operation();
             self.clear_for_retarget();
         }
         self.target = target;
@@ -166,6 +190,18 @@ impl GitPanel {
         if let PanelTarget::Local(path) = self.target.clone() {
             self.resolve_repo(path, kind_changed, cx);
         }
+    }
+
+    /// Retire the current busy git operation: bump `repo_generation` (so a
+    /// process still running belongs to a repo this panel no longer shows,
+    /// and its completion is discarded rather than clearing `busy` out from
+    /// under whatever runs next) and drop `busy` so the UI unblocks. Called
+    /// only where the repo identity is known to have actually changed —
+    /// never for cwd churn within the same repo, where a running process is
+    /// still running.
+    fn retire_busy_operation(&mut self) {
+        self.repo_generation = self.repo_generation.wrapping_add(1);
+        self.busy = false;
     }
 
     /// Reset everything that describes the previous target's repo. Called
@@ -208,6 +244,18 @@ impl GitPanel {
                 let changed = force_refresh
                     || panel.repo.as_ref().map(|r| &r.repo_id)
                         != resolved.as_ref().map(|r| &r.repo_id);
+                // A same-repo cwd move (`force_refresh` false) that turns
+                // out to resolve to a genuinely different repo is a real
+                // identity change, just discovered late instead of eagerly:
+                // bump `repo_generation` and drop `busy` now, so a process
+                // still running against the OLD repo can no longer land as
+                // this target's completion. A kind change already did this
+                // synchronously in `set_target` (`force_refresh` true); redoing
+                // it here would risk orphaning an op started against the
+                // new target in the meantime, since this runs async.
+                if changed && !force_refresh {
+                    panel.retire_busy_operation();
+                }
                 panel.repo = resolved;
                 if changed {
                     panel.report = None;
@@ -375,7 +423,9 @@ impl GitPanel {
             _ => None,
         };
         let state = Arc::clone(&self.state);
-        let generation = self.generation;
+        // Keyed off `repo_generation`, not `generation`: a same-repo cwd
+        // move must not orphan this op's completion (see the field docs).
+        let generation = self.repo_generation;
         cx.spawn(async move |panel, cx| {
             let result: Result<ActionResult, String> = cx
                 .background_executor()
@@ -408,9 +458,11 @@ impl GitPanel {
                 .await;
             let _ = panel.update(cx, |panel: &mut GitPanel, cx| {
                 // Check the token BEFORE touching anything, `busy` included:
-                // a completion from a target since switched away from must
-                // not clear the busy flag of whatever is current now.
-                if !crate::hosts::accepts_completion(panel.generation, generation) {
+                // a completion from a repo since switched away from must
+                // not clear the busy flag of whatever is current now. This
+                // is `repo_generation`, so a same-repo cwd move in the
+                // meantime does not orphan a still-valid, still-running op.
+                if !crate::hosts::accepts_completion(panel.repo_generation, generation) {
                     return;
                 }
                 panel.busy = false;

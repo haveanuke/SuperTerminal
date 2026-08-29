@@ -5,6 +5,7 @@
 //! cannot open one. See `docs/superpowers/specs/2026-08-28-remote-hosts-design.md`.
 
 use serde::{Deserialize, Serialize};
+use superterminal_core::activity::Activity;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProfileId(pub String);
@@ -72,6 +73,30 @@ impl Target {
             Target::Remote(id) => Some(id),
         }
     }
+}
+
+/// What `TerminalPane::foreground_activity`/`status_activity` report,
+/// given the pane's target and what its live session (if any) itself
+/// reports. `session_activity` is `None` exactly when `TerminalPane`'s
+/// `session` field is — no shell spawned, the shell exited, or (today,
+/// since this slice ships no remote capability) a restored `Target::Remote`
+/// pane built via `TerminalPane::dead`, which never has a session.
+///
+/// A local pane with no session is definitively idle: a shell that never
+/// started, or has exited, is not working — this is the pre-slice
+/// behaviour for every local pane, unchanged. A remote pane with no
+/// session carries no trustworthy signal about a machine this app is not
+/// talking to: `Unknown`, never `Idle`. That is the tri-state invariant
+/// this slice exists to hold — `Activity::Unknown` must never be treated
+/// as `Activity::Idle` — extended to cover the "no session at all" case
+/// that a bare `Option<cwd>`-shaped check would otherwise silently fold
+/// into local's answer.
+pub fn pane_activity(target: &Target, session_activity: Option<Activity>) -> Activity {
+    session_activity.unwrap_or(if target.is_local() {
+        Activity::Idle
+    } else {
+        Activity::Unknown
+    })
 }
 
 /// The outcome of resolving a saved `Target` against the currently loaded
@@ -440,6 +465,51 @@ mod tests {
         assert!(
             !is_local_cwd_move(&remote_a, &remote_b),
             "Remote -> Remote, different host"
+        );
+    }
+
+    #[test]
+    fn pane_activity_exhaustive_over_target_and_session() {
+        let local = Target::Local;
+        let remote = Target::Remote(ProfileId("host".into()));
+
+        // No session: the invariant under test. Local -> Idle (unchanged
+        // pre-slice behaviour: a shell that never started is not working).
+        // Remote -> Unknown, never Idle (no trustworthy signal about a
+        // machine this app isn't talking to yet) — this is what a restored
+        // dead `Target::Remote` pane (no session, no telemetry) reports.
+        assert_eq!(pane_activity(&local, None), Activity::Idle);
+        assert_eq!(pane_activity(&remote, None), Activity::Unknown);
+
+        // A live session's own answer always passes through untouched,
+        // regardless of target — the fallback only applies when there is
+        // no session to ask.
+        for session_activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
+            assert_eq!(
+                pane_activity(&local, Some(session_activity)),
+                session_activity
+            );
+            assert_eq!(
+                pane_activity(&remote, Some(session_activity)),
+                session_activity
+            );
+        }
+    }
+
+    #[test]
+    fn a_dead_remote_pane_and_an_idle_local_pane_aggregate_to_unknown() {
+        // Models the exact workspace `Activity::aggregate` call at
+        // workspace/mod.rs (auto-caffeinate) and the sidebar dots: one
+        // restored, unconnected `Target::Remote` pane (no session) beside
+        // one ordinary idle local pane. The dead remote pane's Unknown must
+        // survive the aggregate, not get folded into the local pane's Idle.
+        let dead_remote = pane_activity(&Target::Remote(ProfileId("host".into())), None);
+        let idle_local = pane_activity(&Target::Local, Some(Activity::Idle));
+        assert_eq!(dead_remote, Activity::Unknown);
+        assert_eq!(idle_local, Activity::Idle);
+        assert_eq!(
+            Activity::aggregate([dead_remote, idle_local].into_iter()),
+            Activity::Unknown
         );
     }
 

@@ -212,4 +212,32 @@ mod tests {
         assert!(hold.tick(true, Activity::Idle, base + Duration::from_secs(1)));
         assert!(!hold.tick(true, Activity::Idle, base + Duration::from_secs(120)));
     }
+
+    #[test]
+    fn a_dead_remote_pane_holds_auto_caffeinate_steady_through_aggregate() {
+        // End-to-end down the real path: workspace/mod.rs feeds
+        // `Activity::aggregate` over every pane's `foreground_activity`
+        // into this same `tick`. A restored, unconnected `Target::Remote`
+        // pane (no session) reports Unknown via `hosts::pane_activity`;
+        // aggregated alongside an ordinary idle local pane the workspace
+        // activity is still Unknown — and Unknown must neither acquire the
+        // auto hold from cold, nor release one already held.
+        use crate::hosts::{pane_activity, ProfileId, Target};
+
+        let dead_remote = pane_activity(&Target::Remote(ProfileId("host".into())), None);
+        let idle_local = pane_activity(&Target::Local, Some(Activity::Idle));
+        let workspace_activity = Activity::aggregate([dead_remote, idle_local].into_iter());
+        assert_eq!(workspace_activity, Activity::Unknown);
+
+        let base = Instant::now();
+
+        // From cold: must not acquire.
+        assert!(!AwakeHold::default().tick(true, workspace_activity, base));
+
+        // Already held (busy earlier): must not release, however long it
+        // persists.
+        let mut hold = AwakeHold::default();
+        assert!(hold.tick(true, Activity::Busy, base));
+        assert!(hold.tick(true, workspace_activity, base + Duration::from_secs(600)));
+    }
 }
