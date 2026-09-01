@@ -211,6 +211,34 @@ preserves unrelated `visible_to` state, or explicitly accept — and tell the
 user — that editing one peer's grants un-shares every session from every
 peer, not just the one being edited.
 
+## D3e. Phase C2 requirement: `BroadcastMap::share` is safe by accident, not by construction
+
+`BroadcastMap::share` takes an `id` and a `PeerId` and has no notion of `Target`.
+Phase C1 gated the SHARE affordance at both the render surface and
+`toggle_share` (`may_share_terminal`), and deliberately did not thread `Target`
+into `BroadcastMap` itself — the map is pure `id -> peers` bookkeeping, and
+duplicating a fact the `Workspace` already owns would introduce a staleness risk
+worse than the bypass it prevents. That reasoning is sound and the failure mode
+is bounded: `Hub::set_visible_to`, `may_touch` and `sessions_for` each
+independently refuse a non-`LocalPty` origin, so the worst case is a misleading
+UI state, never a leak.
+
+**But there is already a second writer that does not pass through
+`toggle_share`:** the peer-requested spawn at `workspace/mod.rs:766`. It is safe
+only because `spawn_pane` structurally cannot produce a non-local pane today —
+an invariant nothing encodes at the call site.
+
+Phase C2 introduces attached panes and is the phase most likely to give
+`spawn_pane` a `Target`. At that moment the accident stops holding and the
+bypass becomes reachable. Before that lands, either:
+
+- encode the invariant where it is relied upon (assert or type it at the spawn
+  call site), or
+- give `BroadcastMap` the origin fact and accept the duplication, having first
+  designed how it stays in step.
+
+Do not leave it true by coincidence once a second shape of pane exists.
+
 ## D4. Attached panes are never re-broadcast
 
 If both instances broadcast and both attach to each other, an unguarded
