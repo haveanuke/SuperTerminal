@@ -47,6 +47,23 @@ pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg_attr(not(test), allow(dead_code))]
 pub const STREAM_CLOSED_CLEANLY: &str = "stream closed before a frame arrived";
 
+/// The charset this codebase's own session ids use (`term-<n>`,
+/// `workspace/mod.rs`) plus nothing else -- ASCII alphanumerics and `-`,
+/// non-empty, capped well above any id this process would ever generate.
+/// `session_id` rides straight into an HTTP request line ([`open`]) and a
+/// request path (`attach::Attachment::send`) with no escaping, so anything
+/// outside this set -- a `\r` or `\n` above all -- is a header/request-line
+/// injection primitive, not merely a routing mistake (I2). Today
+/// `session_id` is always self-supplied, so this can never actually be
+/// tripped; the next phase reads it out of a peer's `/sessions` response
+/// instead, at which point REJECTING outright -- never sanitising -- is
+/// what keeps a forged id from planting an extra header in our own
+/// request.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// ROLLING budget for the established stream: healthy as long as
 /// SOMETHING -- a frame or a heartbeat -- arrives within the gap. Six
 /// seconds is three `SSE_HEARTBEAT` (2s) intervals: tight enough to notice
@@ -66,6 +83,19 @@ pub struct StreamConn {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl StreamConn {
+    /// A clone of the socket this connection is reading from. `shutdown`
+    /// on the clone affects the SAME underlying kernel socket `next_frame`
+    /// may be blocked reading from on another thread, waking that read
+    /// with a clean EOF. The only caller is `attach::Attachment`'s `Drop`
+    /// impl (C1): it is what lets a dropped `Attachment` interrupt a
+    /// heartbeat-only stream that would otherwise never return control on
+    /// its own -- `next_frame`'s timeout is per-syscall and a heartbeat
+    /// resets it, so a quiet peer that keeps sending them never lets a
+    /// blocking read time out by itself.
+    pub fn try_clone_socket(&mut self) -> std::io::Result<TcpStream> {
+        self.frames.get_mut().try_clone()
+    }
+
     /// Blocks until one complete snapshot arrives, silently consuming any
     /// number of heartbeats along the way (`sse::FrameReader` already skips
     /// them). `idle_gap` is applied as the socket's read timeout for this
@@ -108,6 +138,10 @@ pub fn open(
     session_id: &str,
     connect_deadline: Duration,
 ) -> Result<StreamConn, PeerError> {
+    if !is_valid_session_id(session_id) {
+        return Err(PeerError::BadResponse("invalid session id"));
+    }
+
     let deadline_at = Instant::now() + connect_deadline;
     let remaining = |now: Instant| -> Result<Duration, PeerError> {
         let left = deadline_at.saturating_duration_since(now);
@@ -247,6 +281,59 @@ mod tests {
     }
 
     #[test]
+    fn session_id_validation_accepts_this_codebase_shape_and_rejects_crlf_injection() {
+        // The real shape, and adjacent-but-still-safe shapes.
+        assert!(is_valid_session_id("term-1"));
+        assert!(is_valid_session_id("term-42"));
+        assert!(is_valid_session_id("t1")); // shorter ids used throughout this module's tests
+
+        // The actual attack (I2): a CRLF splits the request line into an
+        // extra header. Bare CR and bare LF too -- either alone still
+        // breaks HTTP framing.
+        assert!(!is_valid_session_id("term-1\r\nX-Injected: yes"));
+        assert!(!is_valid_session_id("term-1\r\n"));
+        assert!(!is_valid_session_id("term-1\n"));
+        assert!(!is_valid_session_id("term-1\r"));
+        // Neighboring but still-not-needed characters, rejected on the
+        // same "no more permissive than needed" basis.
+        assert!(!is_valid_session_id("term/1"));
+        assert!(!is_valid_session_id("term 1"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn open_rejects_a_session_id_that_could_split_the_request_line_before_ever_connecting() {
+        // A real listener, not a bogus address: if the malformed id were
+        // ever sent, this proves it by never receiving a connection at
+        // all, rather than just asserting `open` returned an error (which
+        // a bug elsewhere in the write path could also produce).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (got_conn_tx, got_conn_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                let _ = got_conn_tx.send(());
+            }
+        });
+        let endpoint = Endpoint {
+            addr,
+            secret: "whatever".into(),
+        };
+        let result = open(&endpoint, "term-1\r\nX-Injected: yes", CONNECT_DEADLINE);
+        assert!(
+            matches!(result, Err(PeerError::BadResponse(_))),
+            "{result:?}"
+        );
+        assert!(
+            got_conn_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "a malformed session id must be rejected before any connection is attempted"
+        );
+    }
+
+    #[test]
     fn a_peer_that_accepts_and_sends_nothing_fails_at_connect_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -379,8 +466,14 @@ mod tests {
             elapsed >= idle_gap,
             "must not fire before the gap: {elapsed:?}"
         );
+        // Widened ceiling (not the tighter one this test shipped with):
+        // a 300ms gap firing under real socket-timeout + scheduler jitter
+        // on a loaded CI box was observed taking ~900ms, uncomfortably
+        // close to the old 1000ms bound. Two full seconds of headroom
+        // still catches "fired nowhere near the gap" (e.g. IDLE_GAP not
+        // applied at all) while no longer flaking under load.
         assert!(
-            elapsed < idle_gap + Duration::from_millis(700),
+            elapsed < idle_gap + Duration::from_secs(2),
             "must fire close to the gap itself, not some other bound: {elapsed:?}"
         );
     }

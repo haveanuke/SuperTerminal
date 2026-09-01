@@ -20,6 +20,7 @@
 //! `Unknown` exists to represent. Do not let a fresher activity poll
 //! override a stale attachment.
 
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -91,15 +92,25 @@ pub enum Status {
 struct AttachState {
     status: Status,
     latest: Option<Arc<WireSnapshot>>,
-    last_frame_at: Instant,
+    /// `None` until a frame has actually been parsed off the wire --
+    /// distinct from "a frame just arrived," which a seeded `Instant::now()`
+    /// would be indistinguishable from. See [`Attachment::freshness`].
+    last_frame_at: Option<Instant>,
 }
 
 /// One attachment to a single session on a single peer. Owns a background
 /// thread (one per attachment) that connects, reconnects on an unexpected
 /// drop up to [`MAX_RECONNECTS`], and stops for good on a terminal
 /// [`Status`]. The thread holds only a [`Weak`] reference back to this
-/// struct -- see [`spawn`] -- so it exits within one blocking call of the
-/// last `Arc<Attachment>` being dropped, rather than leaking per pane.
+/// struct -- see [`spawn`] -- but a `Weak` alone is not enough to exit
+/// promptly: `StreamConn::next_frame`'s read timeout is per-syscall and
+/// resets on every heartbeat, so on a quiet peer that never stops sending
+/// them the thread can be blocked in a single read for as long as the peer
+/// keeps talking -- far longer than any one `weak.upgrade()` check would
+/// notice. `Drop` (below) closes that gap by shutting down
+/// [`Attachment::live_socket`], a clone of whatever connection is
+/// currently open; that is what actually wakes the blocked read, not the
+/// `Weak` by itself.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct Attachment {
     endpoint: Endpoint,
@@ -110,6 +121,27 @@ pub struct Attachment {
     /// terminal status really did stop the thread from trying again,
     /// rather than inferring it from status alone.
     attempts: AtomicU32,
+    /// A clone of the socket backing whichever `/stream/<id>` connection
+    /// the background thread most recently opened, registered right after
+    /// `stream::open` succeeds. `shutdown` on a clone affects the SAME
+    /// underlying kernel socket the other clone may be blocked reading --
+    /// see `Drop`, the only thing that ever reads this field.
+    live_socket: Mutex<Option<TcpStream>>,
+}
+
+impl Drop for Attachment {
+    /// Interrupts a background thread that may be blocked reading the
+    /// most recently opened stream connection -- see this struct's doc
+    /// comment for why a `Weak` reference alone cannot make that happen on
+    /// a heartbeat-only stream. Shutting down the socket forces the
+    /// blocked read to return (as a clean EOF), so the thread's very next
+    /// `weak.upgrade()` observes this drop and exits instead of sitting on
+    /// the read forever.
+    fn drop(&mut self) {
+        if let Some(sock) = self.live_socket.lock().unwrap().take() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -121,17 +153,21 @@ impl Attachment {
     }
 
     /// Whether a frame has arrived within `stream::IDLE_GAP` of `now`.
-    /// Deliberately takes `now` as a parameter rather than reading the
-    /// clock itself: freshness must be `Stale` at the same instant
+    /// `Stale` before any frame has ever arrived, not just once one goes
+    /// quiet -- an attachment with `latest() == None` must never read as
+    /// fresh. Deliberately takes `now` as a parameter rather than reading
+    /// the clock itself: freshness must be `Stale` at the same instant
     /// regardless of when the CALLER happens to ask, and a pure function
     /// of an injected clock is what makes that provable without sleeping
     /// in a test.
     pub fn freshness(&self, now: Instant) -> Freshness {
-        let last_frame_at = self.state.lock().unwrap().last_frame_at;
-        if now.saturating_duration_since(last_frame_at) >= stream::IDLE_GAP {
-            Freshness::Stale
-        } else {
-            Freshness::Fresh
+        match self.state.lock().unwrap().last_frame_at {
+            Some(last_frame_at)
+                if now.saturating_duration_since(last_frame_at) < stream::IDLE_GAP =>
+            {
+                Freshness::Fresh
+            }
+            _ => Freshness::Stale,
         }
     }
 
@@ -147,7 +183,16 @@ impl Attachment {
     /// Independent of the background stream's state: `send` succeeding or
     /// failing says nothing about whether the stream is `Live`, and vice
     /// versa. Returns whether the peer accepted it.
+    ///
+    /// `session_id` rides straight into the request path with no
+    /// escaping, so it is validated first (I2, mirroring `stream::open`) --
+    /// a `session_id` that fails the check is rejected outright rather
+    /// than sanitised, same reasoning as `stream::is_valid_session_id`'s
+    /// doc comment.
     pub fn send(&self, bytes: &[u8]) -> bool {
+        if !stream::is_valid_session_id(&self.session_id) {
+            return false;
+        }
         let body = serde_json::json!({ "bytes": bytes }).to_string();
         let path = format!("/peer-input/{}", self.session_id);
         super::post(&self.endpoint, &path, body.as_bytes(), SEND_DEADLINE).is_ok()
@@ -162,10 +207,13 @@ impl Attachment {
         self.state.lock().unwrap().status = status;
     }
 
+    /// The only place `Status::Live` and a `Some` `last_frame_at` are ever
+    /// set -- see the variant's own doc: `Live` means a frame has actually
+    /// arrived, not merely that a connection is open (I1).
     fn record_frame(&self, snapshot: WireSnapshot) {
         let mut state = self.state.lock().unwrap();
         state.latest = Some(Arc::new(snapshot));
-        state.last_frame_at = Instant::now();
+        state.last_frame_at = Some(Instant::now());
         state.status = Status::Live;
     }
 }
@@ -186,9 +234,10 @@ pub fn spawn(endpoint: Endpoint, session_id: impl Into<String>) -> Arc<Attachmen
         state: Mutex::new(AttachState {
             status: Status::Connecting,
             latest: None,
-            last_frame_at: Instant::now(),
+            last_frame_at: None,
         }),
         attempts: AtomicU32::new(0),
+        live_socket: Mutex::new(None),
     });
     let weak = Arc::downgrade(&attachment);
     let _ = std::thread::Builder::new()
@@ -233,12 +282,19 @@ fn classify(err: &PeerError) -> Outcome {
 ///
 /// Holds `weak` -- never a strong `Arc` -- across every blocking call
 /// (`stream::open`, `StreamConn::next_frame`, `thread::sleep`): each
-/// iteration upgrades just long enough to read the fixed endpoint/session
-/// or to publish a result, then drops it before blocking again. This is
-/// what makes the `Attachment` drop promptly rather than only after
-/// whatever blocking call happens to be in flight (up to `IDLE_GAP`) --
-/// the lifecycle pattern named in the brief (`blender.rs:30`), sized here
-/// to blocking calls that can run far longer than blender's short ones.
+/// iteration upgrades just long enough to read the fixed endpoint/session,
+/// register the live socket, or publish a result, then drops it before
+/// blocking again -- the lifecycle pattern named in the brief
+/// (`blender.rs:30`). `stream::open` and the reconnect sleep are genuinely
+/// bounded (`CONNECT_DEADLINE`, `RECONNECT_DELAY`), so `weak.upgrade()`
+/// alone is enough to make the thread notice a drop within one of those.
+/// `StreamConn::next_frame` is NOT bounded the same way: its read timeout
+/// is per-syscall and a heartbeat resets it, so a quiet peer that only
+/// ever sends `:hb` never lets that call return on its own. Registering
+/// `Attachment::live_socket` right after `stream::open` succeeds is what
+/// closes that gap -- `Attachment`'s `Drop` impl shuts it down, forcing
+/// the blocked read to return so this loop's very next `weak.upgrade()`
+/// can observe the drop.
 #[cfg_attr(not(test), allow(dead_code))]
 fn run(weak: Weak<Attachment>) {
     let mut reconnects: u32 = 0;
@@ -253,24 +309,58 @@ fn run(weak: Weak<Attachment>) {
 
         let outcome = match stream::open(&endpoint, &session_id, stream::CONNECT_DEADLINE) {
             Ok(mut conn) => {
-                reconnects = 0;
+                // Deliberately NOT `reconnects = 0` here (C3): a peer that
+                // accepts and answers with valid SSE headers has not
+                // proven anything yet -- only a real parsed frame below
+                // does. Resetting on mere connection success would let a
+                // peer that always connects but never sends a valid frame
+                // defeat `MAX_RECONNECTS` by construction. Also
+                // deliberately NOT `Status::Live` here (I1): that variant
+                // means a frame has arrived, not merely that a socket is
+                // open -- see `record_frame`, the only place it is set.
                 let Some(attachment) = weak.upgrade() else {
                     return;
                 };
-                attachment.set_status(Status::Live);
+                // INVARIANT: a stream this loop proceeds to read from must
+                // ALWAYS have a registered interrupt handle -- unlike other
+                // secondary I/O errors in this module, a failed clone here
+                // is not merely tolerated. If `try_clone_socket` fails (fd
+                // exhaustion is the realistic cause) and we pressed on
+                // anyway, `live_socket` would still hold the PREVIOUS,
+                // already-dead connection's clone (or nothing at all): a
+                // reconnect later, `Drop` shuts down a corpse (or nothing),
+                // the new connection's blocked read has no interrupt path,
+                // and the thread hangs on a heartbeat-only stream forever
+                // -- C1 again. Clearing `live_socket` instead would not fix
+                // this: `Drop` would just no-op. So a clone failure is
+                // treated as a connection failure and takes the retry path
+                // -- and since the failure mode under fd pressure is
+                // itself "leak a thread and a socket," refusing to
+                // proceed also avoids making that pressure worse.
+                let clone_outcome = match conn.try_clone_socket() {
+                    Ok(sock) => {
+                        *attachment.live_socket.lock().unwrap() = Some(sock);
+                        None
+                    }
+                    Err(e) => Some(classify(&PeerError::Io(e))),
+                };
                 drop(attachment);
 
-                loop {
-                    match conn.next_frame(stream::IDLE_GAP) {
-                        Ok(snapshot) => {
-                            reconnects = 0;
-                            let Some(attachment) = weak.upgrade() else {
-                                return;
-                            };
-                            attachment.record_frame(snapshot);
-                            drop(attachment);
+                if let Some(outcome) = clone_outcome {
+                    outcome
+                } else {
+                    loop {
+                        match conn.next_frame(stream::IDLE_GAP) {
+                            Ok(snapshot) => {
+                                reconnects = 0;
+                                let Some(attachment) = weak.upgrade() else {
+                                    return;
+                                };
+                                attachment.record_frame(snapshot);
+                                drop(attachment);
+                            }
+                            Err(err) => break classify(&err),
                         }
-                        Err(err) => break classify(&err),
                     }
                 }
             }
@@ -318,6 +408,8 @@ mod tests {
         CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell, SnapshotCursor,
         TermSession,
     };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::mpsc;
     use std::sync::Arc;
 
@@ -733,63 +825,90 @@ mod tests {
     }
 
     #[test]
-    fn dropping_the_attachment_ends_its_thread_rather_than_leaking_it() {
-        let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
-        let hub = Arc::new(Hub::new());
-        hub.register("t1", "attach-drop", session.input_sender());
-        let peer_id = PeerId("peerDrop".into());
-        hub.set_visible_to("t1", &peer_id, true);
-        hub.publish_snapshot("t1", Arc::new(seeded_snapshot("hello")));
-
-        const SECRET: &str = "dropdropdropdropdropdropdropdrop";
-        let handle = start(
-            Arc::clone(&hub),
-            crate::themes::default_theme(),
-            ServerConfig {
-                bind: "127.0.0.1:0".parse().unwrap(),
-                token: "phonephonephonephonephonephoneph".into(),
-                page: "<title>attach-drop-test</title>",
-                previews: previews(),
-                thumbs: thumbs(),
-                peers: vec![PeerRecord {
-                    id: peer_id,
-                    host: "peer.local".into(),
-                    label: "peer".into(),
-                    secret: SECRET.into(),
-                    grants: full_grants(),
-                }],
-            },
-        )
-        .expect("server starts");
+    fn dropping_the_attachment_during_a_heartbeat_only_stream_still_ends_its_thread() {
+        // The exact case C1 broke: a peer that never sends a real frame,
+        // only `:hb` heartbeats, forever -- what `serve_stream` does for
+        // an idle session (`server.rs:930-935`). `FrameReader::next_frame`
+        // silently consumes each one and loops straight back into another
+        // blocking read with a FRESH per-syscall timeout, so that call
+        // never returns on its own; only `Attachment`'s `Drop` shutting
+        // down the socket can unblock it.
+        //
+        // This deliberately does NOT go through `weak.upgrade().is_some()`
+        // the way the test this replaces did (C2): that reflects the
+        // `Arc`'s refcount, which already hits zero the instant
+        // `drop(attachment)` below runs, regardless of whether the
+        // background thread ever notices and returns -- an assertion
+        // gated on it is unreachable by construction. `JoinHandle::join`
+        // completing is the real, external-to-the-thread proof this needs.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+            // Heartbeats only, never a frame -- generously long so the
+            // mock server cannot run out first; the client is expected to
+            // disconnect long before this loop finishes.
+            for i in 0..400 {
+                if stream.write_all(b":hb\n\n").is_err() {
+                    return;
+                }
+                if i == 0 {
+                    let _ = ready_tx.send(());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
         let endpoint = Endpoint {
-            addr: handle.addr(),
-            secret: SECRET.into(),
+            addr,
+            secret: "whatever-secret-32-chars-long!!".into(),
         };
 
-        let attachment = spawn(endpoint, "t1");
-        assert!(
-            wait_until(
-                || attachment.status() == Status::Live,
-                Duration::from_secs(5)
-            ),
-            "never reached Live"
-        );
+        // Spawned by hand (mirroring `spawn`) rather than via `spawn`
+        // itself, purely so this test can keep the `JoinHandle` `spawn`
+        // deliberately discards -- `run` is private but visible here as a
+        // child module of `attach`.
+        let attachment = Arc::new(Attachment {
+            endpoint: endpoint.clone(),
+            session_id: "t1".into(),
+            state: Mutex::new(AttachState {
+                status: Status::Connecting,
+                latest: None,
+                last_frame_at: None,
+            }),
+            attempts: AtomicU32::new(0),
+            live_socket: Mutex::new(None),
+        });
         let weak = Arc::downgrade(&attachment);
+        let handle = std::thread::Builder::new()
+            .name("peer-attach-test".into())
+            .spawn(move || run(weak))
+            .expect("thread spawns");
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock peer accepted and sent its first heartbeat");
+        // Let the client consume that heartbeat and loop back into the
+        // next blocking read, so the drop below races a thread that is
+        // GENUINELY stuck inside `next_frame`, not merely still connecting.
+        std::thread::sleep(Duration::from_millis(150));
+
         drop(attachment);
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while weak.upgrade().is_some() {
-            assert!(
-                Instant::now() < deadline,
-                "attachment thread must release its handle and exit after the drop"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        handle.stop();
-        session
-            .shutdown()
-            .join_with_deadline(Duration::from_secs(5));
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "attachment thread must exit even on a heartbeat-only stream, not leak past the drop"
+        );
     }
 
     #[test]
@@ -830,6 +949,93 @@ mod tests {
         assert!(
             elapsed < RECONNECT_DELAY * (MAX_RECONNECTS + 3),
             "must not be exponential backoff or a stuck loop: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn reconnects_are_bounded_even_when_every_attempt_connects_and_then_misbehaves() {
+        // C3: unlike the closed-port test above (where `stream::open`
+        // always fails, so the buggy `reconnects = 0` right after a
+        // successful `open` never even runs), this peer ACCEPTS every
+        // connection and answers with a genuinely valid 200 SSE header --
+        // `stream::open` succeeds every single time. What it never does is
+        // send a frame that actually parses, so this is the one case that
+        // can tell the fix apart from the bug: with the reset left on
+        // "connected" instead of moved to "a frame arrived," every
+        // successful `open` would zero the counter and this would loop
+        // forever, never reaching `Unavailable` -- a full connect-and-
+        // authenticate cycle against the peer every `RECONNECT_DELAY`.
+        // `wait_until`'s bound is what makes a regression here FAIL rather
+        // than hang the suite.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..(MAX_RECONNECTS as usize + 4) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ =
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+                // Valid SSE framing, invalid payload -- "sends garbage
+                // JSON" from the brief. `serde_json::from_slice` fails,
+                // which `classify` routes to `Outcome::Retry`, not
+                // `Terminal`.
+                let _ = stream.write_all(b"data: not valid json\n\n");
+                // Dropped here: the connection closes, forcing the client
+                // back into a reconnect instead of sitting on a live
+                // stream that just never produces anything parseable.
+            }
+        });
+        let endpoint = Endpoint {
+            addr,
+            secret: "whatever-secret-32-chars-long!!".into(),
+        };
+
+        let attachment = spawn(endpoint, "t1");
+        assert!(
+            wait_until(
+                || attachment.status() == Status::Unavailable,
+                Duration::from_secs(20)
+            ),
+            "status: {:?} -- MAX_RECONNECTS must still bound the loop even though \
+             every attempt successfully connects",
+            attachment.status()
+        );
+        assert_eq!(
+            attachment.attempts(),
+            MAX_RECONNECTS + 1,
+            "one initial attempt plus MAX_RECONNECTS retries, no more and no fewer, \
+             even though every one of them connected"
+        );
+    }
+
+    #[test]
+    fn send_rejects_a_session_id_that_could_split_the_request_line() {
+        // Constructed directly rather than via `spawn` so this exercises
+        // exactly `send`'s own validation (I2), independent of the
+        // background thread's separate `stream::open` call --
+        // `stream::is_valid_session_id`'s doc covers why this must be a
+        // strict charset rather than an escaping scheme.
+        let attachment = Attachment {
+            endpoint: Endpoint {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                secret: "whatever-secret-32-chars-long!!".into(),
+            },
+            session_id: "term-1\r\nX-Injected: yes".into(),
+            state: Mutex::new(AttachState {
+                status: Status::Connecting,
+                latest: None,
+                last_frame_at: None,
+            }),
+            attempts: AtomicU32::new(0),
+            live_socket: Mutex::new(None),
+        };
+        assert!(
+            !attachment.send(&[1, 2, 3]),
+            "send must refuse a session id that could split the request line, \
+             not attempt the request"
         );
     }
 }
