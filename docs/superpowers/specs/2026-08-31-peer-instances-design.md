@@ -123,24 +123,30 @@ Both are required, and neither substitutes for the other:
   route at all" — a route-level, principal-level question. It is what lets
   `Peer` reach `/sessions`, `/stream/<id>`, and the raw-byte `/peer-input/<id>`
   sink instead of getting a 404 like an unlisted route would.
-- **`hub.visible_to(&peer_id)`** (and `hub.publishable_ids()` for what could be
-  shown to a peer at all) answers "which sessions may THIS SPECIFIC peer see
-  or touch" — a per-session, per-peer question. Passing `admits` says nothing
-  about which ids a `GET /sessions` response should list, which id a
-  `GET /stream/<id>` may stream, or which id a `POST /peer-input/<id>` may
-  write into.
+- **`hub.sessions_for(&principal)` and `hub.may_touch(&principal, id)`**
+  answer "which sessions may THIS SPECIFIC peer see or touch" — a
+  per-session, per-peer question. Passing `admits` says nothing about which
+  ids a `GET /sessions` response should list, which id a `GET /stream/<id>`
+  may stream, or which id a `POST /peer-input/<id>` may write into.
 
 Phase A implemented only the first check. `server.rs`'s `/sessions`, `/stream`,
 and `/peer-input` handlers all consult `admits` (via `route_admitted`) but none
-of them consult `hub.visible_to` or `hub.publishable_ids` — both exist on
-`CompanionHub` with no caller yet. This is not exploitable in Phase A, because
-`principal_for` cannot produce a `Peer` (there is no pairing to authenticate
-against), so the gap is currently unreachable. **No later phase may enable
-peer authentication — i.e. make `principal_for` capable of returning
-`Principal::Peer` — before every route it can reach also enforces
-`hub.visible_to`/`hub.publishable_ids`.** Turning on pairing without wiring
-the second check would give a paired peer sight of, and input into, every
-local session, not just the ones broadcast to it.
+of them consulted anything scoping *which* ids — the gap was inert in Phase A
+because `principal_for` could not yet produce a `Peer`.
+
+Phase B closed it as `hub.sessions_for`/`hub.may_touch` (`companion/hub.rs`),
+not as the `hub.visible_to`/`hub.publishable_ids` pair this document originally
+sketched for the role. Those two still exist, but only as test-only assertion
+helpers over hub state (see their doc comments) — no route calls them.
+`sessions_for` and `may_touch` re-check `entry.origin == Origin::LocalPty` and
+`entry.visible_to.contains(peer)` directly on each entry, deliberately
+redundant with the guard already in `set_visible_to`, rather than trusting a
+separate filter to have already been applied. **No later phase may enable
+peer authentication further — e.g. add a route a `Peer` principal can reach —
+without that route also consulting `hub.sessions_for`/`hub.may_touch`.**
+Turning on pairing without wiring the second check would give a paired peer
+sight of, and input into, every local session, not just the ones broadcast to
+it.
 
 ## D3b. Decided: a peer does not reach `/input`
 
@@ -160,6 +166,50 @@ Enforced in `companion::auth::admits` and covered by
 `a_peer_uses_the_raw_sink_not_the_symbolic_one`, which asserts both halves: a
 peer with view+type is refused `/input`, and the phone keeps it (also covered
 by `the_phone_keeps_every_route_it_has_today`).
+
+## D3c. Phase C requirement: SSE must re-check `may_touch` per frame, not just at connect
+
+`serve_stream` (`companion/server.rs:743`) authorizes once, at connect time —
+`/stream/<id>`'s handler calls `hub.may_touch` before opening the stream, but
+the loop inside `serve_stream` itself only re-checks `shared.cancel` and
+`shared.hub.revision(id)` (session still exists) on every poll; it never
+re-checks `may_touch`. Safe under Phase B only because every revocation path
+(`Workspace::apply_peer_mutation`, `regenerate_companion_token`) restarts the
+whole companion server, which drops every live connection along with it — a
+stream can never outlive the grant it was opened under.
+
+**Phase C must not add a way to un-share a session without also restarting
+the server** — e.g. a per-session broadcast toggle exposed as its own action,
+distinct from the peer-level mutations `apply_peer_mutation` already forces
+through a restart — **unless `serve_stream`'s poll loop also re-checks
+`hub.may_touch(&principal, id)` and ends the stream the moment it returns
+false.** Without that, un-broadcasting one session would leave a peer's
+already-open `/stream/<id>` connection receiving frames from a session that
+is no longer shared with it.
+
+## D3d. Phase C requirement: a companion restart must not silently reset every peer's `visible_to` state
+
+`Workspace::toggle_companion` (`workspace/companion_ui.rs:83`) constructs a
+fresh `CompanionHub` — `Hub::new()` — on every start, so `visible_to` for
+every session starts empty again after any restart. Editing one peer's
+grants goes through `apply_peer_mutation`, which forces exactly that
+stop+restart — so today, editing (or pairing, or deleting) ANY one peer
+un-broadcasts every session previously shared with EVERY OTHER peer too, not
+just the one being edited.
+
+This is inert today: `hub.set_visible_to` (`workspace/mod.rs:716`) is the only
+writer of that state, and its one call site — the peer-spawn arm of the tick
+that drains `hub.drain_spawns()` — is unreachable, because "no UI path
+produces a peer request yet" (see the comment at that call site). Nothing is
+broadcasting to anything for a restart to silently undo.
+
+**It stops being inert the moment Phase C lets a user broadcast a session to
+a peer** (the still-undesigned control D6/Risks alludes to — "a per-peer
+setting for what this instance is willing to publish to that peer"). From
+that point on, Phase C must either give a peer-grant edit a restart path that
+preserves unrelated `visible_to` state, or explicitly accept — and tell the
+user — that editing one peer's grants un-shares every session from every
+peer, not just the one being edited.
 
 ## D4. Attached panes are never re-broadcast
 
@@ -181,8 +231,11 @@ must never enter either peer publication or local keystroke fan-out membership �
 by construction, not by a filter someone can forget.
 
 **Phase C note.** Phase A only encoded the companion half of this rule:
-`hub.rs`'s `Origin` enum and `publishable_ids()` keep an attached pane out of
-peer publication by construction. The other half is still open.
+`hub.rs`'s `Origin` enum, together with `set_visible_to`'s refusal to
+populate `visible_to` for anything but `Origin::LocalPty`, keeps an attached
+pane out of peer publication by construction — enforced at that one
+mutation, then re-checked redundantly by `sessions_for`/`may_touch` at read
+time (see D3). The other half is still open.
 `BroadcastHub` (`pane.rs:22`, registration at `pane.rs:407`) still infers
 local keystroke fan-out membership from "has a session" — `broadcast_register`
 runs whenever `TerminalPane::new` has a `Some(session)`, with no origin check —

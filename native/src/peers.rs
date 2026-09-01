@@ -31,6 +31,16 @@ pub struct Grants {
 #[serde(rename_all = "camelCase")]
 pub struct PeerRecord {
     pub id: PeerId,
+    /// The tailnet hostname this peer was paired from (`Candidate::host` at
+    /// pairing time, see [`pair`]). Distinct from `label`, which is
+    /// user-facing and may one day be renamed: `offerable_candidates`
+    /// matches against THIS field, never `label`, so renaming a peer can
+    /// never make an already-paired machine reappear as offerable.
+    /// `#[serde(default)]` so a peer record saved before this field
+    /// existed still loads — its origin host is simply unknown until the
+    /// peer is re-paired.
+    #[serde(default)]
+    pub host: String,
     pub label: String,
     /// 32 lowercase hex chars. Compared in constant time at auth.
     pub secret: String,
@@ -284,14 +294,15 @@ fn shell_bounded(
 }
 
 /// Which candidates the settings UI should offer. A host already paired
-/// (by label) is not offered again — pairing the same machine twice would
-/// just mint a second, indistinguishable credential for it. Promotion
-/// itself stays an explicit user action; this only prunes the list they
-/// choose from.
+/// (matched by `PeerRecord::host`, its stable origin, never by the
+/// user-facing `label`) is not offered again — pairing the same machine
+/// twice would just mint a second, indistinguishable credential for it.
+/// Promotion itself stays an explicit user action; this only prunes the
+/// list they choose from.
 pub fn offerable_candidates(candidates: &[Candidate], paired: &[PeerRecord]) -> Vec<Candidate> {
     candidates
         .iter()
-        .filter(|candidate| !paired.iter().any(|peer| peer.label == candidate.host))
+        .filter(|candidate| !paired.iter().any(|peer| peer.host == candidate.host))
         .cloned()
         .collect()
 }
@@ -303,6 +314,7 @@ pub fn offerable_candidates(candidates: &[Candidate], paired: &[PeerRecord]) -> 
 pub fn pair(host: &str) -> PeerRecord {
     PeerRecord {
         id: PeerId(new_peer_id()),
+        host: host.to_string(),
         label: host.to_string(),
         secret: new_peer_secret(),
         grants: Grants::default(),
@@ -619,6 +631,48 @@ mod tests {
     fn with_no_peers_paired_every_candidate_is_offerable() {
         let candidates = vec![candidate("a"), candidate("b")];
         assert_eq!(offerable_candidates(&candidates, &[]).len(), 2);
+    }
+
+    #[test]
+    fn two_peers_sharing_a_label_are_matched_by_their_own_host_distinctly() {
+        // Labels are user-editable and not unique (unlike ids, which are
+        // opaque and quarantined on collision — see `load_peers`). Simulate
+        // two paired peers that ended up sharing a display label — a future
+        // rename, or a hand-edited settings file — while their real origin
+        // hosts stay distinct.
+        let mut a = pair("mac-a");
+        a.label = "shared-name".to_string();
+        let mut b = pair("mac-b");
+        b.label = "shared-name".to_string();
+        assert_eq!(a.label, b.label, "test setup: labels must collide");
+        assert_ne!(a.host, b.host, "test setup: hosts must not collide");
+
+        let candidates = vec![candidate("mac-a"), candidate("mac-b"), candidate("mac-c")];
+        let offered = offerable_candidates(&candidates, &[a, b]);
+
+        // Each already-paired host is suppressed by ITS OWN host, not by
+        // the label the two peers happen to share; the untouched candidate
+        // is unaffected.
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].host, "mac-c");
+    }
+
+    #[test]
+    fn a_renamed_peer_still_suppresses_its_origin_host() {
+        // Matching used to key off `label`, which the settings sheet may
+        // one day let a user edit. If that match had stayed on `label`,
+        // renaming a peer away from its origin hostname would make that
+        // machine reappear as offerable — inviting a second, redundant
+        // pairing of a machine already paired.
+        let mut renamed = pair("work-mbp");
+        renamed.label = "Tomas's other Mac".to_string();
+
+        let candidates = vec![candidate("work-mbp")];
+        let offered = offerable_candidates(&candidates, &[renamed]);
+        assert!(
+            offered.is_empty(),
+            "a renamed peer's origin host must stay suppressed"
+        );
     }
 
     #[test]

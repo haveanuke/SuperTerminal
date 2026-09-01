@@ -355,10 +355,11 @@ pub struct Workspace {
     /// sheet auto-scans at most once per session instead of re-triggering
     /// on every render of an empty result.
     peer_scanned_once: bool,
-    /// The label + secret of a peer just paired, shown once for QR
+    /// The id, label, and secret of a peer just paired, shown once for QR
     /// transfer (the phone-link flyout's `qr::matrix` pattern) until
-    /// dismissed or replaced by the next pairing.
-    peer_pairing_secret: Option<(String, String)>,
+    /// dismissed or replaced by the next pairing. Keyed by id, not label —
+    /// see `Workspace::delete_peer`.
+    peer_pairing_secret: Option<(crate::companion::auth::PeerId, String, String)>,
 }
 
 impl Workspace {

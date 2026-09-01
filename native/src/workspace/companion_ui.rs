@@ -116,13 +116,17 @@ impl Workspace {
         crate::companion::blender::spawn(Arc::downgrade(&previews), cache_dir.clone());
         let thumbs = crate::companion::thumbs::Thumbnailer::new(cache_dir);
         // Resolved ONCE here and frozen for the server's lifetime. Nothing
-        // refreshes it, and no settings change restarts the companion, so a
-        // peer edited or deleted after this point keeps its old grants until
-        // the server is next toggled — which may be the whole app session.
-        // This is NOT parity with regenerate_companion_token, which forces a
-        // restart so a rotated token is live immediately.
-        // The task that ships peer deletion must apply that same forced
-        // restart; revocation that waits for a toggle is not revocation.
+        // refreshes it on its own — a peer edited or deleted after this
+        // point would keep its old grants until the server is next
+        // toggled by hand, possibly the whole app session, if nothing else
+        // intervened. Nothing else DOES leave it to chance: every peer
+        // mutation goes through `Workspace::apply_peer_mutation`, which
+        // forces a stop+restart immediately (via
+        // `stop_companion_for_restart`) whenever the mutation changes what
+        // the running companion would authorize — the same pattern
+        // `regenerate_companion_token` uses for a rotated token. If a
+        // future reader is checking whether revocation actually works,
+        // `apply_peer_mutation` in `settings_ui.rs` is where that lives.
         let (peers, _peer_problems) = self.settings.peers();
         let mut started = None;
         for port in 43110..43121u16 {
@@ -164,7 +168,31 @@ impl Workspace {
     /// Cancellation is flipped SYNCHRONOUSLY (streams start dying before any
     /// pane teardown that follows); the joins happen off the UI thread (a
     /// worker mid-read can take its full deadline; the UI must not wait).
+    ///
+    /// This is the plain "turn the companion off" path — nothing rebinds
+    /// right after. A caller that is about to immediately restart the
+    /// server on the same port (token regeneration, a forced restart after
+    /// a peer-grant edit) must use [`Self::stop_companion_for_restart`]
+    /// instead: firing the port release off-thread here would let the
+    /// rebind race the old listener's drop.
     pub(super) fn stop_companion(&mut self, cx: &mut Context<Self>) {
+        self.stop_companion_inner(cx, false);
+    }
+
+    /// Same teardown as [`Self::stop_companion`], but blocks the calling
+    /// thread until the old listener's port is actually free — i.e. until
+    /// the acceptor thread has exited (see
+    /// [`crate::companion::server::ServerHandle::stop_blocking_on_port_release`]).
+    /// Every caller that stops the companion only to immediately call
+    /// [`Self::toggle_companion`] again — restarting it on the same address
+    /// — must go through this, or the rebind can lose the race, fall
+    /// through to the next port in `43110..43121`, and silently break the
+    /// phone's saved bookmark (it encodes host:port).
+    pub(super) fn stop_companion_for_restart(&mut self, cx: &mut Context<Self>) {
+        self.stop_companion_inner(cx, true);
+    }
+
+    fn stop_companion_inner(&mut self, cx: &mut Context<Self>, block_for_port: bool) {
         // The link this state vouched for is dying (stop, or a regenerate
         // that revokes the token) — "copied" must not outlive it.
         self.companion_copied = false;
@@ -176,7 +204,11 @@ impl Workspace {
         self.companion_previews = None;
         if let Some(handle) = self.companion_server.take() {
             handle.cancel();
-            std::thread::spawn(move || handle.stop());
+            if block_for_port {
+                handle.stop_blocking_on_port_release();
+            } else {
+                std::thread::spawn(move || handle.stop());
+            }
         }
     }
 
@@ -225,7 +257,7 @@ impl Workspace {
     pub(super) fn regenerate_companion_token(&mut self, cx: &mut Context<Self>) {
         let was_running = self.companion_server.is_some();
         if was_running {
-            self.stop_companion(cx);
+            self.stop_companion_for_restart(cx);
         }
         self.settings.companion_token = Some(crate::companion::auth::generate_token());
         let _ = self.settings.save();

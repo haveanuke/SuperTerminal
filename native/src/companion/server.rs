@@ -97,6 +97,36 @@ impl ServerHandle {
             let _ = worker.join();
         }
     }
+
+    /// Like [`Self::stop`], but returns as soon as the port is actually
+    /// free instead of waiting for every worker to finish. The listening
+    /// socket lives inside the acceptor thread's closure (see [`start`]),
+    /// so it is only dropped — and the port only released — once that
+    /// thread has exited; joining it is normally near-instant, since
+    /// `cancel` + the loopback connect below unblock its `accept()` right
+    /// away. Worker joins (a worker mid-read can sit for its full
+    /// deadline) are handed to a background thread instead, same as
+    /// [`Self::stop`] would eventually do anyway.
+    ///
+    /// Callers that stop only to immediately rebind the SAME address —
+    /// token regeneration, a forced restart after a peer-grant edit — MUST
+    /// use this instead of firing `stop` off-thread: with a fire-and-forget
+    /// stop, the rebind can race the old listener's drop, fail to reclaim
+    /// the port, and silently fall through to the next one in the range —
+    /// which breaks a bookmark that encoded the old host:port.
+    pub fn stop_blocking_on_port_release(mut self) {
+        self.cancel.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr); // unblock accept()
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        let workers: Vec<JoinHandle<()>> = std::mem::take(&mut *self.workers.lock().unwrap());
+        std::thread::spawn(move || {
+            for worker in workers {
+                let _ = worker.join();
+            }
+        });
+    }
 }
 
 struct Shared<S: Clone> {
@@ -1660,6 +1690,38 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "stop() must join promptly"
         );
+    }
+
+    #[test]
+    fn stop_blocking_on_port_release_frees_the_port_before_returning() {
+        // Regression for the companion-restart race: a caller that stops
+        // only to immediately rebind the same address (token regen, a
+        // forced peer-grant restart) must see the port free the instant
+        // this returns — never fall through to the next port in the range.
+        let (hub, _rx) = seeded_hub(false);
+        let handle = boot(hub);
+        let addr = host_of(&handle);
+        handle.stop_blocking_on_port_release();
+        let (hub2, _rx2) = seeded_hub(false);
+        let rebound = start(
+            hub2,
+            theme(),
+            ServerConfig {
+                bind: addr.parse().unwrap(),
+                token: TOKEN.into(),
+                page: PAGE,
+                previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+                thumbs: test_thumbs(),
+                peers: Vec::new(),
+            },
+        )
+        .expect("the old listener's port must already be free");
+        assert_eq!(
+            host_of(&rebound),
+            addr,
+            "rebind must land on the SAME port, not fall through to the next one"
+        );
+        rebound.stop();
     }
 
     #[test]

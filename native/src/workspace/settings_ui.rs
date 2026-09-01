@@ -967,7 +967,11 @@ impl Workspace {
     pub(super) fn pair_peer(&mut self, host: &str, cx: &mut Context<Self>) {
         let (mut current, _problems) = self.settings.peers();
         let record = peers::pair(host);
-        self.peer_pairing_secret = Some((record.label.clone(), record.secret.clone()));
+        self.peer_pairing_secret = Some((
+            record.id.clone(),
+            record.label.clone(),
+            record.secret.clone(),
+        ));
         current.push(record);
         self.apply_peer_mutation(current, cx);
     }
@@ -976,14 +980,17 @@ impl Workspace {
     /// to the next manual companion toggle: see `apply_peer_mutation`.
     pub(super) fn delete_peer(&mut self, id: &PeerId, cx: &mut Context<Self>) {
         let (mut current, _problems) = self.settings.peers();
-        let deleted_label = current
-            .iter()
-            .find(|peer| &peer.id == id)
-            .map(|peer| peer.label.clone());
         current.retain(|peer| &peer.id != id);
         // A just-shown pairing secret for the peer being deleted must not
-        // linger onscreen as if it still meant something.
-        if self.peer_pairing_secret.as_ref().map(|(label, _)| label) == deleted_label.as_ref() {
+        // linger onscreen as if it still meant something. Compared by id,
+        // not label — labels are user-editable and not unique (two peers
+        // can share one), while ids are opaque and quarantined on
+        // collision.
+        if self
+            .peer_pairing_secret
+            .as_ref()
+            .is_some_and(|(pid, _, _)| pid == id)
+        {
             self.peer_pairing_secret = None;
         }
         self.apply_peer_mutation(current, cx);
@@ -1028,7 +1035,7 @@ impl Workspace {
         let restart = peers::peer_mutation_requires_restart(&before, &updated);
         let was_running = self.companion_server.is_some();
         if restart && was_running {
-            self.stop_companion(cx);
+            self.stop_companion_for_restart(cx);
         }
         self.settings.peers = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
         let _ = self.settings.save();
@@ -1207,45 +1214,48 @@ impl Workspace {
             .collect();
         let peers_empty = peer_rows.is_empty();
 
-        let pairing_panel = self.peer_pairing_secret.clone().map(|(label, secret)| {
-            let url = self.peer_pairing_url(&secret);
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .p(px(8.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(rgb(theme.ui_accent))
-                .bg(rgb(theme.ui_surface))
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(theme.ui_text))
-                        .child(SharedString::from(format!(
-                            "Paired {label} \u{2014} scan on that Mac to finish:"
-                        ))),
-                )
-                .children(url.as_deref().and_then(|url| self.render_peer_qr(url)))
-                .children((url.is_none()).then(|| {
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(theme.ui_text_muted))
-                        .child("Start the phone link to get a scannable code.")
-                }))
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(theme.ui_text_muted))
-                        .child(SharedString::from(format!("secret: {secret}"))),
-                )
-                .child(self.chip_button(
-                    "done",
-                    false,
-                    |ws, _window, cx| ws.dismiss_peer_pairing_secret(cx),
-                    cx,
-                ))
-        });
+        let pairing_panel = self
+            .peer_pairing_secret
+            .clone()
+            .map(|(_id, label, secret)| {
+                let url = self.peer_pairing_url(&secret);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .p(px(8.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(theme.ui_accent))
+                    .bg(rgb(theme.ui_surface))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(theme.ui_text))
+                            .child(SharedString::from(format!(
+                                "Paired {label} \u{2014} scan on that Mac to finish:"
+                            ))),
+                    )
+                    .children(url.as_deref().and_then(|url| self.render_peer_qr(url)))
+                    .children((url.is_none()).then(|| {
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("Start the phone link to get a scannable code.")
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(format!("secret: {secret}"))),
+                    )
+                    .child(self.chip_button(
+                        "done",
+                        false,
+                        |ws, _window, cx| ws.dismiss_peer_pairing_secret(cx),
+                        cx,
+                    ))
+            });
 
         div()
             .flex()

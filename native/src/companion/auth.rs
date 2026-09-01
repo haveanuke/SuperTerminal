@@ -6,11 +6,12 @@
 use crate::companion::http::Method;
 use serde::{Deserialize, Serialize};
 
-/// Identity of a paired peer instance. Phase A never constructs one; it
-/// exists so the admission table is written once rather than retrofitted
-/// when Phase B adds pairing.
+/// Identity of a paired peer instance. Phase A never constructed one — the
+/// type existed only so the admission table was written once rather than
+/// retrofitted when pairing landed. Phase B constructs one in
+/// `peers::pair`, each time a discovered tailnet candidate is paired.
 ///
-/// Serialize/Deserialize (mirroring `hosts::ProfileId`) so Phase B's
+/// Serialize/Deserialize (mirroring `hosts::ProfileId`) so
 /// `peers::PeerRecord` can round-trip through the raw JSON stored in
 /// `Settings::peers`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -294,6 +295,7 @@ mod tests {
             .iter()
             .map(|(id, secret)| crate::peers::PeerRecord {
                 id: PeerId((*id).to_string()),
+                host: String::new(),
                 label: String::new(),
                 secret: (*secret).to_string(),
                 grants: crate::peers::Grants::default(),

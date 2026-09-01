@@ -25,8 +25,9 @@ use super::wire::serialize_snapshot;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     LocalPty,
-    /// Constructed from Phase B onward, once a pane can attach to a peer's
-    /// session. Until then this arm exists so publication's rules are
+    /// Not constructed anywhere yet — a pane that attaches to a peer's
+    /// session (rendering its stream, forwarding input to it) is Phase C
+    /// work, still unbuilt. This arm exists so publication's rules are
     /// written once against the real enum rather than retrofitted when
     /// attaching lands.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -37,8 +38,9 @@ pub enum Origin {
 /// shows "grid too large" instead of the stream stalling).
 pub const MAX_SERIALIZED: usize = 1024 * 1024;
 
-/// Phone-requested terminal spawns waiting for the main-thread tick; the cap
-/// keeps a misbehaving page from carpeting the Mac in tabs.
+/// Phone- or peer-requested terminal spawns waiting for the main-thread
+/// tick; the cap keeps a misbehaving page — or peer — from carpeting the
+/// Mac in tabs.
 pub const MAX_PENDING_SPAWNS: usize = 4;
 
 /// Phone-requested renames waiting for the main-thread tick.
@@ -82,9 +84,9 @@ struct Published<S> {
     /// the ONLY thing publication may key off — never "has a sender".
     origin: Origin,
     /// Peers this session has been broadcast to. Always empty for
-    /// `Origin::Attached` — [`CompanionHub::set_visible_to`] refuses to
-    /// populate it, so an attached pane can never be re-published even by a
-    /// caller that bypasses [`CompanionHub::publishable_ids`].
+    /// `Origin::Attached` — [`CompanionHub::set_visible_to`] is the only
+    /// writer and refuses to populate it for that origin, so an attached
+    /// pane can never be re-published no matter who calls it.
     visible_to: HashSet<PeerId>,
 }
 
@@ -166,8 +168,12 @@ impl<S: Clone> CompanionHub<S> {
 
     /// Ids eligible for publication to a peer: `Origin::LocalPty` only.
     /// Never derived from "has a sender" — an attached pane has one too.
-    /// Called from Phase B onward, when a route first needs to scope what a
-    /// peer may see; no caller is wired to it yet.
+    ///
+    /// NOT the enforcement path: `sessions_for` and `may_touch` are —
+    /// they re-check origin directly on each entry rather than trusting a
+    /// filter like this one to have already been applied, so a route never
+    /// calls this. It exists for tests to assert on hub state directly,
+    /// e.g. `only_local_pty_sessions_are_publishable`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn publishable_ids(&self) -> Vec<String> {
         self.inner
@@ -179,9 +185,14 @@ impl<S: Clone> CompanionHub<S> {
             .collect()
     }
 
-    /// Ids currently broadcast to this peer. Called from Phase B onward,
-    /// when a route first needs to filter what a peer principal may reach;
-    /// no caller is wired to it yet.
+    /// Ids currently broadcast to this peer.
+    ///
+    /// NOT the enforcement path: `sessions_for` and `may_touch` are — see
+    /// `publishable_ids`. This exists so tests can assert on
+    /// `set_visible_to`'s own mutation-time guard in isolation from the
+    /// redundant origin check `may_touch`/`sessions_for` also perform,
+    /// which would otherwise mask a broken guard; see
+    /// `an_attached_session_cannot_be_broadcast_even_if_asked`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn visible_to(&self, peer: &PeerId) -> Vec<String> {
         self.inner
@@ -195,8 +206,10 @@ impl<S: Clone> CompanionHub<S> {
 
     /// Broadcast (or un-broadcast) a session to one peer. No-op for
     /// `Origin::Attached` sessions: the rule holds here, at the mutation, not
-    /// only at [`Self::publishable_ids`], so a future caller cannot route
-    /// around it by writing `visible_to` directly.
+    /// only in [`Self::sessions_for`]/[`Self::may_touch`]'s own origin
+    /// checks, so a future caller cannot route around it by writing
+    /// `visible_to` directly (those two re-check anyway, deliberately
+    /// redundant — see their doc comments).
     pub fn set_visible_to(&self, id: &str, peer: &PeerId, visible: bool) {
         if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
             if entry.origin != Origin::LocalPty {

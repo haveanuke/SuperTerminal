@@ -288,6 +288,7 @@ fn a_paired_peer_can_view_its_shared_session_but_not_manage_or_preview() {
             ),
             peers: vec![crate::peers::PeerRecord {
                 id: peer_id,
+                host: "second-mac".into(),
                 label: "second-mac".into(),
                 secret: PEER_SECRET.into(),
                 grants: crate::peers::Grants {
@@ -411,6 +412,7 @@ fn a_peer_without_the_view_grant_is_refused_the_session_list() {
             ),
             peers: vec![crate::peers::PeerRecord {
                 id: peer_id,
+                host: "third-mac".into(),
                 label: "third-mac".into(),
                 // Every grant off, including `view`.
                 secret: PEER_SECRET.into(),
