@@ -15,7 +15,7 @@ use crate::term_session::RenderableSnapshot;
 use crate::themes::Theme;
 use superterminal_core::activity::Activity;
 
-use super::auth::PeerId;
+use super::auth::{PeerId, Principal};
 use super::wire::serialize_snapshot;
 
 /// Where a published session's terminal actually lives. Encoded, never
@@ -42,6 +42,14 @@ pub const MAX_PENDING_RENAMES: usize = 8;
 /// Queued closes. Small: one per visible room is already generous, and a
 /// flood would just be the same rooms named twice.
 pub const MAX_PENDING_CLOSES: usize = 8;
+
+/// A queued terminal spawn, remembering who asked. `Principal::Peer`
+/// requests are made visible only to that one peer once the workspace tick
+/// materializes them — never broadcast to every paired peer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnRequest {
+    pub principal: Principal,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionInfo {
@@ -80,9 +88,11 @@ pub struct CompanionHub<S: Clone> {
     /// Bumped when the server (re)starts: panes compare against their own
     /// counter and publish even without fresh output, populating idle grids.
     pub generation: AtomicU64,
-    /// Terminals the phone asked for; drained by the workspace tick (PTY
-    /// spawn is main-thread-only).
-    pending_spawns: Mutex<usize>,
+    /// Terminals asked for (phone or peer); drained by the workspace tick
+    /// (PTY spawn is main-thread-only). The cap below is on this queue's
+    /// length regardless of who is asking — attribution must never turn one
+    /// shared cap into one cap per principal.
+    pending_spawns: Mutex<Vec<SpawnRequest>>,
     /// (terminal id, new label) renames from the phone; drained by the
     /// workspace tick (tab state is main-thread-only).
     pending_renames: Mutex<Vec<(String, String)>>,
@@ -95,7 +105,7 @@ impl<S: Clone> Default for CompanionHub<S> {
         Self {
             inner: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
-            pending_spawns: Mutex::new(0),
+            pending_spawns: Mutex::new(Vec::new()),
             pending_renames: Mutex::new(Vec::new()),
             pending_closes: Mutex::new(Vec::new()),
             cache: Mutex::new(HashMap::new()),
@@ -305,18 +315,40 @@ impl<S: Clone> CompanionHub<S> {
     }
 
     /// Queue one phone-requested terminal spawn; false when the pending cap
-    /// is reached (the server answers 429).
+    /// is reached (the server answers 429). Delegates to
+    /// [`Self::request_spawn_by`] with `Principal::Phone` so every existing
+    /// caller and test keeps today's behavior unchanged. Kept for
+    /// backward-compatible callers/tests; the server now resolves a
+    /// principal and calls [`Self::request_spawn_by`] directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn request_spawn(&self) -> bool {
+        self.request_spawn_by(Principal::Phone)
+    }
+
+    /// Queue one terminal spawn on behalf of `principal`; false when the
+    /// pending cap is reached. The cap is on the queue's length, not on any
+    /// one principal's share of it — a peer does not get a fresh quota just
+    /// by being a different principal than the phone.
+    pub fn request_spawn_by(&self, principal: Principal) -> bool {
         let mut pending = self.pending_spawns.lock().unwrap();
-        if *pending >= MAX_PENDING_SPAWNS {
+        if pending.len() >= MAX_PENDING_SPAWNS {
             return false;
         }
-        *pending += 1;
+        pending.push(SpawnRequest { principal });
         true
     }
 
     /// Drain and return the number of queued spawns (main-thread tick).
+    /// Kept for backward-compatible callers/tests; the workspace now calls
+    /// [`Self::drain_spawns`] directly to recover who asked.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn take_spawns(&self) -> usize {
+        self.drain_spawns().len()
+    }
+
+    /// Drain and return the queued spawn requests, in request order
+    /// (main-thread tick).
+    pub fn drain_spawns(&self) -> Vec<SpawnRequest> {
         std::mem::take(&mut *self.pending_spawns.lock().unwrap())
     }
 
@@ -373,7 +405,7 @@ pub type Hub = CompanionHub<alacritty_terminal::event_loop::EventLoopSender>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::companion::auth::PeerId;
+    use crate::companion::auth::{PeerId, Principal};
     use crate::term_session::{CursorStyle, SnapshotCursor};
 
     type TestHub = CompanionHub<std::sync::mpsc::Sender<Vec<u8>>>;
@@ -547,6 +579,32 @@ mod tests {
         assert_eq!(hub.take_spawns(), MAX_PENDING_SPAWNS);
         assert_eq!(hub.take_spawns(), 0, "drain resets");
         assert!(hub.request_spawn(), "capacity returns after drain");
+    }
+
+    #[test]
+    fn a_drained_spawn_remembers_who_asked() {
+        let hub = TestHub::new();
+        assert!(hub.request_spawn_by(Principal::Phone));
+        assert!(hub.request_spawn_by(Principal::Peer(PeerId("p1".into()))));
+        let drained = hub.drain_spawns();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].principal, Principal::Phone);
+        assert_eq!(drained[1].principal, Principal::Peer(PeerId("p1".into())));
+        assert!(hub.drain_spawns().is_empty(), "drain must be exhaustive");
+    }
+
+    #[test]
+    fn the_pending_cap_still_holds_across_principals() {
+        // The cap exists to stop a misbehaving client carpeting the Mac in
+        // tabs; attribution must not turn one cap into one cap per peer.
+        let hub = TestHub::new();
+        for _ in 0..MAX_PENDING_SPAWNS {
+            assert!(hub.request_spawn_by(Principal::Phone));
+        }
+        assert!(
+            !hub.request_spawn_by(Principal::Peer(PeerId("p1".into()))),
+            "a peer must not get its own fresh quota"
+        );
     }
 
     #[test]

@@ -685,11 +685,21 @@ impl Workspace {
         // server queues and this tick materializes — same flow as the Mac's
         // own "+" (new tab, focused).
         if let Some(hub) = self.companion_hub.clone() {
-            for _ in 0..hub.take_spawns() {
+            for request in hub.drain_spawns() {
                 self.add_tab(None, cx);
                 // add_tab set the logical focus; the gpui FocusHandle needs
                 // a Window, which the next render supplies.
                 self.companion_pending_focus = self.focused_terminal.clone();
+                if let crate::companion::auth::Principal::Peer(peer_id) = request.principal {
+                    // A peer-spawned terminal is visible to exactly the
+                    // peer that asked, never broadcast to every paired
+                    // peer. No UI path produces a peer request yet, so this
+                    // arm is unreachable in this phase — it must still do
+                    // the right thing once one does.
+                    if let Some(new_id) = &self.companion_pending_focus {
+                        hub.set_visible_to(new_id, &peer_id, true);
+                    }
+                }
             }
             // Phone-requested renames: tab state is main-thread-only. The
             // rename lands on the TAB holding that terminal (same label the

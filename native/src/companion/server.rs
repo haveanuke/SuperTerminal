@@ -495,7 +495,13 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
                 return;
             }
-            if shared.hub.request_spawn() {
+            // route_admitted("/spawn") guarantees `principal` is Some; the
+            // fallback below is defensive, never taken in practice.
+            let accepted = principal
+                .clone()
+                .map(|p| shared.hub.request_spawn_by(p))
+                .unwrap_or(false);
+            if accepted {
                 let _ = respond(&stream, "202 Accepted", &[], b"");
             } else {
                 let _ = respond(&stream, "429 Too Many Requests", &[], b"");
