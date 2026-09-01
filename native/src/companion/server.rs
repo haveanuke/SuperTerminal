@@ -14,6 +14,7 @@
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -35,6 +36,13 @@ pub const MAX_SSE: usize = 4;
 pub const MAX_IMG: usize = 2;
 const READ_DEADLINE: Duration = Duration::from_secs(10);
 const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// Bound on [`ServerHandle::stop_blocking_on_port_release`]'s wait for the
+/// acceptor to confirm it dropped the listener. The loopback connect that
+/// unblocks `accept()` normally lands in microseconds, so this is generous
+/// slack, not a tuned budget — the point is that it is FINITE: this runs on
+/// the UI thread via `stop_companion_for_restart`, so an unbounded wait
+/// would hang the whole app if that connect ever failed to land.
+const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 const SSE_POLL: Duration = Duration::from_millis(50);
 const SSE_FLOOR: Duration = Duration::from_millis(200);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(2);
@@ -73,9 +81,21 @@ pub struct ServerHandle {
     cancel: Arc<AtomicBool>,
     acceptor: Option<JoinHandle<()>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Signalled once, by the acceptor thread, right after it has dropped
+    /// the listener and the port is genuinely free. Lets
+    /// `stop_blocking_on_port_release` wait with a bound instead of calling
+    /// `JoinHandle::join` (which has no timed variant) directly.
+    port_released: Receiver<()>,
 }
 
 impl ServerHandle {
+    /// The bound address — needed by a caller that stops the server only to
+    /// immediately rebind on the exact same address (see
+    /// `stop_blocking_on_port_release`'s doc comment).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     /// Flip cancellation and unblock the acceptor WITHOUT joining — cheap
     /// enough for the UI thread, so streams start dying before pane
     /// teardown even though the joins happen elsewhere.
@@ -99,26 +119,51 @@ impl ServerHandle {
     }
 
     /// Like [`Self::stop`], but returns as soon as the port is actually
-    /// free instead of waiting for every worker to finish. The listening
-    /// socket lives inside the acceptor thread's closure (see [`start`]),
-    /// so it is only dropped — and the port only released — once that
-    /// thread has exited; joining it is normally near-instant, since
-    /// `cancel` + the loopback connect below unblock its `accept()` right
-    /// away. Worker joins (a worker mid-read can sit for its full
-    /// deadline) are handed to a background thread instead, same as
-    /// [`Self::stop`] would eventually do anyway.
+    /// free instead of waiting for every worker to finish — bounded by
+    /// [`PORT_RELEASE_TIMEOUT`], never an unbounded `JoinHandle::join`
+    /// (which has no timed variant). The listening socket lives inside the
+    /// acceptor thread's closure (see [`start`]); that thread drops it
+    /// explicitly and signals `port_released` right after, so waiting on
+    /// the channel — not joining the thread — is what tells us the port is
+    /// free. `cancel` + the loopback connect below normally unblock
+    /// `accept()` and land that signal in microseconds. Worker joins (a
+    /// worker mid-read can sit for its full deadline) are handed to a
+    /// background thread instead, same as [`Self::stop`] would eventually
+    /// do anyway — and so is the acceptor join itself, once we already
+    /// know from the channel whether the port is free.
     ///
     /// Callers that stop only to immediately rebind the SAME address —
     /// token regeneration, a forced restart after a peer-grant edit — MUST
     /// use this instead of firing `stop` off-thread: with a fire-and-forget
-    /// stop, the rebind can race the old listener's drop, fail to reclaim
-    /// the port, and silently fall through to the next one in the range —
-    /// which breaks a bookmark that encoded the old host:port.
-    pub fn stop_blocking_on_port_release(mut self) {
+    /// stop, the rebind can race the old listener's drop and fail to
+    /// reclaim the port.
+    ///
+    /// Returns `true` once the port is confirmed free. Returns `false` if
+    /// [`PORT_RELEASE_TIMEOUT`] elapses without a signal — the acceptor
+    /// may simply be slow, or it may never signal at all; either way the
+    /// port's state is then UNKNOWN. This runs on the UI thread, so the
+    /// bound exists to guarantee this call returns either way rather than
+    /// hanging the app. Callers MUST NOT treat `false` as license to search
+    /// for a different port to bind: falling through to the next one in
+    /// the range would silently break a bookmark that encoded the old
+    /// host:port. The safe response to `false` is to attempt a rebind on
+    /// the SAME address exactly once more and surface a visible error if
+    /// that fails too — never a silent move.
+    pub fn stop_blocking_on_port_release(mut self) -> bool {
         self.cancel.store(true, Ordering::Release);
         let _ = TcpStream::connect(self.addr); // unblock accept()
+        let released = matches!(
+            self.port_released.recv_timeout(PORT_RELEASE_TIMEOUT),
+            Ok(())
+        );
+        // Whether or not we heard back in time, the acceptor thread is
+        // either already gone or will be shortly — reap it off the UI
+        // thread rather than joining it here, which is exactly the
+        // unbounded wait this method exists to avoid.
         if let Some(acceptor) = self.acceptor.take() {
-            let _ = acceptor.join();
+            std::thread::spawn(move || {
+                let _ = acceptor.join();
+            });
         }
         let workers: Vec<JoinHandle<()>> = std::mem::take(&mut *self.workers.lock().unwrap());
         std::thread::spawn(move || {
@@ -126,6 +171,7 @@ impl ServerHandle {
                 let _ = worker.join();
             }
         });
+        released
     }
 }
 
@@ -156,6 +202,7 @@ pub fn start<S: InputSink>(
     let addr = listener.local_addr()?;
     let cancel = Arc::new(AtomicBool::new(false));
     let workers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+    let (port_released_tx, port_released_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         hub,
         theme,
@@ -200,6 +247,11 @@ pub fn start<S: InputSink>(
                     list.push(handle);
                 }
             }
+            // The port is only actually released once `listener` drops;
+            // drop it explicitly, THEN signal, so a bounded waiter can
+            // never observe "released" before it is true.
+            drop(listener);
+            let _ = port_released_tx.send(());
         })?;
     Ok(ServerHandle {
         url: format!("http://{addr}/"),
@@ -207,6 +259,7 @@ pub fn start<S: InputSink>(
         cancel,
         acceptor: Some(acceptor),
         workers,
+        port_released: port_released_rx,
     })
 }
 
@@ -346,6 +399,27 @@ fn stream_file(stream: &TcpStream, file: std::fs::File, len: u64, content_type: 
     }
 }
 
+/// Whether a request already accepted by a worker thread may still
+/// perform a side effect (queue a spawn, a rename, a close, or deliver
+/// input bytes to a session).
+///
+/// A worker's `Shared` — and the peer grants snapshotted inside it — is
+/// fixed at accept time, but `cancel` is a live flag: it flips the instant
+/// the server is torn down for an immediate restart (a peer revoked, a
+/// grant narrowed, the token rotated). A worker that was mid-request when
+/// that happened must not let a WRITE land on the strength of grants that
+/// no longer hold, even though it already finished parsing under the old
+/// ones. A read completing late is harmless and need not consult this;
+/// every route that mutates session state must, checked as close to the
+/// mutation as possible so the window this closes stays as small as it
+/// can be.
+///
+/// Pure over the loaded flag (not the `AtomicBool` itself) so the decision
+/// can be tested exhaustively without spinning up threads or sockets.
+fn may_still_act(cancelled: bool) -> bool {
+    !cancelled
+}
+
 fn token_of(req: &Request) -> &str {
     req.header("x-companion-token")
         .or_else(|| req.query_param("t"))
@@ -373,6 +447,17 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             return;
         }
     };
+    // A slow-bodied request that outlived a revocation/restart started
+    // under grants that may no longer hold. Same refusal shape as a bad
+    // token — nothing here may be distinguishable from that to a prober.
+    // Side-effecting routes re-check this again immediately before their
+    // mutation (see `may_still_act`); this first check just means a
+    // request that outlived the server's own shutdown does not get routed
+    // at all.
+    if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+        let _ = respond(&stream, "404 Not Found", &[], b"");
+        return;
+    }
     let path = request.path.clone();
     let host_ok = request.header("host") == Some(shared.host.as_str());
     // Token FIRST on protected routes (constant-time; a bad token learns
@@ -561,6 +646,13 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
                 return;
             }
+            // Re-checked immediately before the mutation: this worker's
+            // grants snapshot may have gone stale while the request was
+            // in flight (see `may_still_act`).
+            if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+                let _ = respond(&stream, "404 Not Found", &[], b"");
+                return;
+            }
             // route_admitted("/spawn") guarantees `principal` is Some; the
             // fallback below is defensive, never taken in practice.
             let accepted = principal
@@ -598,6 +690,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                     let _ = respond(&stream, "410 Gone", &[], b"");
                 }
                 Some((true, _)) => {
+                    // Re-checked immediately before the mutation (see
+                    // `may_still_act`).
+                    if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+                        let _ = respond(&stream, "404 Not Found", &[], b"");
+                        return;
+                    }
                     if shared.hub.request_rename(&id, &label) {
                         // The Mac's next tick applies it; the phone sees the
                         // new label on its next /sessions poll.
@@ -631,6 +729,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                     let _ = respond(&stream, "410 Gone", &[], b"");
                 }
                 Some((true, _)) => {
+                    // Re-checked immediately before the mutation (see
+                    // `may_still_act`).
+                    if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+                        let _ = respond(&stream, "404 Not Found", &[], b"");
+                        return;
+                    }
                     if shared.hub.request_close(&id) {
                         // Killing a PTY is main-thread work; the tick does
                         // it and the room leaves the phone's next poll.
@@ -676,6 +780,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                     let _ = respond(&stream, "410 Gone", &[], b"");
                 }
                 Some((true, sender)) => {
+                    // Re-checked immediately before the mutation (see
+                    // `may_still_act`).
+                    if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+                        let _ = respond(&stream, "404 Not Found", &[], b"");
+                        return;
+                    }
                     if sender.send_bytes(bytes) {
                         let _ = respond(&stream, "204 No Content", &[], b"");
                     } else {
@@ -726,6 +836,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                     let _ = respond(&stream, "410 Gone", &[], b"");
                 }
                 Some((true, sender)) => {
+                    // Re-checked immediately before the mutation (see
+                    // `may_still_act`).
+                    if !may_still_act(shared.cancel.load(Ordering::Acquire)) {
+                        let _ = respond(&stream, "404 Not Found", &[], b"");
+                        return;
+                    }
                     if sender.send_bytes(bytes) {
                         let _ = respond(&stream, "204 No Content", &[], b"");
                     } else {
@@ -1739,5 +1855,197 @@ mod tests {
         let ended = std::io::Read::read_to_string(&mut raw, &mut rest).is_ok();
         assert!(ended, "stream should close after unregister");
         handle.stop();
+    }
+
+    #[test]
+    fn may_still_act_is_exactly_negated_cancellation() {
+        // Exhaustive over the whole domain (a bool has two values) — this
+        // is the pure decision every side-effecting route re-checks
+        // immediately before it acts; a full slow-body race that flips
+        // `cancel` mid-request is impractical to drive deterministically
+        // in a test, so the mechanism is verified here in isolation and
+        // exercised end-to-end (already-cancelled) in
+        // `cancelling_mid_flight_blocks_every_write_route_from_taking_effect`
+        // below.
+        assert!(may_still_act(false), "not cancelled: may act");
+        assert!(!may_still_act(true), "cancelled: may not act");
+    }
+
+    #[test]
+    fn cancelling_mid_flight_blocks_every_write_route_from_taking_effect() {
+        // Regression for the revocation race: a worker's `Shared` is
+        // frozen at accept time, so a slow-bodied request can still be
+        // "in flight" — parsed, admitted, about to mutate — when a peer
+        // is revoked or the token rotates and the server flips `cancel`.
+        // Driving the real timing is impractical (see the predicate test
+        // above), so each write route is exercised twice against the
+        // SAME hub/session/peer setup: once with `cancel` false, proving
+        // the request would otherwise have succeeded (so the later
+        // refusal isn't just some unrelated guard), and once with it
+        // true, proving the in-flight worker now refuses and performs no
+        // side effect. `/spawn`, `/input`, `/peer-input` were the sites
+        // the review named; `/rename` and `/close` are enumerated here
+        // too since they mutate state exactly the same way.
+        let hub = Arc::new(TestHub::new());
+        let (tx, rx) = mpsc::channel();
+        hub.register("t1", "work", tx);
+        hub.publish_snapshot("t1", Arc::new(seeded_snapshot(false)));
+
+        let peer_id = crate::companion::auth::PeerId("peer-1".to_string());
+        hub.set_visible_to("t1", &peer_id, true);
+        let peer_secret = "beefbeefbeefbeefbeefbeefbeefbeef".to_string();
+        let peer = crate::peers::PeerRecord {
+            id: peer_id,
+            host: "peer.local".into(),
+            label: "Work MacBook".into(),
+            secret: peer_secret.clone(),
+            grants: crate::peers::Grants {
+                view: true,
+                type_: true,
+                spawn: true,
+            },
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared = Shared {
+            hub: Arc::clone(&hub),
+            theme: theme(),
+            token: TOKEN.into(),
+            host: host.clone(),
+            page: PAGE,
+            cancel: Arc::clone(&cancel),
+            conns: AtomicUsize::new(0),
+            sse: AtomicUsize::new(0),
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: test_thumbs(),
+            img: AtomicUsize::new(0),
+            build: "test-build".into(),
+            peers: vec![peer],
+        };
+
+        let serve_once = |raw: String| -> String {
+            let host = host.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(&host).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream.write_all(raw.as_bytes()).unwrap();
+                let mut out = String::new();
+                let _ = stream.read_to_string(&mut out);
+                out
+            });
+            let (server_stream, _) = listener.accept().unwrap();
+            serve_connection(&shared, server_stream);
+            client.join().unwrap()
+        };
+
+        let spawn_req = || {
+            format!(
+                "POST /spawn HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
+            )
+        };
+        let ok = serve_once(spawn_req());
+        assert!(ok.starts_with("HTTP/1.1 202"), "baseline /spawn: {ok}");
+        assert_eq!(hub.drain_spawns().len(), 1, "baseline /spawn must queue");
+        cancel.store(true, Ordering::Release);
+        let refused = serve_once(spawn_req());
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(
+            hub.drain_spawns().is_empty(),
+            "a cancelled worker must not queue a spawn"
+        );
+        cancel.store(false, Ordering::Release);
+
+        let peer_input_body = r#"{"bytes":[7]}"#;
+        let peer_input_req = || {
+            format!(
+                "POST /peer-input/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {peer_secret}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{peer_input_body}",
+                peer_input_body.len()
+            )
+        };
+        let ok = serve_once(peer_input_req());
+        assert!(ok.starts_with("HTTP/1.1 204"), "baseline /peer-input: {ok}");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            vec![7u8],
+            "baseline /peer-input must deliver bytes"
+        );
+        cancel.store(true, Ordering::Release);
+        let refused = serve_once(peer_input_req());
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled worker must not deliver peer input"
+        );
+        cancel.store(false, Ordering::Release);
+
+        let input_body = r#"{"text":"x"}"#;
+        let input_req = || {
+            format!(
+                "POST /input/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{input_body}",
+                input_body.len()
+            )
+        };
+        let ok = serve_once(input_req());
+        assert!(ok.starts_with("HTTP/1.1 204"), "baseline /input: {ok}");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            b"x".to_vec(),
+            "baseline /input must deliver bytes"
+        );
+        cancel.store(true, Ordering::Release);
+        let refused = serve_once(input_req());
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled worker must not deliver phone input"
+        );
+        cancel.store(false, Ordering::Release);
+
+        let rename_body = r#"{"label":"renamed"}"#;
+        let rename_req = || {
+            format!(
+                "POST /rename/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{rename_body}",
+                rename_body.len()
+            )
+        };
+        let ok = serve_once(rename_req());
+        assert!(ok.starts_with("HTTP/1.1 202"), "baseline /rename: {ok}");
+        assert_eq!(
+            hub.take_renames(),
+            vec![("t1".to_string(), "renamed".to_string())],
+            "baseline /rename must queue"
+        );
+        cancel.store(true, Ordering::Release);
+        let refused = serve_once(rename_req());
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(
+            hub.take_renames().is_empty(),
+            "a cancelled worker must not queue a rename"
+        );
+        cancel.store(false, Ordering::Release);
+
+        let close_req = || {
+            format!(
+                "POST /close/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
+            )
+        };
+        let ok = serve_once(close_req());
+        assert!(ok.starts_with("HTTP/1.1 202"), "baseline /close: {ok}");
+        assert_eq!(
+            hub.take_closes(),
+            vec!["t1".to_string()],
+            "baseline /close must queue"
+        );
+        cancel.store(true, Ordering::Release);
+        let refused = serve_once(close_req());
+        assert!(refused.starts_with("HTTP/1.1 404"), "{refused}");
+        assert!(
+            hub.take_closes().is_empty(),
+            "a cancelled worker must not queue a close"
+        );
     }
 }

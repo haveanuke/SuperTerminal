@@ -57,29 +57,19 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn toggle_companion(&mut self, cx: &mut Context<Self>) {
-        use crate::companion::{net, server};
-        if self.companion_server.is_some() {
-            self.stop_companion(cx);
-            cx.notify();
-            return;
-        }
-        self.companion_error = None;
-        let token = match &self.settings.companion_token {
-            Some(token) => token.clone(),
-            None => {
-                let token = crate::companion::auth::generate_token();
-                self.settings.companion_token = Some(token.clone());
-                let _ = self.settings.save();
-                token
-            }
-        };
-        let Some(ip) = net::tailnet_ipv4() else {
-            self.companion_error =
-                Some("no Tailscale interface found — is Tailscale on?".to_string());
-            cx.notify();
-            return;
-        };
+    /// Rebuild the hub from the current panes and resolve the preview
+    /// store/thumbnailer a new companion server will use. Shared by a cold
+    /// [`Self::toggle_companion`] and a pinned
+    /// [`Self::restart_companion_pinned`] — they differ only in which
+    /// port(s) they are willing to bind afterward.
+    fn prepare_companion_hub(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> (
+        Arc<crate::companion::hub::Hub>,
+        Arc<crate::companion::previews::PreviewStore>,
+        Arc<crate::companion::thumbs::Thumbnailer>,
+    ) {
         let hub = Arc::new(crate::companion::hub::Hub::new());
         let ids: Vec<String> = self.panes.keys().cloned().collect();
         for id in ids {
@@ -115,6 +105,33 @@ impl Workspace {
         // with the store, so spawning unconditionally is free when off.
         crate::companion::blender::spawn(Arc::downgrade(&previews), cache_dir.clone());
         let thumbs = crate::companion::thumbs::Thumbnailer::new(cache_dir);
+        (hub, previews, thumbs)
+    }
+
+    pub(super) fn toggle_companion(&mut self, cx: &mut Context<Self>) {
+        use crate::companion::{net, server};
+        if self.companion_server.is_some() {
+            self.stop_companion(cx);
+            cx.notify();
+            return;
+        }
+        self.companion_error = None;
+        let token = match &self.settings.companion_token {
+            Some(token) => token.clone(),
+            None => {
+                let token = crate::companion::auth::generate_token();
+                self.settings.companion_token = Some(token.clone());
+                let _ = self.settings.save();
+                token
+            }
+        };
+        let Some(ip) = net::tailnet_ipv4() else {
+            self.companion_error =
+                Some("no Tailscale interface found — is Tailscale on?".to_string());
+            cx.notify();
+            return;
+        };
+        let (hub, previews, thumbs) = self.prepare_companion_hub(cx);
         // Resolved ONCE here and frozen for the server's lifetime. Nothing
         // refreshes it on its own — a peer edited or deleted after this
         // point would keep its old grants until the server is next
@@ -179,20 +196,35 @@ impl Workspace {
         self.stop_companion_inner(cx, false);
     }
 
-    /// Same teardown as [`Self::stop_companion`], but blocks the calling
-    /// thread until the old listener's port is actually free — i.e. until
-    /// the acceptor thread has exited (see
+    /// Same teardown as [`Self::stop_companion`], but waits — with a bound,
+    /// never the UI thread hanging forever — for the old listener's port to
+    /// actually free up (see
     /// [`crate::companion::server::ServerHandle::stop_blocking_on_port_release`]).
-    /// Every caller that stops the companion only to immediately call
-    /// [`Self::toggle_companion`] again — restarting it on the same address
-    /// — must go through this, or the rebind can lose the race, fall
-    /// through to the next port in `43110..43121`, and silently break the
+    /// Every caller that stops the companion only to immediately restart it
+    /// on the same address must go through this, or the rebind can lose
+    /// the race with the old listener's drop and silently break the
     /// phone's saved bookmark (it encodes host:port).
-    pub(super) fn stop_companion_for_restart(&mut self, cx: &mut Context<Self>) {
-        self.stop_companion_inner(cx, true);
+    ///
+    /// Returns the address that was bound, for [`Self::restart_companion_pinned`]
+    /// to rebind on — the caller MUST pin the restart to exactly this
+    /// address rather than searching the port range the way
+    /// [`Self::toggle_companion`] does: the wait above is bounded and can
+    /// return without the port being confirmed free, and searching onward
+    /// in that case is exactly the silent-move failure mode this exists to
+    /// avoid. `None` means nothing was running, so there is nothing to
+    /// restart.
+    pub(super) fn stop_companion_for_restart(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<std::net::SocketAddr> {
+        self.stop_companion_inner(cx, true)
     }
 
-    fn stop_companion_inner(&mut self, cx: &mut Context<Self>, block_for_port: bool) {
+    fn stop_companion_inner(
+        &mut self,
+        cx: &mut Context<Self>,
+        block_for_port: bool,
+    ) -> Option<std::net::SocketAddr> {
         // The link this state vouched for is dying (stop, or a regenerate
         // that revokes the token) — "copied" must not outlive it.
         self.companion_copied = false;
@@ -202,14 +234,73 @@ impl Workspace {
         }
         self.companion_hub = None;
         self.companion_previews = None;
-        if let Some(handle) = self.companion_server.take() {
-            handle.cancel();
-            if block_for_port {
-                handle.stop_blocking_on_port_release();
-            } else {
-                std::thread::spawn(move || handle.stop());
+        let handle = self.companion_server.take()?;
+        let addr = handle.addr();
+        handle.cancel();
+        if block_for_port {
+            // The bound wait's return only distinguishes "confirmed free"
+            // from "unconfirmed — may still be bound"; either way,
+            // `restart_companion_pinned` makes exactly one attempt at
+            // `addr` and reports a visible error instead of guessing at a
+            // different port.
+            let _ = handle.stop_blocking_on_port_release();
+            Some(addr)
+        } else {
+            std::thread::spawn(move || handle.stop());
+            None
+        }
+    }
+
+    /// Rebind the companion on EXACTLY `addr` after a forced restart (token
+    /// rotation, a peer revoked or narrowed). Unlike a cold
+    /// [`Self::toggle_companion`], this never searches `43110..43121`:
+    /// falling through to the next port after losing the old listener's
+    /// release race would silently move the server out from under the
+    /// phone's saved bookmark, which encodes host:port. A visible error the
+    /// user can retry is the safe failure mode; a server that quietly moved
+    /// is not.
+    pub(super) fn restart_companion_pinned(
+        &mut self,
+        cx: &mut Context<Self>,
+        addr: std::net::SocketAddr,
+    ) {
+        use crate::companion::server;
+        // No token means nothing could have been serving it either — there
+        // is nothing to restart.
+        let Some(token) = self.settings.companion_token.clone() else {
+            return;
+        };
+        let (hub, previews, thumbs) = self.prepare_companion_hub(cx);
+        let (peers, _peer_problems) = self.settings.peers();
+        match server::start(
+            Arc::clone(&hub),
+            self.theme,
+            server::ServerConfig {
+                bind: addr,
+                token,
+                page: include_str!("../companion/page.html"),
+                previews: Arc::clone(&previews),
+                thumbs,
+                peers,
+            },
+        ) {
+            Ok(handle) => {
+                self.companion_error = None;
+                self.companion_hub = Some(hub);
+                self.companion_server = Some(handle);
+                self.companion_previews = Some(previews);
+            }
+            Err(_) => {
+                for pane in self.panes.values() {
+                    pane.update(cx, |pane, _| pane.set_companion(None));
+                }
+                self.companion_error = Some(format!(
+                    "companion port {} did not free up after the change — phone link is OFF; reopen it from the rail to retry",
+                    addr.port()
+                ));
             }
         }
+        cx.notify();
     }
 
     /// Point the live catalog at the (re)configured folder; no-op while the
@@ -255,14 +346,15 @@ impl Workspace {
     /// Regenerate the capability token: old bookmarks die, the server
     /// restarts with the new link.
     pub(super) fn regenerate_companion_token(&mut self, cx: &mut Context<Self>) {
-        let was_running = self.companion_server.is_some();
-        if was_running {
-            self.stop_companion_for_restart(cx);
-        }
+        let restart_addr = if self.companion_server.is_some() {
+            self.stop_companion_for_restart(cx)
+        } else {
+            None
+        };
         self.settings.companion_token = Some(crate::companion::auth::generate_token());
         let _ = self.settings.save();
-        if was_running {
-            self.toggle_companion(cx);
+        if let Some(addr) = restart_addr {
+            self.restart_companion_pinned(cx, addr);
         }
         cx.notify();
     }

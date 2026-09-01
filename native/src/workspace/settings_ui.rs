@@ -1033,14 +1033,15 @@ impl Workspace {
     fn apply_peer_mutation(&mut self, updated: Vec<peers::PeerRecord>, cx: &mut Context<Self>) {
         let (before, _problems) = self.settings.peers();
         let restart = peers::peer_mutation_requires_restart(&before, &updated);
-        let was_running = self.companion_server.is_some();
-        if restart && was_running {
-            self.stop_companion_for_restart(cx);
-        }
+        let restart_addr = if restart && self.companion_server.is_some() {
+            self.stop_companion_for_restart(cx)
+        } else {
+            None
+        };
         self.settings.peers = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
         let _ = self.settings.save();
-        if restart && was_running {
-            self.toggle_companion(cx);
+        if let Some(addr) = restart_addr {
+            self.restart_companion_pinned(cx, addr);
         }
         cx.notify();
     }
