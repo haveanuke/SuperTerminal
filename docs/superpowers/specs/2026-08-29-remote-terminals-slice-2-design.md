@@ -1,7 +1,11 @@
 # Remote terminals (slice 2) — design
 
 Date: 2026-08-29
-Status: PROPOSAL, revised once after design review.
+Status: **SUPERSEDED** by `2026-08-31-peer-instances-design.md`. Not cancelled —
+deferred. ssh still earns its place for reaching a machine that is NOT running
+SuperTerminal (a server, a VPS, the Windows PC); it is simply no longer first,
+because peer instances cover the actual use case and delete two slices doing it.
+Read the peer design before touching anything here.
 Parent: `docs/superpowers/specs/2026-08-28-remote-hosts-design.md` (slice 1 shipped as `a9f654e`)
 
 ## Goal
