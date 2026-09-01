@@ -22,10 +22,8 @@ pub struct PeerId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     Phone,
-    /// Constructed from Phase B onward, once pairing exists and
-    /// `principal_for` can actually resolve a peer's token. Until then the
-    /// admission table below is deliberately ahead of what can be reached.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A paired peer instance, resolved by `principal_for` once a presented
+    /// secret matches a configured `peers::PeerRecord`.
     Peer(PeerId),
 }
 
@@ -97,14 +95,37 @@ pub fn admits_with_grants(
     }
 }
 
-/// Resolve a presented token to a principal. Constant-time against the
-/// phone token; Phase A has no peer secrets, so `Peer` is unreachable here.
-pub fn principal_for(phone_token: &str, presented: &str) -> Option<Principal> {
+/// Resolve a presented token to a principal. The phone token is checked
+/// FIRST, exactly as before pairing existed, and wins outright: a peer
+/// secret must never be able to shadow or impersonate the phone principal.
+/// Only once that check fails is `presented` compared against every
+/// configured peer's secret (see `peer_secret_matches`).
+pub fn principal_for(
+    phone_token: &str,
+    presented: &str,
+    peers: &[crate::peers::PeerRecord],
+) -> Option<Principal> {
     if token_matches(phone_token, presented) {
-        Some(Principal::Phone)
-    } else {
-        None
+        return Some(Principal::Phone);
     }
+    peer_secret_matches(presented, peers)
+}
+
+/// Compare `presented` against EVERY peer's secret rather than stopping at
+/// the first hit. `token_matches` is already constant-time per comparison;
+/// a loop that returns as soon as one matches would still leak, through how
+/// many comparisons ran before the response, how many peers are configured
+/// and roughly where in the list a match sits. Running the full loop
+/// unconditionally keeps that shape identical for a match, a miss, and an
+/// empty list.
+fn peer_secret_matches(presented: &str, peers: &[crate::peers::PeerRecord]) -> Option<Principal> {
+    let mut hit: Option<PeerId> = None;
+    for peer in peers {
+        if token_matches(&peer.secret, presented) && hit.is_none() {
+            hit = Some(peer.id.clone());
+        }
+    }
+    hit.map(Principal::Peer)
 }
 
 pub fn generate_token() -> String {
@@ -222,9 +243,73 @@ mod tests {
 
     #[test]
     fn only_the_phone_token_resolves_to_a_principal_in_this_phase() {
-        assert_eq!(principal_for("abc123", "abc123"), Some(Principal::Phone));
-        assert_eq!(principal_for("abc123", "wrong"), None);
-        assert_eq!(principal_for("abc123", ""), None);
+        assert_eq!(
+            principal_for("abc123", "abc123", &[]),
+            Some(Principal::Phone)
+        );
+        assert_eq!(principal_for("abc123", "wrong", &[]), None);
+        assert_eq!(principal_for("abc123", "", &[]), None);
+    }
+
+    /// Test-only shape adapter: the brief's helper takes `(id, secret)`
+    /// pairs rather than full `PeerRecord`s, since auth has no business
+    /// caring about labels or grants when resolving a principal. Builds the
+    /// records `principal_for` actually takes and delegates to it.
+    fn principal_for_with_peers(
+        phone_token: &str,
+        presented: &str,
+        peers: &[(&str, &str)],
+    ) -> Option<Principal> {
+        let records: Vec<crate::peers::PeerRecord> = peers
+            .iter()
+            .map(|(id, secret)| crate::peers::PeerRecord {
+                id: PeerId((*id).to_string()),
+                label: String::new(),
+                secret: (*secret).to_string(),
+                grants: crate::peers::Grants::default(),
+            })
+            .collect();
+        principal_for(phone_token, presented, &records)
+    }
+
+    #[test]
+    fn a_paired_secret_resolves_to_that_peer() {
+        let peers = vec![("p1", "aabbccddeeff00112233445566778899")];
+        assert_eq!(
+            principal_for_with_peers("phone-token", "aabbccddeeff00112233445566778899", &peers),
+            Some(Principal::Peer(PeerId("p1".into())))
+        );
+    }
+
+    #[test]
+    fn the_phone_token_still_wins_and_is_unchanged() {
+        let peers = vec![("p1", "aabbccddeeff00112233445566778899")];
+        assert_eq!(
+            principal_for_with_peers("phone-token", "phone-token", &peers),
+            Some(Principal::Phone)
+        );
+    }
+
+    #[test]
+    fn an_unknown_secret_resolves_to_nobody() {
+        let peers = vec![("p1", "aabbccddeeff00112233445566778899")];
+        assert_eq!(
+            principal_for_with_peers("phone-token", "nope", &peers),
+            None
+        );
+        assert_eq!(principal_for_with_peers("phone-token", "", &peers), None);
+    }
+
+    #[test]
+    fn a_peer_secret_cannot_shadow_the_phone_even_on_an_exact_collision() {
+        // If a peer's secret were ever equal to the phone token, the phone
+        // must still be who gets resolved — the phone check runs first and
+        // returns immediately, so the peer loop never even runs.
+        let peers = vec![("p1", "phone-token")];
+        assert_eq!(
+            principal_for_with_peers("phone-token", "phone-token", &peers),
+            Some(Principal::Phone)
+        );
     }
 
     fn all_off() -> crate::peers::Grants {

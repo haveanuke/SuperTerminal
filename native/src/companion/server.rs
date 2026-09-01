@@ -351,7 +351,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
     let principal: Option<Principal> = if request.method == Method::Get && path == "/" {
         None
     } else {
-        match principal_for(&shared.token, token_of(&request)) {
+        match principal_for(&shared.token, token_of(&request), &shared.peers) {
             Some(principal) => Some(principal),
             None => {
                 let _ = respond(&stream, "404 Not Found", &[], b"");

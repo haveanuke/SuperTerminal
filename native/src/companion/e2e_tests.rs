@@ -259,6 +259,195 @@ fn the_peer_byte_sink_rejects_the_phone_token() {
 }
 
 #[test]
+fn a_paired_peer_can_view_its_shared_session_but_not_manage_or_preview() {
+    // The composition proof: Task 1's admission table, Task 3's grants and
+    // Task 2's scoping each have to independently agree for this to work.
+    // A real peer secret, paired with `view` only, must be able to list
+    // sessions and see ONLY the one session shared with it (scoping), while
+    // the SAME authenticated, granted principal is refused two phone-only
+    // routes outright (admission) regardless of what it holds (grants).
+    let shared_session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let private_session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("shared", "shared-one", shared_session.input_sender());
+    hub.register("private", "private-two", private_session.input_sender());
+    let peer_id = crate::companion::auth::PeerId("mac2".to_string());
+    hub.set_visible_to("shared", &peer_id, true);
+
+    const PEER_SECRET: &str = "aabbccddeeff00112233445566778899";
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-peer-{}", std::process::id())),
+            ),
+            peers: vec![crate::peers::PeerRecord {
+                id: peer_id,
+                label: "second-mac".into(),
+                secret: PEER_SECRET.into(),
+                grants: crate::peers::Grants {
+                    view: true,
+                    type_: false,
+                    spawn: false,
+                },
+            }],
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    // GET /sessions: the paired secret authenticates, is admitted (shared
+    // route) and holds `view`, so it sees the shared session — and ONLY
+    // that one, never the unshared one.
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET /sessions?t={PEER_SECRET} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+    let mut sessions = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut sessions);
+    assert!(sessions.starts_with("HTTP/1.1 200"), "{sessions}");
+    assert!(
+        sessions.contains("\"id\":\"shared\""),
+        "peer lost the session shared with it: {sessions}"
+    );
+    assert!(
+        !sessions.contains("\"id\":\"private\""),
+        "peer saw a session never shared with it: {sessions}"
+    );
+
+    // POST /close: phone-only in the admission table. A view grant on a
+    // route the table never admitted must not matter.
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /close/shared HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {PEER_SECRET}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut close = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut close);
+    assert!(
+        close.starts_with("HTTP/1.1 404"),
+        "a paired peer reached /close: {close}"
+    );
+    assert!(
+        hub.take_closes().is_empty(),
+        "the refused close must never have been queued"
+    );
+
+    // GET /previews: also phone-only.
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET /previews?t={PEER_SECRET} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+    let mut previews = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut previews);
+    assert!(
+        previews.starts_with("HTTP/1.1 404"),
+        "a paired peer reached /previews: {previews}"
+    );
+
+    handle.stop();
+    shared_session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+    private_session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
+fn a_peer_without_the_view_grant_is_refused_the_session_list() {
+    // /sessions is admitted to a Peer by the route table alone (Task 1), so
+    // a refusal here can ONLY come from the grant check (Task 3) — this is
+    // the leg the composition test above cannot prove: with `view` granted,
+    // `admits()` alone would already permit it, so dropping grants entirely
+    // in production would go unnoticed by that test. The secret below is
+    // real and paired (authentication succeeds), and the route is one the
+    // table admits a peer to — the only thing missing is the grant.
+    let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("shared", "shared-one", session.input_sender());
+    let peer_id = crate::companion::auth::PeerId("mac3".to_string());
+    // Shared with the peer, so a refusal cannot be blamed on scoping either.
+    hub.set_visible_to("shared", &peer_id, true);
+
+    const PEER_SECRET: &str = "00112233445566778899aabbccddeeff";
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir()
+                    .join(format!("st-thumbcache-e2e-noview-{}", std::process::id())),
+            ),
+            peers: vec![crate::peers::PeerRecord {
+                id: peer_id,
+                label: "third-mac".into(),
+                // Every grant off, including `view`.
+                secret: PEER_SECRET.into(),
+                grants: crate::peers::Grants::default(),
+            }],
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET /sessions?t={PEER_SECRET} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+    let mut sessions = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut sessions);
+    assert!(
+        sessions.starts_with("HTTP/1.1 404"),
+        "a peer with no view grant reached /sessions: {sessions}"
+    );
+
+    handle.stop();
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
 fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
     // A peer is authenticated but still untrusted input: an oversized
     // payload must be refused by the generic body cap before anything
