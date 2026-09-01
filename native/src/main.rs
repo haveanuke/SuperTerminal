@@ -11,6 +11,7 @@ mod icons;
 mod keys;
 mod layout;
 mod pane;
+mod peer_client;
 mod peers;
 mod settings;
 mod term_session;
