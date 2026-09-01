@@ -38,9 +38,14 @@ pub fn admits(path: &str, method: Method, principal: &Principal) -> bool {
             | ("/spawn", Method::Post)
             | ("/version", Method::Get)
     );
+    // The raw-byte sink: a peer runs the local key encoder itself and ships
+    // the resulting bytes, which the phone's symbolic keypad has no use
+    // for and must never reach — a raw sink is a much bigger attack surface
+    // than ten named keys.
+    let peer_only = matches!((path, method), ("/peer-input", Method::Post));
     match principal {
         Principal::Phone => phone_only || shared,
-        Principal::Peer(_) => shared,
+        Principal::Peer(_) => shared || peer_only,
     }
 }
 
@@ -149,6 +154,15 @@ mod tests {
         assert!(
             !admits("/preview", Method::Get, &peer()),
             "peer got /preview"
+        );
+    }
+
+    #[test]
+    fn only_a_peer_may_use_the_raw_byte_sink() {
+        assert!(admits("/peer-input", Method::Post, &peer()));
+        assert!(
+            !admits("/peer-input", Method::Post, &Principal::Phone),
+            "the phone reached the peer's raw-byte sink"
         );
     }
 

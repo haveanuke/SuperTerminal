@@ -24,7 +24,9 @@ use superterminal_core::activity::Activity;
 use super::auth::{admits, principal_for, Principal};
 use super::http::{parse_request, Method, ParseError, Request};
 use super::hub::CompanionHub;
-use super::input::{parse_body, parse_rename, symbolic_bytes, text_bytes, InputMsg};
+use super::input::{
+    parse_body, parse_peer_bytes, parse_rename, symbolic_bytes, text_bytes, InputMsg,
+};
 
 pub const MAX_CONNS: usize = 8;
 pub const MAX_SSE: usize = 4;
@@ -601,6 +603,45 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                         return;
                     }
                 },
+            };
+            match shared.hub.input_sender(&id) {
+                None => {
+                    let _ = respond(&stream, "404 Not Found", &[], b"");
+                }
+                Some((false, _)) => {
+                    let _ = respond(&stream, "410 Gone", &[], b"");
+                }
+                Some((true, sender)) => {
+                    if sender.send_bytes(bytes) {
+                        let _ = respond(&stream, "204 No Content", &[], b"");
+                    } else {
+                        let _ = respond(&stream, "410 Gone", &[], b"");
+                    }
+                }
+            }
+        }
+        // The peer raw-byte sink: same discipline as `/input` (origin,
+        // content type, body cap already enforced by `parse_request`'s
+        // MAX_BODY), but the payload is opaque bytes a peer already
+        // encoded with `keys.rs::key_to_bytes` — never interpreted here,
+        // only validated as a clean array of bytes. Admitted for
+        // `Principal::Peer` only (see `auth::admits`).
+        (Method::Post, _) if path.starts_with("/peer-input/") && route_admitted("/peer-input") => {
+            let our_origin = format!("http://{}", shared.host);
+            if let Some(origin) = request.header("origin") {
+                if origin != our_origin {
+                    let _ = respond(&stream, "403 Forbidden", &[], b"");
+                    return;
+                }
+            }
+            if request.header("content-type") != Some(INPUT_CONTENT_TYPE) {
+                let _ = respond(&stream, "415 Unsupported Media Type", &[], b"");
+                return;
+            }
+            let id = path["/peer-input/".len()..].to_string();
+            let Some(bytes) = parse_peer_bytes(&request.body) else {
+                let _ = respond(&stream, "400 Bad Request", &[], b"");
+                return;
             };
             match shared.hub.input_sender(&id) {
                 None => {

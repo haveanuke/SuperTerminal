@@ -146,6 +146,118 @@ fn phone_input_round_trips_to_sse_snapshot() {
 }
 
 #[test]
+fn the_peer_byte_sink_rejects_the_phone_token() {
+    // Route admission, not just authentication. The phone authenticates
+    // fine; it must still be refused this route, because it has its own
+    // symbolic endpoint. This is what proves Task 1's table is ENFORCED
+    // and not merely defined.
+    let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("t1", "e2e", session.input_sender());
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
+            ),
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let body = serde_json::json!({ "bytes": [104, 105] }).to_string();
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /peer-input/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut out = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut out);
+    assert!(
+        out.starts_with("HTTP/1.1 404"),
+        "phone token reached the peer sink: {out}"
+    );
+
+    handle.stop();
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
+fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
+    // A peer is authenticated but still untrusted input: an oversized
+    // payload must be refused by the generic body cap before anything
+    // tries to interpret it as a byte array.
+    let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("t1", "e2e", session.input_sender());
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
+            ),
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let body = serde_json::json!({ "bytes": vec![7u8; 3000] }).to_string();
+    assert!(
+        body.len() > super::http::MAX_BODY,
+        "test body must exceed MAX_BODY to exercise the cap"
+    );
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /peer-input/t1 HTTP/1.1\r\nHost: {host}\r\nX-Companion-Token: {TOKEN}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut out = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut out);
+    assert!(out.starts_with("HTTP/1.1 413"), "{out}");
+
+    handle.stop();
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
 fn scrolled_back_host_still_publishes_the_live_screen() {
     let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     // 200 tagged lines so the viewport is deep in scrollback territory.

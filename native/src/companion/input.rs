@@ -69,6 +69,23 @@ pub fn parse_rename(body: &[u8]) -> Option<String> {
     Some(trimmed.chars().take(64).collect())
 }
 
+/// A peer's raw-byte payload: `{"bytes": [u8]}`. Unlike the phone's
+/// symbolic vocabulary, a peer already ran `keys.rs::key_to_bytes` — the
+/// same encoder a local pane uses — so these bytes are opaque PTY input,
+/// not something this server interprets. The only job here is refusing
+/// anything that is not cleanly an array of bytes: a missing field, a
+/// non-array, or an out-of-range/non-integer element is rejected outright
+/// rather than coerced (clamped, truncated, or best-effort parsed).
+#[derive(Deserialize)]
+struct PeerBody {
+    bytes: Option<Vec<u8>>,
+}
+
+pub fn parse_peer_bytes(body: &[u8]) -> Option<Vec<u8>> {
+    let raw: PeerBody = serde_json::from_slice(body).ok()?;
+    raw.bytes
+}
+
 pub fn symbolic_bytes(key: &str, app_cursor: bool) -> Option<Vec<u8>> {
     let arrow = |ch: u8| {
         if app_cursor {
@@ -182,6 +199,40 @@ mod tests {
         // Over-long names truncate to 64 chars.
         let long = format!("{{\"label\":\"{}\"}}", "x".repeat(90));
         assert_eq!(parse_rename(long.as_bytes()).unwrap().chars().count(), 64);
+    }
+
+    #[test]
+    fn peer_bytes_parses_a_clean_array() {
+        assert_eq!(
+            parse_peer_bytes(br#"{"bytes":[27,91,65]}"#),
+            Some(vec![0x1b, b'[', b'A'])
+        );
+        assert_eq!(parse_peer_bytes(br#"{"bytes":[]}"#), Some(vec![]));
+    }
+
+    #[test]
+    fn peer_bytes_rejects_a_missing_field() {
+        assert_eq!(parse_peer_bytes(br#"{}"#), None);
+    }
+
+    #[test]
+    fn peer_bytes_rejects_a_non_array() {
+        assert_eq!(parse_peer_bytes(br#"{"bytes":"hi"}"#), None);
+        assert_eq!(parse_peer_bytes(br#"{"bytes":42}"#), None);
+    }
+
+    #[test]
+    fn peer_bytes_rejects_out_of_range_or_non_integer_elements() {
+        // 256 does not fit a byte, and neither does a negative number or a
+        // fraction — none of these are clamped, they are refused.
+        assert_eq!(parse_peer_bytes(br#"{"bytes":[256]}"#), None);
+        assert_eq!(parse_peer_bytes(br#"{"bytes":[-1]}"#), None);
+        assert_eq!(parse_peer_bytes(br#"{"bytes":[1.5]}"#), None);
+    }
+
+    #[test]
+    fn peer_bytes_rejects_malformed_json() {
+        assert_eq!(parse_peer_bytes(b"not json"), None);
     }
 
     #[test]
