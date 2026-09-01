@@ -404,7 +404,9 @@ impl TerminalPane {
         };
 
         if let Some(session) = &session {
-            broadcast_register(&broadcast, &id, session.input_sender());
+            if may_broadcast_locally(&target) {
+                broadcast_register(&broadcast, &id, session.input_sender());
+            }
         }
 
         Self {
@@ -949,6 +951,19 @@ impl TerminalPane {
             CellColor::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
         }
     }
+}
+
+/// Whether a pane at this target may join the LOCAL keystroke fan-out.
+/// `BroadcastHub` membership must be encoded from the pane's target here —
+/// at the one place every pane is constructed — never inferred from "the
+/// pane has a session". A later phase's attached pane (a local view of a
+/// terminal running on another Mac) will also carry a sender, because it
+/// forwards keystrokes to its peer; if membership followed that structural
+/// fact alone, enabling local broadcast would fan your keystrokes into a
+/// terminal on a different machine. Same reasoning as `hub::Origin` on the
+/// companion hub, stated before Phase C2 exists to be swept in by it.
+fn may_broadcast_locally(target: &Target) -> bool {
+    target.is_local()
 }
 
 fn broadcast_register(hub: &std::sync::Arc<BroadcastHub>, id: &str, sender: EventLoopSender) {
@@ -1642,8 +1657,28 @@ impl TerminalPane {
 
 #[cfg(test)]
 mod tests {
-    use super::{busy_dot, coalesce_runs, drag_scroll_lines, CellLook, COMPANION_BUSY_WINDOW};
+    use super::{
+        busy_dot, coalesce_runs, drag_scroll_lines, may_broadcast_locally, CellLook,
+        COMPANION_BUSY_WINDOW,
+    };
+    use crate::hosts::{ProfileId, Target};
     use crate::term_session::AgentState;
+
+    #[test]
+    fn a_local_target_may_join_the_local_fan_out() {
+        assert!(may_broadcast_locally(&Target::Local));
+    }
+
+    #[test]
+    fn a_remote_target_may_never_join_the_local_fan_out() {
+        // An attached pane (Phase C2) forwards keystrokes to its peer, so it
+        // will also carry a sender — membership must be encoded from the
+        // target, never inferred from "has a sender", or enabling local
+        // broadcast would fan keystrokes into a terminal on another Mac.
+        assert!(!may_broadcast_locally(&Target::Remote(ProfileId(
+            "host-1".to_string()
+        ))));
+    }
 
     #[test]
     fn uninstrumented_foreground_falls_back_to_recent_output() {
