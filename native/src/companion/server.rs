@@ -1514,13 +1514,20 @@ mod tests {
             &format!("POST /spawn HTTP/1.1\r\nHost: {host}\r\nContent-Type: {INPUT_CONTENT_TYPE}\r\nContent-Length: 2\r\n\r\n{{}}"),
         );
         assert!(no_token.starts_with("HTTP/1.1 404"));
-        assert_eq!(hub.take_spawns(), 0, "no guard failure may queue a spawn");
+        assert_eq!(
+            hub.drain_spawns().len(),
+            0,
+            "no guard failure may queue a spawn"
+        );
         // Queue until the cap answers 429.
         for _ in 0..crate::companion::hub::MAX_PENDING_SPAWNS {
             assert!(spawn(INPUT_CONTENT_TYPE, None).starts_with("HTTP/1.1 202"));
         }
         assert!(spawn(INPUT_CONTENT_TYPE, None).starts_with("HTTP/1.1 429"));
-        assert_eq!(hub.take_spawns(), crate::companion::hub::MAX_PENDING_SPAWNS);
+        assert_eq!(
+            hub.drain_spawns().len(),
+            crate::companion::hub::MAX_PENDING_SPAWNS
+        );
         handle.stop();
     }
 

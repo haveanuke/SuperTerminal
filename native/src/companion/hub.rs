@@ -368,17 +368,6 @@ impl<S: Clone> CompanionHub<S> {
             .unwrap_or(false)
     }
 
-    /// Queue one phone-requested terminal spawn; false when the pending cap
-    /// is reached (the server answers 429). Delegates to
-    /// [`Self::request_spawn_by`] with `Principal::Phone` so every existing
-    /// caller and test keeps today's behavior unchanged. Kept for
-    /// backward-compatible callers/tests; the server now resolves a
-    /// principal and calls [`Self::request_spawn_by`] directly.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn request_spawn(&self) -> bool {
-        self.request_spawn_by(Principal::Phone)
-    }
-
     /// Queue one terminal spawn on behalf of `principal`; false when the
     /// pending cap is reached. The cap is on the queue's length, not on any
     /// one principal's share of it — a peer does not get a fresh quota just
@@ -390,14 +379,6 @@ impl<S: Clone> CompanionHub<S> {
         }
         pending.push(SpawnRequest { principal });
         true
-    }
-
-    /// Drain and return the number of queued spawns (main-thread tick).
-    /// Kept for backward-compatible callers/tests; the workspace now calls
-    /// [`Self::drain_spawns`] directly to recover who asked.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn take_spawns(&self) -> usize {
-        self.drain_spawns().len()
     }
 
     /// Drain and return the queued spawn requests, in request order
@@ -644,12 +625,18 @@ pub(crate) mod tests {
     fn spawn_queue_caps_and_drains() {
         let hub = TestHub::new();
         for _ in 0..MAX_PENDING_SPAWNS {
-            assert!(hub.request_spawn());
+            assert!(hub.request_spawn_by(Principal::Phone));
         }
-        assert!(!hub.request_spawn(), "cap must refuse the fifth");
-        assert_eq!(hub.take_spawns(), MAX_PENDING_SPAWNS);
-        assert_eq!(hub.take_spawns(), 0, "drain resets");
-        assert!(hub.request_spawn(), "capacity returns after drain");
+        assert!(
+            !hub.request_spawn_by(Principal::Phone),
+            "cap must refuse the fifth"
+        );
+        assert_eq!(hub.drain_spawns().len(), MAX_PENDING_SPAWNS);
+        assert_eq!(hub.drain_spawns().len(), 0, "drain resets");
+        assert!(
+            hub.request_spawn_by(Principal::Phone),
+            "capacity returns after drain"
+        );
     }
 
     #[test]
