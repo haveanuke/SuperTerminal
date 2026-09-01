@@ -142,6 +142,20 @@ peer authentication — i.e. make `principal_for` capable of returning
 the second check would give a paired peer sight of, and input into, every
 local session, not just the ones broadcast to it.
 
+## D3b. Open for Phase B: should a peer reach `/input` at all?
+
+Phase A's admission table puts `/input` in the SHARED arm, so a peer is admitted
+to the phone's symbolic endpoint as well as the raw `/peer-input` sink. This
+document is genuinely mixed on the point: D1 argues a peer should ship raw bytes
+because the symbolic vocabulary is phone-grade, which implies a peer has no need
+for `/input` — but nothing states that peers are excluded from it.
+
+Not exploitable in Phase A (`principal_for` cannot return `Peer`), and surfaced
+by the pre-push review rather than by design. Decide it before peer
+authentication is enabled: either move `/input` to the phone-only arm, or state
+here why a peer may use both. Do not leave it ambiguous once a peer can
+authenticate.
+
 ## D4. Attached panes are never re-broadcast
 
 If both instances broadcast and both attach to each other, an unguarded
