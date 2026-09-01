@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::hub::tests::RegisterLocalPty;
 use super::hub::Hub;
 use super::server::{start, ServerConfig, INPUT_CONTENT_TYPE};
 use crate::term_session::TermSession;

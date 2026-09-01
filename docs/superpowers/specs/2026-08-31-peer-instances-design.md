@@ -115,6 +115,33 @@ amended to say so. The phone's existing behaviour must be
 byte-identical after the change; it is the surface Tomas uses most and it must
 not regress.
 
+### Route admission and session-visibility scoping are two separate checks
+
+Both are required, and neither substitutes for the other:
+
+- **`admits(path, method, principal)`** answers "may this principal use this
+  route at all" — a route-level, principal-level question. It is what lets
+  `Peer` reach `/sessions`, `/stream/<id>`, and the raw-byte `/peer-input/<id>`
+  sink instead of getting a 404 like an unlisted route would.
+- **`hub.visible_to(&peer_id)`** (and `hub.publishable_ids()` for what could be
+  shown to a peer at all) answers "which sessions may THIS SPECIFIC peer see
+  or touch" — a per-session, per-peer question. Passing `admits` says nothing
+  about which ids a `GET /sessions` response should list, which id a
+  `GET /stream/<id>` may stream, or which id a `POST /peer-input/<id>` may
+  write into.
+
+Phase A implemented only the first check. `server.rs`'s `/sessions`, `/stream`,
+and `/peer-input` handlers all consult `admits` (via `route_admitted`) but none
+of them consult `hub.visible_to` or `hub.publishable_ids` — both exist on
+`CompanionHub` with no caller yet. This is not exploitable in Phase A, because
+`principal_for` cannot produce a `Peer` (there is no pairing to authenticate
+against), so the gap is currently unreachable. **No later phase may enable
+peer authentication — i.e. make `principal_for` capable of returning
+`Principal::Peer` — before every route it can reach also enforces
+`hub.visible_to`/`hub.publishable_ids`.** Turning on pairing without wiring
+the second check would give a paired peer sight of, and input into, every
+local session, not just the ones broadcast to it.
+
 ## D4. Attached panes are never re-broadcast
 
 If both instances broadcast and both attach to each other, an unguarded
@@ -133,6 +160,19 @@ auto-registers spawned PTYs (`pane.rs:22`). Both would sweep up an attached pane
 if it happened to expose a sender. An attached pane is a distinct origin/type and
 must never enter either peer publication or local keystroke fan-out membership —
 by construction, not by a filter someone can forget.
+
+**Phase C note.** Phase A only encoded the companion half of this rule:
+`hub.rs`'s `Origin` enum and `publishable_ids()` keep an attached pane out of
+peer publication by construction. The other half is still open.
+`BroadcastHub` (`pane.rs:22`, registration at `pane.rs:407`) still infers
+local keystroke fan-out membership from "has a session" — `broadcast_register`
+runs whenever `TerminalPane::new` has a `Some(session)`, with no origin check —
+so an attached pane would be swept into local fan-out the same way a
+same-origin `input_sender` would have swept it into peer publication before
+`Origin` existed. D4 requires attached panes to enter NEITHER peer publication
+NOR local fan-out "by construction"; the phase that introduces attaching must
+give `BroadcastHub` the same origin-encoded treatment `CompanionHub` already
+has, not just filter it at one call site.
 
 ## D5. The degraded contract, stated rather than discovered
 

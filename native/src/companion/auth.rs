@@ -17,6 +17,10 @@ pub struct PeerId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     Phone,
+    /// Constructed from Phase B onward, once pairing exists and
+    /// `principal_for` can actually resolve a peer's token. Until then the
+    /// admission table below is deliberately ahead of what can be reached.
+    #[cfg_attr(not(test), allow(dead_code))]
     Peer(PeerId),
 }
 

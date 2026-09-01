@@ -25,6 +25,11 @@ use super::wire::serialize_snapshot;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     LocalPty,
+    /// Constructed from Phase B onward, once a pane can attach to a peer's
+    /// session. Until then this arm exists so publication's rules are
+    /// written once against the real enum rather than retrofitted when
+    /// attaching lands.
+    #[cfg_attr(not(test), allow(dead_code))]
     Attached,
 }
 
@@ -118,13 +123,11 @@ impl<S: Clone> CompanionHub<S> {
         Self::default()
     }
 
-    pub fn register(&self, id: &str, label: &str, sender: S) {
-        self.register_with_origin(id, label, sender, Origin::LocalPty);
-    }
-
-    /// Same as [`Self::register`] but with the origin stated explicitly.
-    /// `register` delegates here with `Origin::LocalPty` so every existing
-    /// caller keeps its old behavior unchanged.
+    /// Register a session with its origin stated explicitly — see
+    /// [`Origin`]. Every production caller passes `Origin::LocalPty` today.
+    /// The old two-argument `register` that assumed `Origin::LocalPty` had
+    /// no caller left outside tests, so it now lives only in this module's
+    /// `#[cfg(test)]` block as `tests::RegisterLocalPty`.
     pub fn register_with_origin(&self, id: &str, label: &str, sender: S, origin: Origin) {
         let mut inner = self.inner.lock().unwrap();
         inner.insert(
@@ -163,6 +166,9 @@ impl<S: Clone> CompanionHub<S> {
 
     /// Ids eligible for publication to a peer: `Origin::LocalPty` only.
     /// Never derived from "has a sender" — an attached pane has one too.
+    /// Called from Phase B onward, when a route first needs to scope what a
+    /// peer may see; no caller is wired to it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn publishable_ids(&self) -> Vec<String> {
         self.inner
             .lock()
@@ -173,7 +179,10 @@ impl<S: Clone> CompanionHub<S> {
             .collect()
     }
 
-    /// Ids currently broadcast to this peer.
+    /// Ids currently broadcast to this peer. Called from Phase B onward,
+    /// when a route first needs to filter what a peer principal may reach;
+    /// no caller is wired to it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn visible_to(&self, peer: &PeerId) -> Vec<String> {
         self.inner
             .lock()
@@ -403,10 +412,27 @@ impl<S: Clone> CompanionHub<S> {
 pub type Hub = CompanionHub<alacritty_terminal::event_loop::EventLoopSender>;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::companion::auth::{PeerId, Principal};
     use crate::term_session::{CursorStyle, SnapshotCursor};
+
+    /// Test-only shorthand for the old two-argument `register`, which had
+    /// no production caller left once every real site moved to
+    /// `register_with_origin` (see that method's doc comment). An extension
+    /// trait, not a free function, so every existing `hub.register(...)`
+    /// call site — here and in `server.rs` / `e2e_tests.rs` tests — keeps
+    /// its method-call syntax; those files bring it into scope with
+    /// `use crate::companion::hub::tests::RegisterLocalPty;`.
+    pub(crate) trait RegisterLocalPty<S: Clone> {
+        fn register(&self, id: &str, label: &str, sender: S);
+    }
+
+    impl<S: Clone> RegisterLocalPty<S> for CompanionHub<S> {
+        fn register(&self, id: &str, label: &str, sender: S) {
+            self.register_with_origin(id, label, sender, Origin::LocalPty);
+        }
+    }
 
     type TestHub = CompanionHub<std::sync::mpsc::Sender<Vec<u8>>>;
 

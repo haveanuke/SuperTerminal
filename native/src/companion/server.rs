@@ -395,6 +395,13 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             );
         }
         (Method::Get, "/sessions") if route_admitted("/sessions") => {
+            // PHASE B: this returns every session in the hub, regardless of
+            // principal. `admits` already lets a Peer reach this route, but
+            // nothing here narrows the list to `hub.visible_to(&peer_id)`
+            // (or `hub.publishable_ids()` for what a peer could be shown at
+            // all) — a peer would be handed every local session, not just
+            // the ones published to it. Admitting Peer on `/sessions` is not
+            // the same as scoping what it returns.
             let sessions = shared.hub.sessions();
             let json = serde_json::to_string(
                 &sessions
@@ -469,6 +476,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
         }
         (Method::Get, _) if path.starts_with("/stream/") && route_admitted("/stream") => {
             let id = path["/stream/".len()..].to_string();
+            // PHASE B: this streams whichever id is in the URL, for any
+            // admitted principal. `admits` lets a Peer reach `/stream`, but
+            // nothing here checks the id against `hub.visible_to(&peer_id)`
+            // — a peer could stream any session's grid, not just the ones
+            // published to it. Admitting Peer on `/stream` is not the same
+            // as scoping what it may stream.
             if shared.hub.revision(&id).is_none() {
                 let _ = respond(&stream, "404 Not Found", &[], b"");
                 return;
@@ -628,6 +641,14 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
         // encoded with `keys.rs::key_to_bytes` — never interpreted here,
         // only validated as a clean array of bytes. Admitted for
         // `Principal::Peer` only (see `auth::admits`).
+        //
+        // PHASE B: this writes those bytes into whichever id is in the URL,
+        // including an `Origin::Attached` one, with no check that this peer
+        // is allowed to touch it — `hub.visible_to(&peer_id)` is never
+        // consulted below. Admitting Peer on `/peer-input` is not the same
+        // as scoping which sessions it may write into; today that gap is
+        // moot because `principal_for` cannot produce a `Peer`, but the
+        // table already reads as though the question is settled.
         (Method::Post, _) if path.starts_with("/peer-input/") && route_admitted("/peer-input") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
@@ -713,6 +734,7 @@ fn serve_stream<S: InputSink>(shared: &Shared<S>, mut stream: &TcpStream, id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::companion::hub::tests::RegisterLocalPty;
     use crate::companion::hub::CompanionHub;
     use std::io::Read;
     use std::sync::mpsc;
