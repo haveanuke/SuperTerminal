@@ -25,6 +25,8 @@ pub struct WireSnapshot {
     /// (and omitted from the JSON) when there is no history yet.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<Vec<WireRun>>,
+    pub bracketed_paste: bool,
+    pub mouse_tracking: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -168,6 +170,8 @@ pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireS
         app_cursor: snapshot.app_cursor_mode,
         rows,
         history,
+        bracketed_paste: snapshot.bracketed_paste,
+        mouse_tracking: snapshot.mouse_tracking,
     }
 }
 
@@ -386,5 +390,40 @@ mod tests {
         let s = snap(vec![vec![cell('e', red)]]);
         let wire = serialize_snapshot(&s, theme());
         assert_eq!(wire.rows[0][0].fg, hex(ansi_256(1, theme())));
+    }
+
+    #[test]
+    fn the_snapshot_carries_paste_and_mouse_modes() {
+        let mut snapshot = snap(vec![vec![cell('x', style())]]);
+        snapshot.bracketed_paste = true;
+        snapshot.mouse_tracking = true;
+        let wire = serialize_snapshot(&snapshot, theme());
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"bracketedPaste\":true"), "{json}");
+        assert!(json.contains("\"mouseTracking\":true"), "{json}");
+    }
+
+    #[test]
+    fn both_modes_are_always_present_even_when_false() {
+        // A missing field and a false field must not be ambiguous to a
+        // client deciding whether to wrap a paste.
+        let snapshot = snap(vec![vec![cell('x', style())]]);
+        let wire = serialize_snapshot(&snapshot, theme());
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"bracketedPaste\":false"), "{json}");
+        assert!(json.contains("\"mouseTracking\":false"), "{json}");
+    }
+
+    #[test]
+    fn the_two_modes_are_not_transposed() {
+        // Both-true and both-false fixtures cannot catch a swap: identical
+        // values serialize identically either way. One of each pins it.
+        let mut snapshot = snap(vec![vec![cell('x', style())]]);
+        snapshot.bracketed_paste = true;
+        snapshot.mouse_tracking = false;
+        let wire = serialize_snapshot(&snapshot, theme());
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains("\"bracketedPaste\":true"), "{json}");
+        assert!(json.contains("\"mouseTracking\":false"), "{json}");
     }
 }
