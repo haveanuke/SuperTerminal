@@ -549,4 +549,119 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+
+    /// The expanded share panel under a sidebar terminal row: one toggle
+    /// chip per shareable peer, reflecting live `BroadcastMap` state. An
+    /// empty `shareable` (no paired peer grants `view`) reads as its own
+    /// explicit fact rather than silently rendering nothing — same reason
+    /// a peer's own "not shared" state is spelled out per chip rather than
+    /// implied by an unlit dot: after an app relaunch `BroadcastMap` is
+    /// deliberately empty (terminal ids aren't stable across restarts), and
+    /// that must read as information, not as a bug.
+    pub(super) fn render_share_row(
+        &self,
+        terminal_id: &str,
+        shareable: &[crate::peers::PeerRecord],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+        if shareable.is_empty() {
+            return div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .py(px(3.0))
+                .pl(px(30.0))
+                .pr(px(8.0))
+                .text_size(px(9.0))
+                .text_color(rgb(theme.ui_text_muted))
+                .child("not shared \u{b7} no paired peer can view yet")
+                .into_any_element();
+        }
+        let shared_with = self.broadcasts.peers_for(terminal_id);
+        let chips: Vec<_> = shareable
+            .iter()
+            .map(|peer| {
+                let on = shared_with.contains(&peer.id);
+                let label = peer.label.clone();
+                let peer_id = peer.id.clone();
+                let toggle_terminal = terminal_id.to_string();
+                div()
+                    .id(SharedString::from(format!(
+                        "share-{terminal_id}-{}",
+                        peer.id.0
+                    )))
+                    .cursor_pointer()
+                    .px(px(7.0))
+                    .py(px(1.0))
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(rgb(if on { theme.ui_accent } else { theme.ui_border }))
+                    .bg(rgb(theme.ui_surface))
+                    .text_size(px(9.0))
+                    .text_color(rgb(if on {
+                        theme.ui_accent
+                    } else {
+                        theme.ui_text_muted
+                    }))
+                    .hover(|style| style.border_color(rgb(theme.ui_accent)))
+                    .child(SharedString::from(format!(
+                        "{label}: {}",
+                        if on { "shared" } else { "not shared" }
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, _, cx| {
+                            cx.stop_propagation();
+                            ws.toggle_share(&toggle_terminal, &peer_id, cx);
+                        }),
+                    )
+            })
+            .collect();
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(4.0))
+            .py(px(3.0))
+            .pl(px(30.0))
+            .pr(px(8.0))
+            .children(chips)
+            .into_any_element()
+    }
+
+    /// Expand/collapse the inline share control under a sidebar terminal
+    /// row. Purely a UI toggle — carries no authority of its own.
+    pub(super) fn toggle_share_open(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
+        if !self.share_open.remove(terminal_id) {
+            self.share_open.insert(terminal_id.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Flip whether `peer` may see `terminal_id`. Mutates BOTH
+    /// `BroadcastMap` (so the record outlives a companion restart — see
+    /// its doc comment) AND the live hub, so the change is visible to an
+    /// already-connected peer immediately rather than at the next
+    /// companion restart. Un-sharing while a peer's stream is open is what
+    /// actually cuts it: `set_visible_to` is re-checked every frame by the
+    /// live stream (see `companion::hub::CompanionHub::may_touch`).
+    pub(super) fn toggle_share(
+        &mut self,
+        terminal_id: &str,
+        peer: &crate::companion::auth::PeerId,
+        cx: &mut Context<Self>,
+    ) {
+        let now_shared = !self.broadcasts.peers_for(terminal_id).contains(peer);
+        if now_shared {
+            self.broadcasts.share(terminal_id, peer);
+        } else {
+            self.broadcasts.unshare(terminal_id, peer);
+        }
+        if let Some(hub) = &self.companion_hub {
+            hub.set_visible_to(terminal_id, peer, now_shared);
+        }
+        cx.notify();
+    }
 }

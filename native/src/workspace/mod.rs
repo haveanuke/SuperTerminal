@@ -290,6 +290,11 @@ pub struct Workspace {
     /// disk. Every production `hub.set_visible_to` call must mirror through
     /// here, and every terminal-removal path must prune it.
     broadcasts: crate::peers::BroadcastMap,
+    /// Terminal ids whose inline share control is expanded in the sidebar.
+    /// Purely a UI convenience (which panel is open) — never authority;
+    /// pruned alongside `broadcasts` on every terminal-removal path so a
+    /// reused id never opens already-expanded.
+    share_open: std::collections::HashSet<String>,
     /// Terminal awaiting a window-aware focus handoff: phone spawns happen
     /// on the tick (no Window), so render — which has one — completes the
     /// focus, keeping keyboard focus consistent with the visible tab.
@@ -425,6 +430,7 @@ impl Workspace {
             companion_previews: None,
             companion_error: None,
             broadcasts: crate::peers::BroadcastMap::default(),
+            share_open: std::collections::HashSet::new(),
             companion_pending_focus: None,
             companion_flyout: false,
             companion_copied: false,
@@ -1309,6 +1315,7 @@ impl Workspace {
             // peer's visibility.
             let live: Vec<String> = self.panes.keys().cloned().collect();
             self.broadcasts.prune_to(&live);
+            self.share_open.retain(|id| self.panes.contains_key(id));
         }
         let Some(tab_index) = self
             .tabs
@@ -1401,6 +1408,7 @@ impl Workspace {
         // their share state together, same reasoning as `close_terminal`.
         let live: Vec<String> = self.panes.keys().cloned().collect();
         self.broadcasts.prune_to(&live);
+        self.share_open.retain(|id| self.panes.contains_key(id));
         self.tabs.remove(index);
         self.fix_rename_after_removal(index);
         self.prune_collapsed_projects();
@@ -1694,6 +1702,14 @@ impl Workspace {
     /// terminal to jump straight to it.
     fn render_projects_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
+        // Computed once: which paired peers a per-terminal share toggle may
+        // offer at all. A peer without `view` could never do anything with
+        // a share, so it is never offered one — see `peers::shareable_peers`.
+        let (paired_peers, _peer_problems) = self.settings.peers();
+        let shareable: Vec<crate::peers::PeerRecord> = crate::peers::shareable_peers(&paired_peers)
+            .into_iter()
+            .cloned()
+            .collect();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             let active_tab = tab_index == self.active_tab;
@@ -1966,6 +1982,34 @@ impl Workspace {
                                     .text_color(rgb(theme.ui_text_muted))
                                     .child(cwd),
                             )
+                            .child({
+                                let toggle_id = terminal_id.clone();
+                                let shared_now =
+                                    !self.broadcasts.peers_for(&terminal_id).is_empty();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "project-term-share-{terminal_id}"
+                                    )))
+                                    .flex_none()
+                                    .cursor_pointer()
+                                    .opacity(if shared_now { 1.0 } else { 0.45 })
+                                    .hover(|style| style.opacity(1.0))
+                                    .child(crate::icons::icon(
+                                        crate::icons::Icon::Share { active: shared_now },
+                                        if shared_now {
+                                            theme.ui_accent
+                                        } else {
+                                            theme.ui_text_muted
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |ws, _, _, cx| {
+                                            cx.stop_propagation();
+                                            ws.toggle_share_open(&toggle_id, cx);
+                                        }),
+                                    )
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {
@@ -1974,6 +2018,9 @@ impl Workspace {
                             )
                             .into_any_element(),
                     );
+                    if self.share_open.contains(&terminal_id) {
+                        rows.push(self.render_share_row(&terminal_id, &shareable, cx));
+                    }
                 }
             }
         }
@@ -2362,6 +2409,7 @@ impl Workspace {
         // place, a later fresh id that happened to reuse an old string
         // would silently inherit that old id's peers.
         self.broadcasts.prune_to(&[]);
+        self.share_open.clear();
         self.tabs.clear();
         // Resolved once per load: a saved target whose profile is gone must
         // restore as a dead pane, never silently as a local shell.

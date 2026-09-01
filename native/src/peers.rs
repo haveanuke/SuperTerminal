@@ -374,6 +374,17 @@ pub fn peer_mutation_requires_restart(before: &[PeerRecord], after: &[PeerRecord
     before != after
 }
 
+/// Peers a per-terminal share control should offer: only those whose
+/// grants let them actually view a shared session. Sharing with a peer
+/// that cannot view would be a silent no-op the user would have to debug
+/// — `/sessions` and `/stream` are gated on `Grants::view` at the auth
+/// layer (`companion::auth::admits_with_grants`) regardless of
+/// `BroadcastMap` visibility, so offering a peer without it would just be
+/// a control that lies about what it does.
+pub fn shareable_peers(peers: &[PeerRecord]) -> Vec<&PeerRecord> {
+    peers.iter().filter(|p| p.grants.view).collect()
+}
+
 // ---------------------------------------------------------------------
 // BroadcastMap: which terminals a peer may see, held on the Workspace.
 // ---------------------------------------------------------------------
@@ -415,12 +426,9 @@ impl BroadcastMap {
     }
 
     /// Revoke `peer`'s visibility of `id`. A no-op — never an empty
-    /// leftover entry — if `id` was never shared with anyone.
-    // No production caller yet: the settings-sheet unshare toggle is a
-    // later task in this phase (see the plan's Task 4). Kept public now
-    // because it is part of BroadcastMap's stated interface, mirroring
-    // `share` — see `CompanionHub::set_meta` for the same pattern.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// leftover entry — if `id` was never shared with anyone. Called by
+    /// the sidebar's per-terminal share toggle
+    /// (`workspace::companion_ui::toggle_share`).
     pub fn unshare(&mut self, id: &str, peer: &PeerId) {
         if let Some(peers) = self.0.get_mut(id) {
             peers.remove(peer);
@@ -428,10 +436,8 @@ impl BroadcastMap {
     }
 
     /// Peers `id` is currently shared with, sorted by peer id string so
-    /// callers (tests, and any future UI listing this) see a stable order —
-    /// the backing `HashSet`'s own iteration order is not stable.
-    // No production caller yet either — see `unshare` above.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// callers (tests, and the sidebar share row) see a stable order — the
+    /// backing `HashSet`'s own iteration order is not stable.
     pub fn peers_for(&self, id: &str) -> Vec<PeerId> {
         let mut peers: Vec<PeerId> = self
             .0
@@ -449,6 +455,18 @@ impl BroadcastMap {
     pub fn prune_to(&mut self, live_ids: &[String]) {
         let live: HashSet<&str> = live_ids.iter().map(String::as_str).collect();
         self.0.retain(|id, _| live.contains(id.as_str()));
+    }
+
+    /// Remove `peer` from every terminal's share set. Call this on peer
+    /// deletion: the design deliberately allows recreating a deleted peer
+    /// WITH THE SAME id, for identity recovery, so without this a
+    /// recreated peer would silently inherit shares granted to its
+    /// predecessor. Unlike a deleted PEER, a deleted terminal has no such
+    /// recovery path — that stays `prune_to`'s job.
+    pub fn forget_peer(&mut self, peer: &PeerId) {
+        for peers in self.0.values_mut() {
+            peers.remove(peer);
+        }
     }
 
     /// Every `(terminal_id, peers)` pair currently recorded, for replaying
@@ -515,6 +533,73 @@ mod tests {
         let mut map = BroadcastMap::default();
         map.unshare("t1", &PeerId("p1".into()));
         assert!(map.peers_for("t1").is_empty());
+    }
+
+    #[test]
+    fn deleting_a_peer_forgets_every_share_it_held() {
+        // The design deliberately allows recreating a deleted peer WITH THE
+        // SAME id for identity recovery. Without this, a recreated peer
+        // would silently inherit shares granted to its predecessor.
+        let mut map = BroadcastMap::default();
+        let gone = PeerId("gone".into());
+        let stays = PeerId("stays".into());
+        map.share("t1", &gone);
+        map.share("t1", &stays);
+        map.share("t2", &gone);
+        map.forget_peer(&gone);
+        assert!(map.peers_for("t1") == vec![stays.clone()]);
+        assert!(map.peers_for("t2").is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_peer_never_shared_is_a_no_op() {
+        let mut map = BroadcastMap::default();
+        map.share("t1", &PeerId("stays".into()));
+        map.forget_peer(&PeerId("never-shared".into()));
+        assert_eq!(map.peers_for("t1"), vec![PeerId("stays".into())]);
+    }
+
+    // -------------------------------------------------------------
+    // shareable_peers: which peers a per-terminal share control offers.
+    // -------------------------------------------------------------
+
+    fn sample(label: &str) -> PeerRecord {
+        PeerRecord {
+            id: PeerId(format!("id-{label}")),
+            host: format!("{label}.local"),
+            label: label.to_string(),
+            secret: "aabbccddeeff00112233445566778899".to_string(),
+            grants: Grants::default(),
+        }
+    }
+
+    #[test]
+    fn only_peers_that_may_view_are_offered_a_share() {
+        // Sharing with a peer that cannot view is a no-op the user would
+        // have to debug. Offer only peers whose grants let them actually
+        // see it.
+        let can = PeerRecord {
+            grants: Grants {
+                view: true,
+                ..Default::default()
+            },
+            ..sample("a")
+        };
+        let cannot = PeerRecord {
+            grants: Grants::default(),
+            ..sample("b")
+        };
+        let all = vec![can.clone(), cannot];
+        let offered: Vec<&str> = shareable_peers(&all)
+            .iter()
+            .map(|p| p.label.as_str())
+            .collect();
+        assert_eq!(offered, vec!["a"]);
+    }
+
+    #[test]
+    fn no_peers_means_nothing_to_offer() {
+        assert!(shareable_peers(&[]).is_empty());
     }
 
     const OK: &str = r#"[{"id":"p1","label":"work","secret":"aabbccddeeff00112233445566778899","grants":{"view":true,"type":false,"spawn":false}}]"#;

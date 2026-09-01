@@ -981,6 +981,13 @@ impl Workspace {
     pub(super) fn delete_peer(&mut self, id: &PeerId, cx: &mut Context<Self>) {
         let (mut current, _problems) = self.settings.peers();
         current.retain(|peer| &peer.id != id);
+        // Pairing deliberately allows recreating a deleted peer WITH THE
+        // SAME id for identity recovery, so without this a recreated peer
+        // would silently inherit shares granted to its predecessor. Must
+        // run before `apply_peer_mutation` below: a forced restart rebuilds
+        // the hub by replaying `self.broadcasts`, so this has to be pruned
+        // first or the dead peer's visibility would be replayed right back.
+        self.broadcasts.forget_peer(id);
         // A just-shown pairing secret for the peer being deleted must not
         // linger onscreen as if it still meant something. Compared by id,
         // not label — labels are user-editable and not unique (two peers

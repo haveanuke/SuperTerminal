@@ -16,6 +16,9 @@ pub enum Icon {
     Coffee { filled: bool },
     /// Handset outline with a home strip; filled body = companion serving.
     Phone { filled: bool },
+    /// Three linked nodes (share-to icon); filled nodes = shared with at
+    /// least one peer right now, hollow = not shared.
+    Share { active: bool },
 }
 
 pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
@@ -87,6 +90,23 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                         line(window, 4.0, 14.0, 12.0, 14.0);
                         // Home strip near the bottom edge.
                         line(window, 6.5, 12.0, 9.5, 12.0);
+                    }
+                }
+                Icon::Share { active } => {
+                    // Two edges from the left node out to the two right
+                    // nodes, drawn node-center to node-center so they land
+                    // exactly at each node's middle regardless of fill.
+                    line(window, 4.3, 7.3, 10.7, 4.2);
+                    line(window, 4.3, 8.7, 10.7, 11.8);
+                    for (nx, ny) in [(3.0_f32, 8.0_f32), (12.0, 3.5), (12.0, 12.5)] {
+                        if active {
+                            quad(window, nx - 1.6, ny - 1.6, 3.2, 3.2);
+                        } else {
+                            line(window, nx - 1.6, ny - 1.6, nx + 1.6, ny - 1.6);
+                            line(window, nx + 1.6, ny - 1.6, nx + 1.6, ny + 1.6);
+                            line(window, nx + 1.6, ny + 1.6, nx - 1.6, ny + 1.6);
+                            line(window, nx - 1.6, ny + 1.6, nx - 1.6, ny - 1.6);
+                        }
                     }
                 }
             }
