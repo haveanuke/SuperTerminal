@@ -50,6 +50,7 @@ pub enum FrameError {
 /// Carries a byte buffer across calls so a frame split across multiple
 /// underlying `read()`s -- the normal case for a live socket -- is
 /// reassembled correctly regardless of where the split lands.
+#[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct FrameReader<R> {
     reader: R,

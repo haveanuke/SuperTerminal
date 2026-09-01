@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use crate::companion::server::INPUT_CONTENT_TYPE;
 
 mod sse;
+mod stream;
 
 /// A cap on the whole status-line-plus-headers section of a response. Our
 /// own server's responses are always small (a handful of security headers
