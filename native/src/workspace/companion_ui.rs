@@ -87,7 +87,18 @@ impl Workspace {
             if let Some(pane) = self.panes.get(&id) {
                 pane.update(cx, |pane, _| {
                     if let Some(sender) = pane.input_sender() {
-                        hub.register(&pane.id, &label, sender);
+                        // Origin is stated explicitly, never inferred from
+                        // "has a sender": a Phase C attached pane will also
+                        // have one (it forwards keystrokes to its peer), and
+                        // treating that as publishable would re-publish a
+                        // remote view, producing a remote view of a remote
+                        // view. Every pane here is a local PTY today.
+                        hub.register_with_origin(
+                            &pane.id,
+                            &label,
+                            sender,
+                            crate::companion::hub::Origin::LocalPty,
+                        );
                     }
                     pane.set_companion(Some(Arc::clone(&hub)));
                 });

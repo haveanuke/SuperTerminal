@@ -7,7 +7,7 @@
 //! mutex. Input senders are cloned out under the lock and used after release.
 //! Nothing here performs socket I/O or process probes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +15,18 @@ use crate::term_session::RenderableSnapshot;
 use crate::themes::Theme;
 use superterminal_core::activity::Activity;
 
+use super::auth::PeerId;
 use super::wire::serialize_snapshot;
+
+/// Where a published session's terminal actually lives. Encoded, never
+/// inferred: an ATTACHED pane also has an input sender (it forwards
+/// keystrokes to its peer), so "has a sender" cannot distinguish them, and
+/// re-publishing an attached pane would create remote views of remote views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    LocalPty,
+    Attached,
+}
 
 /// Serialized snapshots above this are replaced by an error event (the page
 /// shows "grid too large" instead of the stream stalling).
@@ -54,6 +65,14 @@ struct Published<S> {
     revision: u64,
     info: SessionInfo,
     sender: S,
+    /// Where this session's terminal actually lives. See [`Origin`]: this is
+    /// the ONLY thing publication may key off — never "has a sender".
+    origin: Origin,
+    /// Peers this session has been broadcast to. Always empty for
+    /// `Origin::Attached` — [`CompanionHub::set_visible_to`] refuses to
+    /// populate it, so an attached pane can never be re-published even by a
+    /// caller that bypasses [`CompanionHub::publishable_ids`].
+    visible_to: HashSet<PeerId>,
 }
 
 pub struct CompanionHub<S: Clone> {
@@ -90,6 +109,13 @@ impl<S: Clone> CompanionHub<S> {
     }
 
     pub fn register(&self, id: &str, label: &str, sender: S) {
+        self.register_with_origin(id, label, sender, Origin::LocalPty);
+    }
+
+    /// Same as [`Self::register`] but with the origin stated explicitly.
+    /// `register` delegates here with `Origin::LocalPty` so every existing
+    /// caller keeps its old behavior unchanged.
+    pub fn register_with_origin(&self, id: &str, label: &str, sender: S, origin: Origin) {
         let mut inner = self.inner.lock().unwrap();
         inner.insert(
             id.to_string(),
@@ -105,6 +131,8 @@ impl<S: Clone> CompanionHub<S> {
                     finished: 0,
                 },
                 sender,
+                origin,
+                visible_to: HashSet::new(),
             },
         );
     }
@@ -121,6 +149,46 @@ impl<S: Clone> CompanionHub<S> {
     /// gone).
     pub fn ids(&self) -> Vec<String> {
         self.inner.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Ids eligible for publication to a peer: `Origin::LocalPty` only.
+    /// Never derived from "has a sender" — an attached pane has one too.
+    pub fn publishable_ids(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| entry.origin == Origin::LocalPty)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Ids currently broadcast to this peer.
+    pub fn visible_to(&self, peer: &PeerId) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, entry)| entry.visible_to.contains(peer))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Broadcast (or un-broadcast) a session to one peer. No-op for
+    /// `Origin::Attached` sessions: the rule holds here, at the mutation, not
+    /// only at [`Self::publishable_ids`], so a future caller cannot route
+    /// around it by writing `visible_to` directly.
+    pub fn set_visible_to(&self, id: &str, peer: &PeerId, visible: bool) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(id) {
+            if entry.origin != Origin::LocalPty {
+                return;
+            }
+            if visible {
+                entry.visible_to.insert(peer.clone());
+            } else {
+                entry.visible_to.remove(peer);
+            }
+        }
     }
 
     pub fn unregister(&self, id: &str) {
@@ -305,6 +373,7 @@ pub type Hub = CompanionHub<alacritty_terminal::event_loop::EventLoopSender>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::companion::auth::PeerId;
     use crate::term_session::{CursorStyle, SnapshotCursor};
 
     type TestHub = CompanionHub<std::sync::mpsc::Sender<Vec<u8>>>;
@@ -546,5 +615,48 @@ mod tests {
         }
         assert!(!hub.request_close("one-too-many"), "cap answers 429");
         assert_eq!(hub.take_closes().len(), MAX_PENDING_CLOSES);
+    }
+
+    #[test]
+    fn only_local_pty_sessions_are_publishable() {
+        // An attached pane forwards keystrokes, so it HAS an input sender.
+        // Publication must key off origin, never off "has a sender".
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("local", "one", tx.clone(), Origin::LocalPty);
+        hub.register_with_origin("attached", "two", tx, Origin::Attached);
+        assert_eq!(hub.publishable_ids(), vec!["local".to_string()]);
+    }
+
+    #[test]
+    fn a_session_is_visible_to_nobody_until_broadcast() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("local", "one", tx, Origin::LocalPty);
+        assert!(hub.visible_to(&PeerId("p1".into())).is_empty());
+    }
+
+    #[test]
+    fn broadcasting_to_one_peer_does_not_expose_it_to_another() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("local", "one", tx, Origin::LocalPty);
+        hub.set_visible_to("local", &PeerId("p1".into()), true);
+        assert_eq!(
+            hub.visible_to(&PeerId("p1".into())),
+            vec!["local".to_string()]
+        );
+        assert!(hub.visible_to(&PeerId("p2".into())).is_empty());
+    }
+
+    #[test]
+    fn an_attached_session_cannot_be_broadcast_even_if_asked() {
+        // Defence in depth: the rule holds at the mutation, not only at the
+        // listing, so a future caller cannot route around it.
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("attached", "two", tx, Origin::Attached);
+        hub.set_visible_to("attached", &PeerId("p1".into()), true);
+        assert!(hub.visible_to(&PeerId("p1".into())).is_empty());
     }
 }

@@ -1088,7 +1088,15 @@ impl Workspace {
             let label = self.companion_label_for(&id);
             pane.update(cx, |pane, _| {
                 if let Some(sender) = pane.input_sender() {
-                    hub.register(&pane.id, &label, sender);
+                    // Origin is stated, never inferred from `input_sender()`
+                    // being Some: an attached pane forwards keystrokes and so
+                    // also has a sender. See `Origin` in companion/hub.rs.
+                    hub.register_with_origin(
+                        &pane.id,
+                        &label,
+                        sender,
+                        crate::companion::hub::Origin::LocalPty,
+                    );
                 }
                 pane.set_companion(Some(Arc::clone(hub)));
             });
