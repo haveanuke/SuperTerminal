@@ -77,7 +77,13 @@ Expected: FAIL — `WireSnapshot` does not implement `Deserialize`.
 
 Add `Deserialize` to the derive on `WireSnapshot`, `WireCursor`, `WireRun`, and any nested type they contain. Add `#[serde(default)]` where the server skips a field when empty, so an absent field parses rather than erroring.
 
-Check every field: any the server omits conditionally needs a default on the client side.
+Check every field. `history` is the only one the server skips when empty
+(`wire.rs:26`), so it needs `#[serde(default)]` alongside its existing
+`skip_serializing_if`. `Option` fields such as `cursor` and a run's `bg` already
+deserialize an absent value as `None`. The two mode booleans are always
+serialized and should stay required — a missing `bracketedPaste` means the peer
+is running a build that predates it, and defaulting that to `false` would
+silently mis-handle paste rather than failing loudly.
 
 - [ ] **Step 4: Run the full suite**
 
@@ -94,7 +100,7 @@ git commit -m "feat(companion): the wire snapshot parses as well as serialises"
 
 ---
 
-### Task 2: A bounded HTTP client
+### Task 2: A bounded ONE-SHOT HTTP client
 
 **Files:**
 - Create: `native/src/peer_client/mod.rs` (and `mod peer_client;` in `native/src/main.rs`)
@@ -103,7 +109,18 @@ git commit -m "feat(companion): the wire snapshot parses as well as serialises"
 **Interfaces:**
 - Produces: `peer_client::Endpoint { addr: SocketAddr, secret: String }`; `peer_client::get(&Endpoint, path: &str, deadline: Duration) -> Result<Vec<u8>, PeerError>`; `peer_client::post(&Endpoint, path: &str, body: &[u8], deadline: Duration) -> Result<(), PeerError>`; `peer_client::PeerError`.
 
-Hand-rolled, matching the server's own HTTP handling. The token goes in the `X-Companion-Token` header, exactly as the phone sends it.
+**Scope: one-shot requests only** — `/sessions` and `/peer-input/<id>`. A TOTAL
+round-trip deadline is correct for these and is what `blender.rs:55` does.
+It is NOT correct for `/stream/<id>`, which the server deliberately keeps open
+forever; that is Task 4 and it has different rules. Do not reuse this function
+for the stream.
+
+Hand-rolled, matching the server's own HTTP handling. The secret may go in the
+`X-Companion-Token` header OR the `?t=` query parameter — `token_of`
+(`server.rs:421`) accepts either. Use the header for one-shot requests. Note the
+phone is NOT a single precedent here: its `fetch` calls use the header, but
+`EventSource` cannot set headers so its streams use `?t=`. Do not describe the
+header as "what the phone does"; it is what the phone does for half its traffic.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -182,47 +199,123 @@ git commit -m "feat(peer): parse the companion event stream"
 
 ---
 
-### Task 4: The attachment
+### Task 4: A stream connection, bounded by liveness rather than duration
+
+**Files:**
+- Create: `native/src/peer_client/stream.rs`
+- Test: inline
+
+**Interfaces:**
+- Produces: `stream::open(&Endpoint, session_id, connect_deadline) -> Result<StreamConn, PeerError>`; `StreamConn::next_frame(idle_gap) -> Result<WireSnapshot, PeerError>`.
+
+**This is where the plan was originally wrong and it matters.** Task 2's total
+round-trip deadline is right for a one-shot request and WRONG here: the server
+holds `/stream/<id>` open indefinitely by design, sending snapshots plus a `:hb`
+heartbeat every 2 seconds (`SSE_HEARTBEAT`, `server.rs:931`). A total deadline
+would kill a perfectly healthy stream.
+
+Three separate bounds, each with a different job:
+
+- **Connect + headers: `CONNECT_DEADLINE` (5s), total.** A peer that accepts the
+  TCP connection and then sends nothing must fail HERE. This is the hang the
+  original plan cared about, and it belongs at stream-open, not on the stream.
+- **Frame and line caps** (reuse Task 3's): memory safety, unchanged.
+- **Idle gap: `IDLE_GAP` (6s), rolling.** Once established, the stream is healthy
+  as long as SOMETHING arrives — a frame or a heartbeat — within the gap. Six
+  seconds is three heartbeat intervals: tight enough to notice a dead peer
+  quickly, loose enough that one dropped heartbeat on a slow link does not flap.
+  Exceeding it is an error, not a silent stall.
+
+Tests: a peer that accepts and sends nothing fails at `CONNECT_DEADLINE`; a
+stream that delivers a frame then goes silent fails after `IDLE_GAP` and not
+before; heartbeats alone keep a stream alive indefinitely (drive at least two
+gaps' worth); a frame arriving keeps it alive.
+
+- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 2: Run them and observe the failure**
+- [ ] **Step 3: Implement, with the three constants named and documented**
+- [ ] **Step 4: `cargo test` from the repo root, then commit**
+
+```bash
+cargo fmt
+git add native/src/peer_client/
+git commit -m "feat(peer): stream connections bounded by liveness, not by duration"
+```
+
+---
+
+### Task 5: The attachment
 
 **Files:**
 - Create: `native/src/peer_client/attach.rs`
 - Test: inline
 
 **Interfaces:**
-- Produces: `attach::Attachment` — holds the latest `WireSnapshot` and a status; `attach::spawn(endpoint, session_id) -> Arc<Attachment>`; `Attachment::latest() -> Option<Arc<WireSnapshot>>`; `Attachment::activity(now) -> Activity`; `Attachment::send(bytes)`.
+- Produces: `attach::Freshness { Fresh, Stale }`; `attach::Status { Connecting, Live, Refused, Gone, Unavailable }`; `attach::Attachment` with `latest() -> Option<Arc<WireSnapshot>>`, `freshness(now) -> Freshness`, `status() -> Status`, `send(bytes)`; `attach::spawn(endpoint, session_id) -> Arc<Attachment>`.
 
-This is what Phase C2b will render. It owns a background thread, exactly like `blender.rs`'s poller, and holds only a `Weak` back-reference so it exits when the attachment is dropped.
+**A contract the original plan got wrong, corrected here.** It claimed
+`activity()` would report the peer's activity. It cannot: `WireSnapshot` carries
+geometry, rows, cursor and the two modes — NOT activity. Activity is reported by
+`/sessions` as a string (`server.rs:533`), on a different endpoint.
 
-**The property that matters most: staleness is not idleness.** If frames stop arriving — network drop, peer asleep, stream cut because sharing was revoked — `activity()` must report `Activity::Unknown`, never `Idle`. Slice 1 built that distinction precisely so a pane with no trustworthy signal cannot be mistaken for a finished job; this is the first code that can actually produce `Unknown` from a real cause.
+So the attachment does NOT report activity. It reports **freshness**: are frames
+still arriving. Activity comes from the peer's session list, which the OWNER
+polls once per peer rather than once per attachment — polling `/sessions` per
+attachment would multiply requests by the number of open panes for data that is
+identical across all of them.
+
+Phase C2b combines the two: **stale attachment wins.** If frames have stopped,
+the pane reports `Activity::Unknown` regardless of what the last session list
+said, because a cached "busy" from thirty seconds ago is exactly the stale signal
+`Unknown` exists to represent. Write that rule down here so C2b inherits it
+rather than inventing it.
+
+**Status states, each with a defined cause:**
+
+- `Connecting` — spawned, no successful stream yet.
+- `Live` — a stream is open and within `IDLE_GAP`.
+- `Refused` — the peer answered 404. The session is not shared with us (or does
+  not exist; the server deliberately does not distinguish those, so neither can we).
+- `Gone` — the peer answered 410, or the stream ended cleanly. The session is over.
+- `Unavailable` — connect failed, or reconnect attempts were exhausted.
+
+`Refused` and `Gone` are terminal: do not reconnect. Retrying a 404 in a loop is
+how you turn a revoked share into a request flood against someone else's machine.
+
+**Reconnect policy, fixed here rather than left to judgement:** on an unexpected
+drop, wait `RECONNECT_DELAY` (2s) and retry, up to `MAX_RECONNECTS` (5), then
+settle on `Unavailable` and stop. No exponential backoff — five attempts over ten
+seconds is enough to ride out a wifi blip, and a peer that is off should not be
+polled forever by a pane the user has forgotten about.
 
 - [ ] **Step 1: Write the failing tests**
 
-Against a real in-process server:
+Against a real in-process server (the harness in `e2e_tests.rs` starts one on
+`127.0.0.1:0`, configures `PeerRecord`s, and shares sessions with
+`hub::set_visible_to` — "pairing" here means constructing a configured record,
+not driving the settings UI):
 
-- attaching to a shared session receives at least one snapshot
-- `activity()` reflects the peer's reported activity while frames flow
-- **`activity()` becomes `Unknown` once frames stop for longer than the staleness threshold** — drive this by stopping the server, and assert it does NOT become `Idle`
-- `send()` delivers bytes that the server's hub actually receives
+- attaching to a shared session reaches `Live` and receives at least one snapshot
+- **`freshness()` becomes `Stale` once frames stop past `IDLE_GAP`, and never
+  reports `Fresh` again without a new frame** — drive it by stopping the server
+- attaching to a session NOT shared with this peer reaches `Refused` and does not
+  reconnect (assert the attempt count does not climb)
+- `send()` delivers bytes the server's hub actually receives
 - dropping the `Attachment` ends its thread rather than leaking it
-- attaching to a session the peer has not shared fails cleanly rather than hanging
+- reconnect gives up at `MAX_RECONNECTS` and settles on `Unavailable`
 
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `cargo test -p superterminal-native peer_client::attach`
-Expected: FAIL.
-
+- [ ] **Step 2: Run them and observe the failure**
 - [ ] **Step 3: Implement**
 
-One thread per attachment. It connects, reads frames, and publishes each into a `Mutex<Option<Arc<WireSnapshot>>>` alongside the instant it arrived. `activity()` compares that instant against the threshold.
+One thread per attachment, holding a `Weak` back-reference so it exits when the
+attachment is dropped — the `blender.rs:30` lifecycle pattern.
 
-Reconnect policy: on a dropped stream, wait a bounded interval and try again — but do NOT retry hot, and give up after a bounded number of attempts rather than hammering a peer that is off. State the numbers you chose and why.
-
-- [ ] **Step 4: Run the full suite and commit**
+- [ ] **Step 4: `cargo test` from the repo root, then commit**
 
 ```bash
 cargo fmt
 git add native/src/peer_client/
-git commit -m "feat(peer): attach to a shared session and track its staleness"
+git commit -m "feat(peer): attach to a shared session, tracking freshness and status"
 ```
 
 ---
@@ -232,6 +325,11 @@ git commit -m "feat(peer): attach to a shared session and track its staleness"
 - `cargo test` green from the repo root; `cargo fmt --check` clean; no new warnings.
 - **No new crate.** No reqwest, hyper, ureq, tokio, or async runtime.
 - Every pre-existing test passes with expected values unchanged — this phase adds a client and does not touch the server.
-- A peer that accepts a connection and then sends nothing cannot hang the caller.
-- Frames stopping produces `Activity::Unknown`, never `Idle`.
+- A peer that accepts a connection and then sends nothing fails at
+  `CONNECT_DEADLINE`, on both the one-shot and the stream path.
+- A healthy stream carrying only heartbeats survives indefinitely; a silent one
+  fails at `IDLE_GAP`.
+- Frames stopping produces `Freshness::Stale`, which C2b maps to
+  `Activity::Unknown` — never `Idle`.
+- `Refused` and `Gone` do not reconnect.
 - The Codex gate passes on the full commit range before pushing.
