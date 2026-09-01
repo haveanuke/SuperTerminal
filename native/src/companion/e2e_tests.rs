@@ -258,6 +258,50 @@ fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
 }
 
 #[test]
+fn version_advertises_a_protocol_and_capabilities() {
+    let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("t1", "e2e", session.input_sender());
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
+            ),
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(format!("GET /version?t={TOKEN} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut body = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut body);
+    assert!(body.contains("\"protocol\":1"), "{body}");
+    assert!(body.contains("\"capabilities\""), "{body}");
+    assert!(body.contains("peer-input"), "{body}");
+
+    handle.stop();
+    session
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
 fn scrolled_back_host_still_publishes_the_live_screen() {
     let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     // 200 tagged lines so the viewport is deep in scrollback territory.

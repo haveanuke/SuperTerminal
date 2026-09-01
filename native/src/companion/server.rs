@@ -380,6 +380,8 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             let json = serde_json::json!({
                 "version": crate::settings::APP_VERSION,
                 "build": shared.build,
+                "protocol": 1,
+                "capabilities": ["principals", "origin", "peer-input"],
             })
             .to_string();
             let _ = respond(
