@@ -160,6 +160,28 @@ step.
 The tab strip shows a host badge on remote panes, drawn from `icons.rs`. No
 emoji.
 
+**The phone must distinguish hosts too.** The parent design specified
+`SessionInfo` gaining a host field; this document dropped it and that was a
+mistake. The primary use case is now two MacBooks (personal and work) with
+tabs open on both, so an undifferentiated session list on the phone IS the
+"cannot tell sources apart" problem, just on the surface Tomas uses most.
+
+- `hub::SessionInfo` gains `host: Option<String>` — `None` for local, the
+  resolved profile label for remote. It comes from the pane's `RemoteLaunch`
+  snapshot, not from live settings, so renaming a profile does not relabel a
+  running session mid-flight.
+- The `/sessions` handler emits it; `page.html` renders it on the tile.
+  Additive, exactly like the `activity` field in slice 1: absent means local,
+  and a phone page that predates the field is unaffected.
+- The host label is UNTRUSTED for display purposes in the same sense the rest
+  of the wire is: cap its length and strip control bytes before rendering.
+
+Note for slice 3: if SuperTerminal is installed on the remote Mac, its adapter
+shims are already on that machine's login-shell PATH, so an ssh session into it
+may ALREADY emit adapter bells and write `ST_PANE_STATE` for a pane that does
+not exist there. Slice 3's telemetry design must account for that rather than
+assuming a clean remote environment.
+
 ## Failure is visible, not silent
 
 `workspace/mod.rs` currently routes `PaneEvent::Exited` straight to
