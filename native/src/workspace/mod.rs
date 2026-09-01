@@ -282,6 +282,14 @@ pub struct Workspace {
     /// its watched dir in place (the server never restarts for that).
     companion_previews: Option<std::sync::Arc<crate::companion::previews::PreviewStore>>,
     companion_error: Option<String>,
+    /// Which peers each still-live terminal is shared with. Outlives the
+    /// companion (the `Hub` does not — it is rebuilt on every start and
+    /// every forced restart) and is replayed into a freshly built hub in
+    /// `companion_ui::prepare_companion_hub`. See `peers::BroadcastMap`'s
+    /// doc comment for why this cannot live on the hub or be persisted to
+    /// disk. Every production `hub.set_visible_to` call must mirror through
+    /// here, and every terminal-removal path must prune it.
+    broadcasts: crate::peers::BroadcastMap,
     /// Terminal awaiting a window-aware focus handoff: phone spawns happen
     /// on the tick (no Window), so render — which has one — completes the
     /// focus, keeping keyboard focus consistent with the visible tab.
@@ -416,6 +424,7 @@ impl Workspace {
             companion_server: None,
             companion_previews: None,
             companion_error: None,
+            broadcasts: crate::peers::BroadcastMap::default(),
             companion_pending_focus: None,
             companion_flyout: false,
             companion_copied: false,
@@ -715,6 +724,10 @@ impl Workspace {
                     // the right thing once one does.
                     if let Some(new_id) = &self.companion_pending_focus {
                         hub.set_visible_to(new_id, &peer_id, true);
+                        // Mirrored so this survives a companion restart —
+                        // the hub itself is rebuilt from scratch on every
+                        // one (see `peers::BroadcastMap`'s doc comment).
+                        self.broadcasts.share(new_id, &peer_id);
                     }
                 }
             }
@@ -1291,6 +1304,11 @@ impl Workspace {
                     });
                 }
             });
+            // Drop this terminal's share state along with the pane — a
+            // future id reusing this string must never inherit an old
+            // peer's visibility.
+            let live: Vec<String> = self.panes.keys().cloned().collect();
+            self.broadcasts.prune_to(&live);
         }
         let Some(tab_index) = self
             .tabs
@@ -1379,6 +1397,10 @@ impl Workspace {
                 });
             }
         }
+        // A tab close can drop several terminals at once; prune all of
+        // their share state together, same reasoning as `close_terminal`.
+        let live: Vec<String> = self.panes.keys().cloned().collect();
+        self.broadcasts.prune_to(&live);
         self.tabs.remove(index);
         self.fix_rename_after_removal(index);
         self.prune_collapsed_projects();
@@ -2333,6 +2355,13 @@ impl Workspace {
                 });
             }
         }
+        // Every surviving terminal below gets a FRESH id (`fresh_id`,
+        // called per leaf just below) — none of the ones just torn down
+        // mean anything anymore. Clear share state now, while `self.panes`
+        // is empty, rather than carrying it forward: if it were left in
+        // place, a later fresh id that happened to reuse an old string
+        // would silently inherit that old id's peers.
+        self.broadcasts.prune_to(&[]);
         self.tabs.clear();
         // Resolved once per load: a saved target whose profile is gone must
         // restore as a dead pane, never silently as a local shell.

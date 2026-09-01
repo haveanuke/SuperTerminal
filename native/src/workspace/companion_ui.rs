@@ -94,6 +94,24 @@ impl Workspace {
                 });
             }
         }
+        // Re-apply share state recorded before this (freshly built) hub
+        // existed. MUST run after the registration loop above:
+        // `set_visible_to` only mutates an entry that is already
+        // registered, so replaying before registration would find no
+        // entry and silently do nothing — see
+        // `companion::hub::CompanionHub::set_visible_to`. Skips any id no
+        // longer in `self.panes`; that should already be pruned (see
+        // `Workspace::close_terminal`/`close_tab`/`load_session`), but a
+        // freshly-built hub is exactly the place a stale entry would first
+        // do visible harm, so this checks rather than trusts.
+        for (id, peers) in self.broadcasts.iter() {
+            if !self.panes.contains_key(id) {
+                continue;
+            }
+            for peer in peers {
+                hub.set_visible_to(id, peer, true);
+            }
+        }
         hub.bump_generation();
         let previews = Arc::new(crate::companion::previews::PreviewStore::new(
             crate::settings::prepare_preview_dir(&self.settings),

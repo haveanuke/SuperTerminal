@@ -9,6 +9,8 @@
 //! the peer machine who can read the stored secret can replay it. Keypairs
 //! would prevent that; this is a stated limit, not an oversight.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::companion::auth::PeerId;
@@ -372,12 +374,147 @@ pub fn peer_mutation_requires_restart(before: &[PeerRecord], after: &[PeerRecord
     before != after
 }
 
+// ---------------------------------------------------------------------
+// BroadcastMap: which terminals a peer may see, held on the Workspace.
+// ---------------------------------------------------------------------
+
+/// Which peers each still-live terminal is shared with. This is the
+/// Workspace's own record of visibility — deliberately NOT the
+/// `companion::hub::Hub`'s, because the hub is rebuilt from scratch on
+/// every companion start and every forced restart (a peer grant narrowed or
+/// revoked forces exactly that restart; see `peer_mutation_requires_restart`
+/// and `workspace::settings_ui::apply_peer_mutation`). Without a copy that
+/// outlives the hub, editing ANY peer's grants would silently un-share
+/// every terminal from every OTHER peer too.
+///
+/// This cannot instead be persisted to disk: terminal ids are only stable
+/// within one running `Workspace` (`Workspace::fresh_id` restarts the
+/// counter at `term-1` in a new process, and `load_session` deliberately
+/// mints fresh ids per leaf — see its doc comment). A map keyed by
+/// `terminal_id` that survived a process restart would point at ids that no
+/// longer mean anything. Ids ARE stable across a companion restart within
+/// one app run, which is the exact scope of the bug this exists to fix — so
+/// this lives on the `Workspace`, which outlives the companion, and is
+/// replayed into a freshly built `Hub` in
+/// `workspace::companion_ui::prepare_companion_hub`.
+///
+/// Every production mutation of hub visibility must mirror through here in
+/// the same operation, and every terminal-removal path must prune it — see
+/// that module and `Workspace::close_terminal` / `close_tab` /
+/// `load_session`.
+#[derive(Debug, Clone, Default)]
+pub struct BroadcastMap(HashMap<String, HashSet<PeerId>>);
+
+impl BroadcastMap {
+    /// Record `peer` as allowed to see `id`. Idempotent.
+    pub fn share(&mut self, id: &str, peer: &PeerId) {
+        self.0
+            .entry(id.to_string())
+            .or_default()
+            .insert(peer.clone());
+    }
+
+    /// Revoke `peer`'s visibility of `id`. A no-op — never an empty
+    /// leftover entry — if `id` was never shared with anyone.
+    // No production caller yet: the settings-sheet unshare toggle is a
+    // later task in this phase (see the plan's Task 4). Kept public now
+    // because it is part of BroadcastMap's stated interface, mirroring
+    // `share` — see `CompanionHub::set_meta` for the same pattern.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unshare(&mut self, id: &str, peer: &PeerId) {
+        if let Some(peers) = self.0.get_mut(id) {
+            peers.remove(peer);
+        }
+    }
+
+    /// Peers `id` is currently shared with, sorted by peer id string so
+    /// callers (tests, and any future UI listing this) see a stable order —
+    /// the backing `HashSet`'s own iteration order is not stable.
+    // No production caller yet either — see `unshare` above.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn peers_for(&self, id: &str) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = self
+            .0
+            .get(id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        peers.sort_by(|a, b| a.0.cmp(&b.0));
+        peers
+    }
+
+    /// Drop every recorded terminal id that is not in `live_ids`. Call this
+    /// on every removal path (single close, tab close, session-load
+    /// rebuild) — a stale id left behind would silently re-share a future
+    /// terminal that happens to reuse it.
+    pub fn prune_to(&mut self, live_ids: &[String]) {
+        let live: HashSet<&str> = live_ids.iter().map(String::as_str).collect();
+        self.0.retain(|id, _| live.contains(id.as_str()));
+    }
+
+    /// Every `(terminal_id, peers)` pair currently recorded, for replaying
+    /// into a freshly built `Hub`. Iteration order is not meaningful — the
+    /// caller applies one `set_visible_to` per peer regardless of order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &HashSet<PeerId>)> {
+        self.0.iter().map(|(id, peers)| (id.as_str(), peers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn raw(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    // -------------------------------------------------------------
+    // BroadcastMap: the Workspace-side record of who a still-live terminal
+    // is shared with, replayed into a freshly built Hub on every companion
+    // (re)start. See the type's doc comment for why this cannot live on the
+    // Hub itself.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sharing_is_per_terminal_and_per_peer() {
+        let mut map = BroadcastMap::default();
+        let p1 = PeerId("p1".into());
+        let p2 = PeerId("p2".into());
+        map.share("t1", &p1);
+        assert_eq!(map.peers_for("t1"), vec![p1.clone()]);
+        assert!(
+            map.peers_for("t2").is_empty(),
+            "sharing leaked to another terminal"
+        );
+        map.share("t1", &p2);
+        assert_eq!(map.peers_for("t1").len(), 2);
+        map.unshare("t1", &p1);
+        assert_eq!(map.peers_for("t1"), vec![p2]);
+    }
+
+    #[test]
+    fn nothing_is_shared_by_default() {
+        let map = BroadcastMap::default();
+        assert!(map.peers_for("t1").is_empty());
+    }
+
+    #[test]
+    fn pruning_drops_terminals_that_no_longer_exist() {
+        // A closed terminal's id must not linger and be re-shared if a future
+        // id ever collides with it.
+        let mut map = BroadcastMap::default();
+        let p1 = PeerId("p1".into());
+        map.share("gone", &p1);
+        map.share("alive", &p1);
+        map.prune_to(&["alive".to_string()]);
+        assert!(map.peers_for("gone").is_empty());
+        assert_eq!(map.peers_for("alive"), vec![p1]);
+    }
+
+    #[test]
+    fn unsharing_a_terminal_never_shared_is_a_no_op() {
+        let mut map = BroadcastMap::default();
+        map.unshare("t1", &PeerId("p1".into()));
+        assert!(map.peers_for("t1").is_empty());
     }
 
     const OK: &str = r#"[{"id":"p1","label":"work","secret":"aabbccddeeff00112233445566778899","grants":{"view":true,"type":false,"spawn":false}}]"#;
