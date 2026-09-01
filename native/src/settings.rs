@@ -56,6 +56,10 @@ pub struct Settings {
     /// null` line on every save.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub remote_profiles: serde_json::Value,
+    /// Raw, so a malformed entry can never fail whole-settings serde and trip
+    /// the `unwrap_or_default()` fallback at load.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub peers: serde_json::Value,
 }
 
 impl Default for Settings {
@@ -86,6 +90,7 @@ impl Default for Settings {
             preview_dir: None,
             blender_viewport: false,
             remote_profiles: serde_json::Value::Null,
+            peers: serde_json::Value::Null,
         }
     }
 }
@@ -234,6 +239,16 @@ impl Settings {
     ) {
         crate::hosts::load_profiles(&self.remote_profiles)
     }
+
+    /// Validated peers plus anything that was rejected, for surfacing.
+    pub fn peers(
+        &self,
+    ) -> (
+        Vec<crate::peers::PeerRecord>,
+        Vec<crate::peers::PeerProblem>,
+    ) {
+        crate::peers::load_peers(&self.peers)
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +311,7 @@ mod tests {
             preview_dir: Some("/tmp/renders".into()),
             blender_viewport: true,
             remote_profiles: serde_json::Value::Null,
+            peers: serde_json::Value::Null,
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
@@ -426,6 +442,25 @@ mod tests {
         // The unrelated setting survives.
         assert!(!settings.audio_cues);
         let (ok, problems) = settings.profiles();
+        assert!(ok.is_empty());
+        assert_eq!(problems.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_peer_does_not_reset_unrelated_settings() {
+        let dir = std::env::temp_dir().join(format!("st-settings-peers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"audioCues":false,"peers":[{"id":"x","label":"bad","secret":"nothex"}]}"#,
+        )
+        .unwrap();
+        let settings = Settings::load_from(&path);
+        // The unrelated setting survives.
+        assert!(!settings.audio_cues);
+        let (ok, problems) = settings.peers();
         assert!(ok.is_empty());
         assert_eq!(problems.len(), 1);
         std::fs::remove_dir_all(&dir).ok();

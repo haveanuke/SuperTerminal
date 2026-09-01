@@ -4,11 +4,16 @@
 //! constant-time so timing can't leak prefix matches.
 
 use crate::companion::http::Method;
+use serde::{Deserialize, Serialize};
 
 /// Identity of a paired peer instance. Phase A never constructs one; it
 /// exists so the admission table is written once rather than retrofitted
 /// when Phase B adds pairing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Serialize/Deserialize (mirroring `hosts::ProfileId`) so Phase B's
+/// `peers::PeerRecord` can round-trip through the raw JSON stored in
+/// `Settings::peers`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub String);
 
 /// Who is making a request. Every protected route states which principals
