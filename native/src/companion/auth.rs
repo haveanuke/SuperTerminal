@@ -36,12 +36,16 @@ pub fn admits(path: &str, method: Method, principal: &Principal) -> bool {
             | ("/rename", Method::Post)
             | ("/previews", Method::Get)
             | ("/preview", Method::Get)
+            // Symbolic keypad: text plus ~10 named keys. A peer ships raw
+            // bytes through `/peer-input` instead, which is strictly more
+            // expressive — two ways in would mean two code paths to keep in
+            // step and two places to get scoping wrong. See spec D3b.
+            | ("/input", Method::Post)
     );
     let shared = matches!(
         (path, method),
         ("/sessions", Method::Get)
             | ("/stream", Method::Get)
-            | ("/input", Method::Post)
             | ("/spawn", Method::Post)
             | ("/version", Method::Get)
     );
@@ -233,6 +237,32 @@ mod tests {
             !admits("/peer-input", Method::Post, &Principal::Phone),
             "the phone reached the peer's raw-byte sink"
         );
+    }
+
+    #[test]
+    fn a_peer_uses_the_raw_sink_not_the_symbolic_one() {
+        let g = crate::peers::Grants {
+            view: true,
+            type_: true,
+            ..Default::default()
+        };
+        assert!(
+            !admits_with_grants("/input", Method::Post, &peer(), Some(g)),
+            "peer reached the phone's symbolic endpoint"
+        );
+        assert!(admits_with_grants(
+            "/peer-input",
+            Method::Post,
+            &peer(),
+            Some(g)
+        ));
+        // Moving the route must not cost the phone anything.
+        assert!(admits_with_grants(
+            "/input",
+            Method::Post,
+            &Principal::Phone,
+            None
+        ));
     }
 
     #[test]

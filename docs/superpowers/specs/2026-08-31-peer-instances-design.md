@@ -142,19 +142,24 @@ peer authentication — i.e. make `principal_for` capable of returning
 the second check would give a paired peer sight of, and input into, every
 local session, not just the ones broadcast to it.
 
-## D3b. Open for Phase B: should a peer reach `/input` at all?
+## D3b. Decided: a peer does not reach `/input`
 
-Phase A's admission table puts `/input` in the SHARED arm, so a peer is admitted
+Phase A's admission table put `/input` in the SHARED arm, so a peer was admitted
 to the phone's symbolic endpoint as well as the raw `/peer-input` sink. This
-document is genuinely mixed on the point: D1 argues a peer should ship raw bytes
+document was genuinely mixed on the point: D1 argues a peer should ship raw bytes
 because the symbolic vocabulary is phone-grade, which implies a peer has no need
-for `/input` — but nothing states that peers are excluded from it.
+for `/input` — but nothing stated that peers were excluded from it. Surfaced as
+an open question by the pre-push review rather than by design.
 
-Not exploitable in Phase A (`principal_for` cannot return `Peer`), and surfaced
-by the pre-push review rather than by design. Decide it before peer
-authentication is enabled: either move `/input` to the phone-only arm, or state
-here why a peer may use both. Do not leave it ambiguous once a peer can
-authenticate.
+Decision (Phase B): `/input` moved to the phone-only arm. A peer has
+`/peer-input`, which is strictly more expressive than the phone's ~10 named
+keys — leaving two ways in would mean two code paths to keep in step and two
+places to get scoping wrong. If a peer ever needs the symbolic form, that is a
+deliberate change with its own reasoning, not a default left open by omission.
+Enforced in `companion::auth::admits` and covered by
+`a_peer_uses_the_raw_sink_not_the_symbolic_one`, which asserts both halves: a
+peer with view+type is refused `/input`, and the phone keeps it (also covered
+by `the_phone_keeps_every_route_it_has_today`).
 
 ## D4. Attached panes are never re-broadcast
 
