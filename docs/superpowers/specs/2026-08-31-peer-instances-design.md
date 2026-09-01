@@ -1,7 +1,7 @@
 # Peer instances: SuperTerminal to SuperTerminal — design
 
 Date: 2026-08-31
-Status: PROPOSAL, revised once after design review.
+Status: APPROVED for implementation. Two rounds of design review; the final round found no blocking defects.
 Supersedes: `2026-08-29-remote-terminals-slice-2-design.md` (ssh remote terminals)
 Builds on: `2026-08-28-remote-hosts-design.md` slice 1, shipped as `a9f654e`
 
@@ -68,8 +68,23 @@ same encoder against its own key events and ships the resulting bytes. The
 encoding stays in one place, and the peer endpoint becomes a byte sink rather
 than a vocabulary that must be kept in sync.
 
-`app_cursor` already crosses the wire in the snapshot, so the attached pane can
-encode correctly. `option_as_meta` is the VIEWER's preference and stays local.
+`app_cursor` already crosses the wire in the snapshot (`wire.rs:18`), so the
+attached pane can encode correctly. `option_as_meta` is the VIEWER's preference
+and stays local. IME works, because committed IME text ultimately becomes UTF-8
+bytes on the local path too (`pane.rs:1063`).
+
+Two gaps the encoder alone does NOT close, and what to do about each:
+
+- **Bracketed paste must cross the wire.** Local paste fidelity depends on
+  `bracketed_paste` (`pane.rs:894`), and the mode exists in `RenderableSnapshot`
+  (`term_session.rs:314`) but is not serialized. The peer snapshot adds
+  `bracketedPaste`. Without it, pasting into an attached pane silently loses the
+  wrapping that stops editors treating a paste as typed input.
+- **Mouse tracking is out of scope and declared, not discovered.** Local click
+  handling already avoids mouse-tracking apps and falls back to selection
+  (`pane.rs:1608`). The peer snapshot carries the mouse mode so an attached pane
+  can show that mouse reporting is unavailable, rather than sending nothing and
+  looking broken.
 
 The phone's symbolic endpoint is untouched.
 
@@ -94,8 +109,9 @@ Authentication therefore resolves to a principal:
     enum Principal { Phone, Peer(PeerId) }
 
 and every route states which principals it admits. `Peer` gets the broadcast
-session list, the peer stream, and the peer input sink — nothing else, unless
-this document is amended to say otherwise. The phone's existing behaviour must be
+session list, the peer stream, the peer input sink, and `/spawn` (see D6).
+It does not get `/previews`, `/close`, or `/rename` unless this document is
+amended to say so. The phone's existing behaviour must be
 byte-identical after the change; it is the surface Tomas uses most and it must
 not regress.
 
@@ -111,6 +127,13 @@ Rule: only a pane that owns a local PTY may be broadcast. An attached pane is
 never publishable, and the broadcast list is filtered by origin, not merely by
 what happens to be open.
 
+**Origin must be encoded, not inferred.** Today companion start registers every
+pane exposing a local `input_sender` (`companion_ui.rs:83`), and local broadcast
+auto-registers spawned PTYs (`pane.rs:22`). Both would sweep up an attached pane
+if it happened to expose a sender. An attached pane is a distinct origin/type and
+must never enter either peer publication or local keystroke fan-out membership —
+by construction, not by a filter someone can forget.
+
 ## D5. The degraded contract, stated rather than discovered
 
 An attached pane is not a native terminal and this document does not pretend
@@ -123,6 +146,54 @@ otherwise:
 
 These are acceptable for a first cut ONLY because they are named. Each is a
 candidate for later work; none should surprise anyone.
+
+## D6. A peer may open a new terminal, subject to direction
+
+The phone can already `/spawn` a terminal remotely and Tomas uses it. A paired
+Mac that could not would leave the phone MORE privileged than a deliberately
+paired peer, which is backwards — the peer relationship is the stronger one
+(a per-peer secret, a name Tomas chose, individual revocation) versus the
+phone's single shared token.
+
+So `Principal::Peer` may `/spawn`, reusing the existing main-thread-tick queue
+and its `MAX_PENDING_SPAWNS = 4` cap (`hub.rs`), which already exists to stop a
+misbehaving client carpeting the Mac in tabs.
+
+**The queue must carry attribution, which today it does not.** `pending_spawns`
+is a bare count (`hub.rs:239`) drained as anonymous tab spawns
+(`workspace/mod.rs:683`), so it cannot express "who asked". It becomes a request
+carrying the principal:
+
+    struct SpawnRequest { principal: Principal, requested_at: Instant }
+
+and each session carries its publication state explicitly:
+
+    struct Publication { owner: Origin, visible_to: PeerSet }
+
+"Implicitly broadcast to the spawner" therefore means a `visible_to` set
+containing exactly that one `PeerId` — NOT a global broadcast flag. Per-direction
+permission is evaluated on the RECEIVING instance against its own peer record,
+before the request is queued.
+
+Two consequences to design deliberately rather than discover:
+
+- **A peer-spawned terminal is implicitly broadcast to the peer that spawned
+  it.** Otherwise it opens somewhere the requester cannot see, which is useless.
+  This is the one carve-out to "nothing is exposed by default": nothing is
+  exposed unless its owner broadcasts it, OR the peer created it. It is not
+  broadcast to any OTHER peer.
+- **Spawn is a visible per-peer permission, default OFF.** Do not try to infer
+  which machine is the work one — make the authority explicit and legible at
+  pairing time, as three separate grants per peer:
+
+      this peer may VIEW    (see broadcast terminals)
+      this peer may TYPE    (send input to them)
+      this peer may SPAWN   (create new terminals here)
+
+  Each defaults off for a new peer. That covers the work-Mac asymmetry without
+  encoding any assumption about which machine is which: allowing personal ->
+  work spawn while refusing work -> personal is just two peer records with
+  different grants.
 
 ## The model
 
@@ -242,14 +313,13 @@ feature is simply absent.
   protocol mismatch; tolerate build differences only when the protocol version
   matches. Refusing must say why, in the pane, rather than failing silently.
 
-## Open questions
+## Questions resolved in review
 
-Q1. Is broadcaster-owned geometry acceptable in practice for two MacBooks of
-    different screen sizes, or does a same-size assumption make attached panes
-    unpleasant enough to need the lease design sooner than "later"?
-Q2. Should `Principal::Peer` be allowed `/spawn` — i.e. can Tomas open a NEW
-    terminal on the work Mac from the personal one, or only attach to ones
-    already broadcast there? Opening one is the more useful product and the
-    larger authority grant.
-Q3. Does the 150-row scrollback limit need lifting for peers specifically, given
-    a desktop attached pane invites scrolling in a way a phone does not?
+- **Broadcaster-owned geometry is acceptable for this cut.** Different MacBook
+  sizes will be imperfect; resize leases add ownership, revocation, and race
+  semantics not needed yet.
+- **Spawn is an explicit pairing-time permission, default off** — see D6's three
+  grants. Do not infer the work machine.
+- **150-row scrollback stays for this cut.** Desktop attach makes the limit more
+  noticeable, but lifting it is bandwidth and state work that should follow real
+  use. The contract is acceptable because it is explicit rather than surprising.
