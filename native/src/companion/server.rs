@@ -613,10 +613,11 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             // route_admitted("/stream") guarantees `principal` is Some; a
             // missing principal is refused the same as a session it may not
             // see — never a distinguishable response.
-            let may_touch = principal
-                .as_ref()
-                .is_some_and(|p| shared.hub.may_touch(p, &id));
-            if !may_touch {
+            let Some(p) = principal.as_ref() else {
+                let _ = respond(&stream, "404 Not Found", &[], b"");
+                return;
+            };
+            if !shared.hub.may_touch(p, &id) {
                 let _ = respond(&stream, "404 Not Found", &[], b"");
                 return;
             }
@@ -631,7 +632,10 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 let _ = respond(&stream, "503 Service Unavailable", &[], b"");
                 return;
             }
-            serve_stream(shared, &stream, &id);
+            // `p` (the principal resolved above) is kept for the life of the
+            // connection — see `serve_stream`'s doc comment for why it is
+            // never re-resolved.
+            serve_stream(shared, &stream, &id, p);
             shared.sse.fetch_sub(1, Ordering::AcqRel);
         }
         (Method::Post, "/spawn") if route_admitted("/spawn") => {
@@ -856,7 +860,36 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
     }
 }
 
-fn serve_stream<S: InputSink>(shared: &Shared<S>, mut stream: &TcpStream, id: &str) {
+/// Whether an already-open SSE stream may keep looping, re-checked every
+/// iteration: not cancelled (the whole-server flag every route honors) AND
+/// the principal still `may_touch` this session. `permitted` must come from
+/// a fresh `hub.may_touch` call each time this is consulted — un-sharing a
+/// session (spec D3c) flips it the instant `set_visible_to` runs, and a
+/// stream reading a stale `true` would keep handing frames to a peer that
+/// was just cut off.
+///
+/// Pure over the two booleans (not the live hub or flag) so the decision
+/// can be tested exhaustively, matching `may_still_act` above.
+fn may_continue_stream(cancelled: bool, permitted: bool) -> bool {
+    !cancelled && permitted
+}
+
+/// Streams one session's snapshots as `text/event-stream` until the
+/// connection is cancelled, the session is unregistered, or `principal` can
+/// no longer touch it. `principal` is resolved once by the caller at
+/// CONNECT and held for the whole connection — it is deliberately never
+/// re-resolved per iteration here. A revoked peer's stream already dies
+/// through the companion restart Phase B's revocation performs; re-deriving
+/// the principal from a live token check on every loop would duplicate that
+/// mechanism and blur which one is actually doing the work. What DOES
+/// change per iteration, and must, is whether that same principal still
+/// `may_touch` the session — see `may_continue_stream`.
+fn serve_stream<S: InputSink>(
+    shared: &Shared<S>,
+    mut stream: &TcpStream,
+    id: &str,
+    principal: &Principal,
+) {
     let _ = stream.set_write_timeout(Some(WRITE_DEADLINE));
     let mut head = String::from(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n",
@@ -872,7 +905,13 @@ fn serve_stream<S: InputSink>(shared: &Shared<S>, mut stream: &TcpStream, id: &s
     let mut last_write = Instant::now();
     let mut last_event = Instant::now() - SSE_FLOOR; // first send is immediate
     loop {
-        if shared.cancel.load(Ordering::Acquire) {
+        let cancelled = shared.cancel.load(Ordering::Acquire);
+        let permitted = shared.hub.may_touch(principal, id);
+        if !may_continue_stream(cancelled, permitted) {
+            // Same shape as any other end of stream below: just close the
+            // socket. No error frame, no distinguishable status — a client
+            // that just lost visibility sees exactly what it would see if
+            // the session had been unregistered.
             return;
         }
         let Some(current) = shared.hub.revision(id) else {
@@ -942,6 +981,39 @@ mod tests {
             },
         )
         .expect("server starts on loopback")
+    }
+
+    /// Like [`boot`], but with a real listener/acceptor loop AND configured
+    /// peers, for tests that need a live SSE stream authenticated as a
+    /// `Principal::Peer` rather than the phone.
+    fn boot_with_peers(hub: Arc<TestHub>, peers: Vec<crate::peers::PeerRecord>) -> ServerHandle {
+        start(
+            hub,
+            theme(),
+            ServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token: TOKEN.into(),
+                page: PAGE,
+                previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+                thumbs: test_thumbs(),
+                peers,
+            },
+        )
+        .expect("server starts on loopback")
+    }
+
+    fn test_peer(id: &str, secret: &str) -> crate::peers::PeerRecord {
+        crate::peers::PeerRecord {
+            id: crate::companion::auth::PeerId(id.to_string()),
+            host: "peer.local".into(),
+            label: "Work MacBook".into(),
+            secret: secret.to_string(),
+            grants: crate::peers::Grants {
+                view: true,
+                type_: true,
+                spawn: true,
+            },
+        }
     }
 
     fn preview_store(dir: &std::path::Path) -> Arc<crate::companion::previews::PreviewStore> {
@@ -1691,6 +1763,12 @@ mod tests {
     }
 
     fn open_sse(host: &str, id: &str) -> (TcpStream, BufReader<TcpStream>) {
+        open_sse_with_token(host, id, TOKEN)
+    }
+
+    /// Like [`open_sse`], but with an arbitrary bearer token — needed to open
+    /// a stream authenticated as a paired peer rather than the phone.
+    fn open_sse_with_token(host: &str, id: &str, token: &str) -> (TcpStream, BufReader<TcpStream>) {
         let stream = TcpStream::connect(host).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1698,7 +1776,7 @@ mod tests {
         let mut writer = stream.try_clone().unwrap();
         writer
             .write_all(
-                format!("GET /stream/{id}?t={TOKEN} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+                format!("GET /stream/{id}?t={token} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
             )
             .unwrap();
         (stream, BufReader::new(writer.try_clone().unwrap()))
@@ -1840,6 +1918,30 @@ mod tests {
         rebound.stop();
     }
 
+    /// Reads `stream` to EOF on a background thread and asserts that
+    /// happens within `deadline` — a hard TOTAL-duration bound, unlike the
+    /// PER-SYSCALL bound `TcpStream::set_read_timeout` gives. `read_to_string`
+    /// re-arms that per-syscall timeout on every successful read, and a
+    /// `:hb\n\n` heartbeat lands every `SSE_HEARTBEAT` (2s) — comfortably
+    /// inside a naive 5s socket timeout — so a regression that stops
+    /// `serve_stream` from ever closing would make the OLD version of this
+    /// assertion hang forever (bounded only by CI's own job timeout)
+    /// instead of failing. Enforcing the bound on the channel recv instead
+    /// closes that gap: a broken check now fails here, fast and loud.
+    fn assert_stream_closes_within(stream: TcpStream, deadline: Duration, msg: &str) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut raw = stream;
+            let mut rest = String::new();
+            let ok = std::io::Read::read_to_string(&mut raw, &mut rest).is_ok();
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(deadline) {
+            Ok(ok) => assert!(ok, "{msg}"),
+            Err(_) => panic!("{msg} (did not close within {deadline:?})"),
+        }
+    }
+
     #[test]
     fn stream_of_unregistered_session_ends() {
         let (hub, _rx) = seeded_hub(false);
@@ -1848,12 +1950,68 @@ mod tests {
         let (stream, mut reader) = open_sse(&host, "t1");
         assert!(next_data_line(&mut reader).contains("hello"));
         hub.unregister("t1");
-        // The stream must END (read returns 0) rather than hang.
-        let mut rest = String::new();
-        let mut raw = stream;
-        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let ended = std::io::Read::read_to_string(&mut raw, &mut rest).is_ok();
-        assert!(ended, "stream should close after unregister");
+        assert_stream_closes_within(
+            stream,
+            Duration::from_secs(5),
+            "stream should close after unregister",
+        );
+        handle.stop();
+    }
+
+    #[test]
+    fn peer_stream_ends_when_visibility_is_revoked_mid_stream() {
+        // Spec D3c: un-sharing a session must cut a stream that is ALREADY
+        // open, not merely refuse new connects. `serve_stream` resolves its
+        // principal once at CONNECT (see the fn's own doc), so this proves
+        // the loop itself re-checks `may_touch` every iteration rather than
+        // trusting that first resolution for the life of the connection.
+        let (hub, _rx) = seeded_hub(false);
+        let peer_id = crate::companion::auth::PeerId("peer-1".to_string());
+        hub.set_visible_to("t1", &peer_id, true);
+        let peer_secret = "beefbeefbeefbeefbeefbeefbeefbeef";
+        let handle = boot_with_peers(Arc::clone(&hub), vec![test_peer("peer-1", peer_secret)]);
+        let host = host_of(&handle);
+        let (stream, mut reader) = open_sse_with_token(&host, "t1", peer_secret);
+        assert!(next_data_line(&mut reader).contains("hello"));
+        hub.set_visible_to("t1", &peer_id, false);
+        // The stream must END (read returns 0), the same shape the client
+        // sees for any other normal end of stream — no error frame, no
+        // distinguishable status.
+        assert_stream_closes_within(
+            stream,
+            Duration::from_secs(5),
+            "peer stream should close once visibility is revoked",
+        );
+        handle.stop();
+    }
+
+    #[test]
+    fn phone_stream_keeps_receiving_after_an_unrelated_peer_loses_visibility() {
+        // The regression guard that matters most: the phone streams through
+        // this EXACT loop every day. A peer's visibility being revoked on
+        // the SAME session must never cut the phone's stream — only the
+        // peer's own `may_touch` may end it.
+        let (hub, _rx) = seeded_hub(false);
+        let peer_id = crate::companion::auth::PeerId("peer-1".to_string());
+        hub.set_visible_to("t1", &peer_id, true);
+        let peer_secret = "beefbeefbeefbeefbeefbeefbeefbeef";
+        let handle = boot_with_peers(Arc::clone(&hub), vec![test_peer("peer-1", peer_secret)]);
+        let host = host_of(&handle);
+        let (_phone_stream, mut phone_reader) = open_sse(&host, "t1"); // phone token
+        assert!(next_data_line(&mut phone_reader).contains("hello"));
+        hub.set_visible_to("t1", &peer_id, false);
+        // A fresh publish must still reach the phone, proving the loop
+        // never even considered the phone's principal against `may_touch`
+        // for a peer grant that was never its own.
+        let mut updated = seeded_snapshot(false);
+        updated.rows[0][0].ch = 'W';
+        updated.rows[0][1].ch = 'O';
+        updated.rows[0][2].ch = 'R';
+        updated.rows[0][3].ch = 'L';
+        updated.rows[0][4].ch = 'D';
+        hub.publish_snapshot("t1", Arc::new(updated));
+        let next = next_data_line(&mut phone_reader);
+        assert!(next.contains("WORLD"), "{next}");
         handle.stop();
     }
 
@@ -1869,6 +2027,25 @@ mod tests {
         // below.
         assert!(may_still_act(false), "not cancelled: may act");
         assert!(!may_still_act(true), "cancelled: may not act");
+    }
+
+    #[test]
+    fn may_continue_stream_is_exactly_neither_cancelled_nor_denied() {
+        // Exhaustive over the whole domain (two bools) — the real
+        // `hub.may_touch` re-check (visibility flipping mid-stream) is
+        // exercised end-to-end in `peer_stream_ends_when_visibility_is_revoked_mid_stream`
+        // and `phone_stream_keeps_receiving_after_an_unrelated_peer_loses_visibility`
+        // above; this just pins down the decision itself.
+        assert!(may_continue_stream(false, true), "neither: may continue");
+        assert!(
+            !may_continue_stream(true, true),
+            "cancelled: may not continue"
+        );
+        assert!(
+            !may_continue_stream(false, false),
+            "not permitted: may not continue"
+        );
+        assert!(!may_continue_stream(true, false), "both: may not continue");
     }
 
     #[test]
