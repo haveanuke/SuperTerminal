@@ -103,9 +103,37 @@ Add `broadcasts: BroadcastMap` to `Workspace`. In `companion_ui.rs`, immediately
 
 Order matters: registration must happen BEFORE replay, or `set_visible_to` finds no entry and silently does nothing. Verify that ordering in the code rather than assuming it.
 
-- [ ] **Step 5: Prune on terminal close**
+- [ ] **Step 4b: Mirror EVERY production `set_visible_to` writer, not just the UI toggle**
 
-Where a terminal is removed, prune its entry. A stale id whose slot is later reused would silently re-share a new terminal with an old peer.
+There is already a production writer this plan originally missed: a peer-spawned
+terminal is made visible to exactly the peer that asked for it, at
+`workspace/mod.rs:716` (inside the spawn drain around `:704`). If that call is not
+ALSO recorded in `BroadcastMap`, a peer-spawned terminal loses its visibility on
+the next companion restart — which is exactly the failure D3d exists to eliminate,
+arriving through the one writer nobody was looking at.
+
+Requirement: every production call to `hub.set_visible_to` is mirrored through
+`BroadcastMap` in the same operation. Grep for the call and handle each site;
+do not rely on this list being complete. If you find a writer neither this plan
+nor the peer-spawn arm names, report it — that is a finding, not a chore.
+
+- [ ] **Step 5: Prune on EVERY removal and rebuild path**
+
+"Where a terminal is removed" is too vague and is exactly how a sibling gets
+left behind. Enumerate and handle all three:
+
+- single terminal close — `workspace/mod.rs:1283`
+- tab close, which removes multiple panes at once — `workspace/mod.rs:1361`
+- session load teardown and remap — `workspace/mod.rs:2322`, which deliberately
+  assigns fresh ids per saved leaf at `:2343`
+
+The session-load path matters most: it rebuilds every terminal with a NEW id, so
+stale share state must be cleared during the rebuild rather than carried forward
+against ids that no longer mean anything. A stale id whose slot is later reused
+would silently share a brand-new terminal with an old peer.
+
+Add a test per path if the logic is pure; where it is entity-bound, say in your
+report which paths you verified by reading rather than by test.
 
 - [ ] **Step 6: Run the full suite**
 
@@ -133,9 +161,25 @@ git commit -m "feat(native): broadcast state outlives the companion restart"
 
 Spec D3c. `serve_stream` (`server.rs:743`) authorizes at CONNECT time and then loops on `cancel` and `revision` only. Today that is safe solely because every revocation path restarts the whole server — but this phase adds a per-session broadcast toggle, and un-sharing a session must cut a live stream that is already open. Otherwise a peer keeps receiving frames from a terminal you just stopped sharing.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests — real SSE tests, not a pure helper**
 
-The property: a stream that was authorized at connect stops delivering once `may_touch` becomes false. Drive it at whatever level you can genuinely test — if the full SSE loop is impractical, extract the per-iteration decision into a pure function (`fn may_continue_stream(cancelled: bool, still_permitted: bool) -> bool`) and test that exhaustively, then call it in the loop. State plainly in your report which you did.
+The full SSE loop IS testable in this repo: existing tests open real streams and
+assert termination after `hub.unregister("t1")` (`server.rs:1844`). Use that
+pattern. A pure `may_continue_stream(cancelled, permitted)` helper is NOT
+sufficient on its own — it would pass while `serve_stream` failed to receive the
+principal at all, or checked the wrong one, or broke the phone.
+
+Three tests, all against the real server:
+
+1. A PEER stream opened on a visible session terminates after
+   `hub.set_visible_to(id, &peer, false)`.
+2. A PHONE stream on that same session KEEPS receiving updates despite the peer
+   having no visibility. This is the regression guard that matters most — the
+   phone streams through this identical loop every day.
+3. Existing phone SSE behaviour is unchanged (the pre-existing tests must pass
+   untouched).
+
+A pure helper is fine in addition, if it makes the loop read better.
 
 - [ ] **Step 2: Run test to verify it fails**
 
