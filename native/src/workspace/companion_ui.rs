@@ -558,6 +558,15 @@ impl Workspace {
     /// implied by an unlit dot: after an app relaunch `BroadcastMap` is
     /// deliberately empty (terminal ids aren't stable across restarts), and
     /// that must read as information, not as a bug.
+    ///
+    /// The no-`shareable` case has two distinct sub-states, and the text
+    /// must not collapse them: `shared_with` (from `BroadcastMap`, the same
+    /// source the row icon's `active` reads) can be non-empty even though
+    /// `shareable` is empty — narrow a peer's `view` grant after sharing
+    /// with it and that is exactly what happens. Reporting "not shared"
+    /// there would contradict the icon; reporting plain "shared" would
+    /// claim a peer can see something `admits_with_grants` will actually
+    /// refuse. So this names the state on its own terms instead.
     pub(super) fn render_share_row(
         &self,
         terminal_id: &str,
@@ -565,7 +574,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
+        let shared_with = self.broadcasts.peers_for(terminal_id);
         if shareable.is_empty() {
+            let message = if shared_with.is_empty() {
+                "not shared \u{b7} no paired peer can view yet"
+            } else {
+                "shared \u{b7} no paired peer can currently view"
+            };
             return div()
                 .flex()
                 .flex_row()
@@ -575,10 +590,9 @@ impl Workspace {
                 .pr(px(8.0))
                 .text_size(px(9.0))
                 .text_color(rgb(theme.ui_text_muted))
-                .child("not shared \u{b7} no paired peer can view yet")
+                .child(message)
                 .into_any_element();
         }
-        let shared_with = self.broadcasts.peers_for(terminal_id);
         let chips: Vec<_> = shareable
             .iter()
             .map(|peer| {
@@ -655,6 +669,23 @@ impl Workspace {
     ) {
         let now_shared = !self.broadcasts.peers_for(terminal_id).contains(peer);
         if now_shared {
+            // Refuse the grant on anything but a local-target pane, even if
+            // some future caller reaches this without going through the
+            // (already gated) sidebar icon — see `may_share_terminal`. A
+            // dead remote pane (`spawn_dead_pane` never registers with the
+            // hub) must not be able to make `BroadcastMap` claim a share
+            // that cannot exist; `hub.set_visible_to` already fails closed
+            // on a non-local origin, but the rule should hold at this
+            // mutation too, not only two layers downstream. Un-sharing below
+            // stays unconditional — revoking is always safe, including
+            // clearing a grant this guard would now refuse to create.
+            let local = self
+                .panes
+                .get(terminal_id)
+                .is_some_and(|pane| may_share_terminal(pane.read(cx).target()));
+            if !local {
+                return;
+            }
             self.broadcasts.share(terminal_id, peer);
         } else {
             self.broadcasts.unshare(terminal_id, peer);

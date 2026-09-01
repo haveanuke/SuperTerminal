@@ -418,6 +418,24 @@ pub struct BroadcastMap(HashMap<String, HashSet<PeerId>>);
 
 impl BroadcastMap {
     /// Record `peer` as allowed to see `id`. Idempotent.
+    ///
+    /// Deliberately does NOT refuse a non-local id itself, unlike
+    /// `companion::hub::Hub::set_visible_to`'s refusal of a non-`LocalPty`
+    /// origin: `Hub` can self-check because it already tracks each
+    /// registered id's `Origin`, but `BroadcastMap` is pure `id -> peers`
+    /// bookkeeping with no notion of a pane's target at all — giving it one
+    /// here would mean threading `Target` through every call site (and
+    /// every existing test) just to duplicate a fact the `Workspace`
+    /// already holds on `self.panes`. The guard instead lives at
+    /// `BroadcastMap`'s one production caller,
+    /// `workspace::companion_ui::toggle_share`, which already has that pane
+    /// in hand — see `workspace::may_share_terminal`. That still closes the
+    /// gap this doc warns about: a caller reaching `share` directly, rather
+    /// than through the (also gated) sidebar icon, gets no enforcement from
+    /// this type alone. `Hub::set_visible_to` remains the backstop that
+    /// actually matters for authority — it fails closed regardless of what
+    /// this map records — so the risk of a second bypass here is a
+    /// misleading "shared" in the UI, not a data leak.
     pub fn share(&mut self, id: &str, peer: &PeerId) {
         self.0
             .entry(id.to_string())

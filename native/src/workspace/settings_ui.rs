@@ -1037,6 +1037,10 @@ impl Workspace {
     /// whole app session. The decision itself is
     /// `peers::peer_mutation_requires_restart`, a pure predicate tested in
     /// `peers.rs`; this only carries it out.
+    ///
+    /// Also the one place `shareable_peers_cache` is refreshed after
+    /// startup — this is the only path that ever writes `settings.peers`,
+    /// so it is the only path that can leave that cache stale.
     fn apply_peer_mutation(&mut self, updated: Vec<peers::PeerRecord>, cx: &mut Context<Self>) {
         let (before, _problems) = self.settings.peers();
         let restart = peers::peer_mutation_requires_restart(&before, &updated);
@@ -1045,6 +1049,10 @@ impl Workspace {
         } else {
             None
         };
+        self.shareable_peers_cache = peers::shareable_peers(&updated)
+            .into_iter()
+            .cloned()
+            .collect();
         self.settings.peers = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
         let _ = self.settings.save();
         if let Some(addr) = restart_addr {

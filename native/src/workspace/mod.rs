@@ -219,6 +219,21 @@ fn local_context_available(target: &crate::hosts::Target, cwd: Option<String>) -
     target.is_local() && cwd.is_some()
 }
 
+/// Whether this pane may be offered — or granted — peer-share visibility at
+/// all. Gates the sidebar's Share icon and share row (`render_projects_view`)
+/// AND the mutation those drive (`companion_ui::toggle_share`) on the pane's
+/// `target`, never on whether a companion sender happens to exist for it:
+/// `spawn_dead_pane` never registers with the hub, so a naive "has a sender"
+/// check would let a dead remote pane's Share control claim success while
+/// sharing nothing. Mirrors `pane::may_broadcast_locally`'s reasoning for the
+/// LOCAL keystroke fan-out — kept as its own predicate rather than reused
+/// because the two gate different hubs for different reasons, and a future
+/// attached pane (a local view of a terminal running on another Mac) is
+/// exactly where they are expected to diverge.
+fn may_share_terminal(target: &crate::hosts::Target) -> bool {
+    target.is_local()
+}
+
 struct DragState {
     tab_index: usize,
     /// The window this drag started in — resizes must never follow an
@@ -290,6 +305,14 @@ pub struct Workspace {
     /// disk. Every production `hub.set_visible_to` call must mirror through
     /// here, and every terminal-removal path must prune it.
     broadcasts: crate::peers::BroadcastMap,
+    /// Peers a per-terminal share toggle may offer at all: those with the
+    /// `view` grant (`peers::shareable_peers`), cloned from `settings.peers`
+    /// once here rather than on every projects-sidebar render — that render
+    /// used to re-parse the peers JSON and clone every `PeerRecord`,
+    /// including its secret, on every frame. Refreshed at startup
+    /// (`Workspace::new`) and on the one path peers are ever mutated,
+    /// `settings_ui::apply_peer_mutation`.
+    shareable_peers_cache: Vec<crate::peers::PeerRecord>,
     /// Terminal ids whose inline share control is expanded in the sidebar.
     /// Purely a UI convenience (which panel is open) — never authority;
     /// pruned alongside `broadcasts` on every terminal-removal path so a
@@ -390,6 +413,12 @@ impl Workspace {
             .map(Companion::from_save)
             .unwrap_or_else(Companion::hatch);
         let pet_pos = settings.buddy_pet_pos;
+        let (paired_peers, _peer_problems) = settings.peers();
+        let shareable_peers_cache: Vec<crate::peers::PeerRecord> =
+            crate::peers::shareable_peers(&paired_peers)
+                .into_iter()
+                .cloned()
+                .collect();
         let mut this = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -430,6 +459,7 @@ impl Workspace {
             companion_previews: None,
             companion_error: None,
             broadcasts: crate::peers::BroadcastMap::default(),
+            shareable_peers_cache,
             share_open: std::collections::HashSet::new(),
             companion_pending_focus: None,
             companion_flyout: false,
@@ -1702,14 +1732,6 @@ impl Workspace {
     /// terminal to jump straight to it.
     fn render_projects_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
-        // Computed once: which paired peers a per-terminal share toggle may
-        // offer at all. A peer without `view` could never do anything with
-        // a share, so it is never offered one — see `peers::shareable_peers`.
-        let (paired_peers, _peer_problems) = self.settings.peers();
-        let shareable: Vec<crate::peers::PeerRecord> = crate::peers::shareable_peers(&paired_peers)
-            .into_iter()
-            .cloned()
-            .collect();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             let active_tab = tab_index == self.active_tab;
@@ -1906,6 +1928,10 @@ impl Workspace {
                         continue;
                     };
                     let pane_ref = pane.read(cx);
+                    // Encode, don't infer: a remote-target pane offers no
+                    // Share control at all, rather than one that silently
+                    // no-ops (see `may_share_terminal`).
+                    let shareable_target = may_share_terminal(pane_ref.target());
                     let focused = self.focused_terminal.as_deref() == Some(terminal_id.as_str());
                     let title = pane_ref.title();
                     let (cwd, activity) = self
@@ -1982,7 +2008,7 @@ impl Workspace {
                                     .text_color(rgb(theme.ui_text_muted))
                                     .child(cwd),
                             )
-                            .child({
+                            .children(shareable_target.then(|| {
                                 let toggle_id = terminal_id.clone();
                                 let shared_now =
                                     !self.broadcasts.peers_for(&terminal_id).is_empty();
@@ -2009,7 +2035,7 @@ impl Workspace {
                                             ws.toggle_share_open(&toggle_id, cx);
                                         }),
                                     )
-                            })
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {
@@ -2018,8 +2044,16 @@ impl Workspace {
                             )
                             .into_any_element(),
                     );
-                    if self.share_open.contains(&terminal_id) {
-                        rows.push(self.render_share_row(&terminal_id, &shareable, cx));
+                    // Defense in depth alongside the icon gate above: a
+                    // remote-target pane's id must never open a share row
+                    // even if `share_open` somehow already held it (e.g. a
+                    // reused id across a session reload).
+                    if shareable_target && self.share_open.contains(&terminal_id) {
+                        rows.push(self.render_share_row(
+                            &terminal_id,
+                            &self.shareable_peers_cache,
+                            cx,
+                        ));
                     }
                 }
             }
@@ -4517,5 +4551,15 @@ mod tests {
             Some("/tmp/repo".to_string())
         ));
         assert!(!local_context_available(&Target::Local, None));
+    }
+
+    #[test]
+    fn a_remote_pane_may_never_be_offered_a_share_control() {
+        // The sidebar Share icon, the share row, and `toggle_share`'s
+        // mutation all key off this — a remote-target pane (including a
+        // dead one from `spawn_dead_pane`, which never registers with the
+        // hub) must never look shareable.
+        assert!(!may_share_terminal(&Target::Remote(ProfileId("p1".into()))));
+        assert!(may_share_terminal(&Target::Local));
     }
 }
