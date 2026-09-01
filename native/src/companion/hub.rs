@@ -263,6 +263,51 @@ impl<S: Clone> CompanionHub<S> {
         list
     }
 
+    /// Sessions a principal may see. `Phone` gets everything, unchanged from
+    /// [`Self::sessions`] — this must never regress what the phone sees
+    /// today. A `Peer` gets only sessions that are BOTH `Origin::LocalPty`
+    /// AND broadcast to it: origin is checked here directly, on the entry,
+    /// rather than trusted to have already been enforced by
+    /// [`Self::set_visible_to`] — the two guards are deliberately redundant.
+    pub fn sessions_for(&self, principal: &Principal) -> Vec<SessionInfo> {
+        match principal {
+            Principal::Phone => self.sessions(),
+            Principal::Peer(peer) => {
+                let mut list: Vec<SessionInfo> = self
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|entry| {
+                        entry.origin == Origin::LocalPty && entry.visible_to.contains(peer)
+                    })
+                    .map(|entry| entry.info.clone())
+                    .collect();
+                list.sort_by(|a, b| a.label.cmp(&b.label).then(a.id.cmp(&b.id)));
+                list
+            }
+        }
+    }
+
+    /// Whether a principal may touch (stream from, or write input to) one
+    /// session. `Phone` may touch any session that exists, matching its
+    /// unrestricted access today. A `Peer` needs the same two conditions as
+    /// [`Self::sessions_for`], checked directly on the entry so a future
+    /// caller that writes `visible_to` without going through
+    /// `set_visible_to` is still refused. An unknown id refuses everyone.
+    pub fn may_touch(&self, principal: &Principal, id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.get(id) else {
+            return false;
+        };
+        match principal {
+            Principal::Phone => true,
+            Principal::Peer(peer) => {
+                entry.origin == Origin::LocalPty && entry.visible_to.contains(peer)
+            }
+        }
+    }
+
     pub fn revision(&self, id: &str) -> Option<u64> {
         self.inner.lock().unwrap().get(id).map(|e| e.revision)
     }
@@ -742,5 +787,125 @@ pub(crate) mod tests {
         hub.register_with_origin("attached", "two", tx, Origin::Attached);
         hub.set_visible_to("attached", &PeerId("p1".into()), true);
         assert!(hub.visible_to(&PeerId("p1".into())).is_empty());
+    }
+
+    #[test]
+    fn the_phone_still_sees_every_session() {
+        // Scoping must not change what the phone sees. This is the
+        // regression guard for the whole task.
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("a", "one", tx.clone(), Origin::LocalPty);
+        hub.register_with_origin("b", "two", tx, Origin::LocalPty);
+        let seen: Vec<String> = hub
+            .sessions_for(&Principal::Phone)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn a_peer_sees_only_what_it_was_made_visible() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("a", "one", tx.clone(), Origin::LocalPty);
+        hub.register_with_origin("b", "two", tx, Origin::LocalPty);
+        let p1 = PeerId("p1".into());
+        hub.set_visible_to("a", &p1, true);
+        let seen: Vec<String> = hub
+            .sessions_for(&Principal::Peer(p1.clone()))
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(seen, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_peer_sees_nothing_before_anything_is_broadcast() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("a", "one", tx, Origin::LocalPty);
+        assert!(hub
+            .sessions_for(&Principal::Peer(PeerId("p1".into())))
+            .is_empty());
+    }
+
+    #[test]
+    fn a_peer_may_not_touch_a_session_it_cannot_see() {
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("a", "one", tx.clone(), Origin::LocalPty);
+        hub.register_with_origin("b", "two", tx, Origin::LocalPty);
+        let p1 = PeerId("p1".into());
+        hub.set_visible_to("a", &p1, true);
+        let peer = Principal::Peer(p1);
+        assert!(hub.may_touch(&peer, "a"));
+        assert!(
+            !hub.may_touch(&peer, "b"),
+            "peer reached an unshared session"
+        );
+        assert!(hub.may_touch(&Principal::Phone, "b"), "phone lost access");
+    }
+
+    #[test]
+    fn set_visible_to_refuses_an_attached_session() {
+        // Covers the guard at the MUTATION: set_visible_to must not record
+        // visibility for an Attached entry in the first place. This does
+        // NOT exercise may_touch's own origin check — see
+        // `may_touch_refuses_an_attached_session_even_if_visibility_was_recorded`
+        // for that, which bypasses this guard on purpose.
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("mirror", "two", tx, Origin::Attached);
+        let p1 = PeerId("p1".into());
+        hub.set_visible_to("mirror", &p1, true);
+        assert!(!hub.may_touch(&Principal::Peer(p1), "mirror"));
+    }
+
+    #[test]
+    fn may_touch_refuses_an_attached_session_even_if_visibility_was_recorded() {
+        // set_visible_to refuses Attached entries, so going through it would
+        // leave visible_to empty and this test would pass even with may_touch's
+        // origin check deleted. Write the visibility DIRECTLY to simulate a
+        // future caller that bypasses that guard — proving may_touch's own
+        // check is load-bearing rather than decorative.
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("mirror", "two", tx, Origin::Attached);
+        let p1 = PeerId("p1".into());
+        hub.inner
+            .lock()
+            .unwrap()
+            .get_mut("mirror")
+            .expect("registered above")
+            .visible_to
+            .insert(p1.clone());
+        assert!(
+            !hub.may_touch(&Principal::Peer(p1), "mirror"),
+            "may_touch relied on set_visible_to instead of checking origin itself"
+        );
+    }
+
+    #[test]
+    fn sessions_for_omits_an_attached_session_even_if_visibility_was_recorded() {
+        // Same gap, same fix, for the list form: sessions_for's peer arm
+        // must check origin itself rather than trust that visible_to was
+        // only ever populated by set_visible_to.
+        let hub = TestHub::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        hub.register_with_origin("mirror", "two", tx, Origin::Attached);
+        let p1 = PeerId("p1".into());
+        hub.inner
+            .lock()
+            .unwrap()
+            .get_mut("mirror")
+            .expect("registered above")
+            .visible_to
+            .insert(p1.clone());
+        assert!(
+            hub.sessions_for(&Principal::Peer(p1)).is_empty(),
+            "sessions_for relied on set_visible_to instead of checking origin itself"
+        );
     }
 }

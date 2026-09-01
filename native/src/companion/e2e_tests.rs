@@ -147,6 +147,59 @@ fn phone_input_round_trips_to_sse_snapshot() {
 }
 
 #[test]
+fn phone_sessions_list_is_unaffected_by_peer_scoping() {
+    // Task 2 routes `/sessions` through `hub.sessions_for(&principal)`.
+    // This is the end-to-end regression guard: the phone must still see
+    // every registered session over the wire, not a peer-scoped subset —
+    // neither session below was ever made visible to any peer.
+    let session_a = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let session_b = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+    let hub = Arc::new(Hub::new());
+    hub.register("a", "one", session_a.input_sender());
+    hub.register("b", "two", session_b.input_sender());
+    let handle = start(
+        Arc::clone(&hub),
+        crate::themes::default_theme(),
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+            page: "<title>e2e</title>",
+            previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+            thumbs: crate::companion::thumbs::Thumbnailer::new(
+                std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
+            ),
+        },
+    )
+    .expect("server starts");
+    let host = handle
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+
+    let mut stream = TcpStream::connect(&host).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .write_all(format!("GET /sessions?t={TOKEN} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut out = String::new();
+    let _ = std::io::Read::read_to_string(&mut stream, &mut out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("\"id\":\"a\""), "phone lost session a: {out}");
+    assert!(out.contains("\"id\":\"b\""), "phone lost session b: {out}");
+
+    handle.stop();
+    session_a
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+    session_b
+        .shutdown()
+        .join_with_deadline(Duration::from_secs(5));
+}
+
+#[test]
 fn the_peer_byte_sink_rejects_the_phone_token() {
     // Route admission, not just authentication. The phone authenticates
     // fine; it must still be refused this route, because it has its own

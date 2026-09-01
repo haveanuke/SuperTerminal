@@ -395,14 +395,12 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             );
         }
         (Method::Get, "/sessions") if route_admitted("/sessions") => {
-            // PHASE B: this returns every session in the hub, regardless of
-            // principal. `admits` already lets a Peer reach this route, but
-            // nothing here narrows the list to `hub.visible_to(&peer_id)`
-            // (or `hub.publishable_ids()` for what a peer could be shown at
-            // all) — a peer would be handed every local session, not just
-            // the ones published to it. Admitting Peer on `/sessions` is not
-            // the same as scoping what it returns.
-            let sessions = shared.hub.sessions();
+            // route_admitted("/sessions") guarantees `principal` is Some;
+            // the fallback below is defensive, never taken in practice.
+            let sessions = principal
+                .clone()
+                .map(|p| shared.hub.sessions_for(&p))
+                .unwrap_or_default();
             let json = serde_json::to_string(
                 &sessions
                     .iter()
@@ -476,13 +474,13 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
         }
         (Method::Get, _) if path.starts_with("/stream/") && route_admitted("/stream") => {
             let id = path["/stream/".len()..].to_string();
-            // PHASE B: this streams whichever id is in the URL, for any
-            // admitted principal. `admits` lets a Peer reach `/stream`, but
-            // nothing here checks the id against `hub.visible_to(&peer_id)`
-            // — a peer could stream any session's grid, not just the ones
-            // published to it. Admitting Peer on `/stream` is not the same
-            // as scoping what it may stream.
-            if shared.hub.revision(&id).is_none() {
+            // route_admitted("/stream") guarantees `principal` is Some; a
+            // missing principal is refused the same as a session it may not
+            // see — never a distinguishable response.
+            let may_touch = principal
+                .as_ref()
+                .is_some_and(|p| shared.hub.may_touch(p, &id));
+            if !may_touch {
                 let _ = respond(&stream, "404 Not Found", &[], b"");
                 return;
             }
@@ -641,14 +639,6 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
         // encoded with `keys.rs::key_to_bytes` — never interpreted here,
         // only validated as a clean array of bytes. Admitted for
         // `Principal::Peer` only (see `auth::admits`).
-        //
-        // PHASE B: this writes those bytes into whichever id is in the URL,
-        // including an `Origin::Attached` one, with no check that this peer
-        // is allowed to touch it — `hub.visible_to(&peer_id)` is never
-        // consulted below. Admitting Peer on `/peer-input` is not the same
-        // as scoping which sessions it may write into; today that gap is
-        // moot because `principal_for` cannot produce a `Peer`, but the
-        // table already reads as though the question is settled.
         (Method::Post, _) if path.starts_with("/peer-input/") && route_admitted("/peer-input") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
@@ -662,6 +652,17 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 return;
             }
             let id = path["/peer-input/".len()..].to_string();
+            // route_admitted("/peer-input") guarantees `principal` is Some
+            // (and, per `auth::admits`, a `Peer`); scoped to sessions
+            // shared with this peer the same as `/stream` — a bad token, a
+            // denied route, and an unshared session must all read 404.
+            let may_touch = principal
+                .as_ref()
+                .is_some_and(|p| shared.hub.may_touch(p, &id));
+            if !may_touch {
+                let _ = respond(&stream, "404 Not Found", &[], b"");
+                return;
+            }
             let Some(bytes) = parse_peer_bytes(&request.body) else {
                 let _ = respond(&stream, "400 Bad Request", &[], b"");
                 return;
