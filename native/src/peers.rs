@@ -50,6 +50,14 @@ pub fn new_peer_secret() -> String {
     crate::companion::auth::generate_token()
 }
 
+/// Fresh identifier for a newly paired peer. Same generator as the secret:
+/// an id carries no confidentiality requirement, only uniqueness, and a
+/// second generator would just be a second place to get the hex format
+/// wrong.
+pub fn new_peer_id() -> String {
+    crate::companion::auth::generate_token()
+}
+
 fn secret_ok(secret: &str) -> bool {
     secret.len() == SECRET_LEN
         && secret
@@ -130,6 +138,226 @@ pub fn load_peers(raw: &serde_json::Value) -> (Vec<PeerRecord>, Vec<PeerProblem>
         }
     }
     (kept, problems)
+}
+
+// ---------------------------------------------------------------------
+// Discovery: candidates from `tailscale status --json`, pairing, and the
+// decision of whether a peer-settings mutation must reach the running
+// companion immediately.
+// ---------------------------------------------------------------------
+
+/// A tailnet peer that COULD be paired: not yet a `PeerRecord`, just
+/// something `tailscale status --json` reported as an online desktop
+/// machine. Promotion to a peer is always an explicit user action — the
+/// tailnet also holds an Android phone, which must never become offerable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub host: String,
+    pub addr: String,
+    pub os: String,
+}
+
+/// Tailscale-reported `OS` values this app treats as "another desktop that
+/// could run SuperTerminal". Everything else (the tailnet's Android phone,
+/// iOS, etc.) is excluded here, not by the caller.
+fn is_desktop_os(os: &str) -> bool {
+    matches!(os, "macOS" | "linux" | "windows")
+}
+
+/// Parse `tailscale status --json` into candidates: online, desktop peers
+/// only. Never panics — a peer entry missing or misusing a field is simply
+/// dropped, and a malformed container (wrong shape, invalid JSON, `null`,
+/// non-object) yields no candidates, matching `companion::blender`'s
+/// temperament for absent or malformed input.
+pub fn parse_tailscale_status(raw: &str) -> Vec<Candidate> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(peers) = value.get("Peer").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for peer in peers.values() {
+        let Some(host) = peer.get("HostName").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(os) = peer.get("OS").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let online = peer
+            .get("Online")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !online || !is_desktop_os(os) {
+            continue;
+        }
+        let Some(addr) = peer
+            .get("TailscaleIPs")
+            .and_then(|v| v.as_array())
+            .and_then(|ips| ips.first())
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        candidates.push(Candidate {
+            host: host.to_string(),
+            addr: addr.to_string(),
+            os: os.to_string(),
+        });
+    }
+    // A JSON object backed by a hash map iterates in arbitrary order; a
+    // candidate list that reshuffles on every scan would look broken.
+    candidates.sort_by(|a, b| a.host.cmp(&b.host));
+    candidates
+}
+
+/// Total budget for the `tailscale status` subprocess — a wedged
+/// `tailscaled` costs one click, never a hung settings sheet.
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Never slurp an unbounded reply.
+const SCAN_MAX_BYTES: usize = 1024 * 1024;
+
+/// Shell `tailscale status --json` and parse it. One attempt, no hot
+/// retry: `tailscale` missing from PATH, a wedged daemon, or output past
+/// the cap all yield an empty list — the feature is simply absent, never
+/// an error dialog. Same bounded-probe discipline as
+/// `companion::blender::capture_once`.
+pub fn scan_candidates() -> Vec<Candidate> {
+    match shell_bounded(
+        "tailscale",
+        &["status", "--json"],
+        SCAN_TIMEOUT,
+        SCAN_MAX_BYTES,
+    ) {
+        Some(raw) => parse_tailscale_status(&raw),
+        None => Vec::new(),
+    }
+}
+
+/// Bounded subprocess call: run `program` with `args`, capturing stdout up
+/// to `max_bytes` within a hard total `timeout`. `None` on any failure —
+/// missing binary, non-UTF8 output, a process still running past the
+/// deadline, or output over the cap. The reader runs on its own thread so
+/// the deadline is real wall-clock time, not a per-read timeout a trickling
+/// process could keep resetting forever.
+fn shell_bounded(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let ok = loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > max_bytes {
+                        break false;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        // The receiver may already be gone (deadline blew past this send);
+        // that is not this thread's problem to report.
+        let _ = tx.send(ok.then_some(buf));
+    });
+    let result = rx.recv_timeout(timeout).ok().flatten();
+    // Always reap: past the deadline the reader thread may still be
+    // blocked on a wedged pipe, but the child itself must never be left
+    // running loose — a later scan must not stack up abandoned processes.
+    let _ = child.kill();
+    let _ = child.wait();
+    String::from_utf8(result?).ok()
+}
+
+/// Which candidates the settings UI should offer. A host already paired
+/// (by label) is not offered again — pairing the same machine twice would
+/// just mint a second, indistinguishable credential for it. Promotion
+/// itself stays an explicit user action; this only prunes the list they
+/// choose from.
+pub fn offerable_candidates(candidates: &[Candidate], paired: &[PeerRecord]) -> Vec<Candidate> {
+    candidates
+        .iter()
+        .filter(|candidate| !paired.iter().any(|peer| peer.label == candidate.host))
+        .cloned()
+        .collect()
+}
+
+/// A brand-new pairing: fresh id, fresh secret, every grant OFF. The
+/// running companion still needs an explicit restart before this record is
+/// actually recognized — pairing alone only produces the record; see
+/// `peer_mutation_requires_restart`.
+pub fn pair(host: &str) -> PeerRecord {
+    PeerRecord {
+        id: PeerId(new_peer_id()),
+        label: host.to_string(),
+        secret: new_peer_secret(),
+        grants: Grants::default(),
+    }
+}
+
+/// Which grant a peer row's toggle acted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantKind {
+    View,
+    Type,
+    Spawn,
+}
+
+/// What a grant toggle means: flip exactly the one field named, leave the
+/// other two exactly as they were.
+pub fn toggled_grants(grants: Grants, which: GrantKind) -> Grants {
+    match which {
+        GrantKind::View => Grants {
+            view: !grants.view,
+            ..grants
+        },
+        GrantKind::Type => Grants {
+            type_: !grants.type_,
+            ..grants
+        },
+        GrantKind::Spawn => Grants {
+            spawn: !grants.spawn,
+            ..grants
+        },
+    }
+}
+
+/// THE blocking decision for peer mutations: whether swapping the
+/// companion's frozen peer snapshot from `before` to `after` must happen
+/// through an immediate stop+restart rather than waiting for the next
+/// manual toggle. `ServerConfig.peers` (see `companion::server`) is
+/// resolved once at server start and never refreshed — nothing restarts
+/// the companion when settings change on its own — so without this, a
+/// peer deleted, or narrowed, keeps its OLD authority live until the
+/// server is next toggled by hand, possibly the whole app session.
+/// Shipping deletion as "revocation" on top of that would silently reopen
+/// the exact hole per-peer pairing exists to close.
+///
+/// Deliberately unconditional on direction: a narrowed grant or a deleted
+/// peer must restart because the old snapshot would otherwise keep
+/// authorizing exactly what was just revoked, but a widened grant or a
+/// freshly paired peer restarts too — a peer mutation that "mostly" takes
+/// effect immediately is one nobody can reason about, and it is also the
+/// only way a fresh pairing's secret becomes recognizable at all. See
+/// `workspace::settings_ui::apply_peer_mutation`, which is `regenerate_
+/// companion_token`'s stop-then-toggle pattern applied to every peer
+/// mutation.
+pub fn peer_mutation_requires_restart(before: &[PeerRecord], after: &[PeerRecord]) -> bool {
+    before != after
 }
 
 #[cfg(test)]
@@ -244,5 +472,234 @@ mod tests {
         assert!(a
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn generated_ids_are_unique() {
+        assert_ne!(new_peer_id(), new_peer_id());
+    }
+
+    // -------------------------------------------------------------
+    // Discovery
+    // -------------------------------------------------------------
+
+    #[test]
+    fn tailscale_peers_become_candidates() {
+        let json = r#"{"Peer":{"k1":{"HostName":"work-mbp","TailscaleIPs":["100.64.0.2"],"OS":"macOS","Online":true}}}"#;
+        let found = parse_tailscale_status(json);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host, "work-mbp");
+        assert_eq!(found[0].addr, "100.64.0.2");
+    }
+
+    #[test]
+    fn offline_and_non_desktop_peers_are_not_offered() {
+        // The tailnet also holds an Android phone, which is not a peer host.
+        let json = r#"{"Peer":{
+            "k1":{"HostName":"pixel","TailscaleIPs":["100.64.0.3"],"OS":"android","Online":true},
+            "k2":{"HostName":"off","TailscaleIPs":["100.64.0.4"],"OS":"macOS","Online":false}}}"#;
+        assert!(parse_tailscale_status(json).is_empty());
+    }
+
+    #[test]
+    fn malformed_status_yields_no_candidates_rather_than_panicking() {
+        for bad in ["", "null", "{}", "not json", r#"{"Peer":5}"#] {
+            assert!(
+                parse_tailscale_status(bad).is_empty(),
+                "panicked or accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_online_desktop_peers_come_back_sorted_by_host() {
+        let json = r#"{"Peer":{
+            "k1":{"HostName":"zeta","TailscaleIPs":["100.64.0.9"],"OS":"linux","Online":true},
+            "k2":{"HostName":"alpha","TailscaleIPs":["100.64.0.8"],"OS":"windows","Online":true}}}"#;
+        let found = parse_tailscale_status(json);
+        let hosts: Vec<&str> = found.iter().map(|c| c.host.as_str()).collect();
+        assert_eq!(hosts, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn a_peer_missing_an_ip_is_dropped_not_panicked_on() {
+        let json = r#"{"Peer":{"k1":{"HostName":"work-mbp","TailscaleIPs":[],"OS":"macOS","Online":true}}}"#;
+        assert!(parse_tailscale_status(json).is_empty());
+    }
+
+    #[test]
+    fn shell_bounded_returns_stdout_on_a_quick_command() {
+        let out = shell_bounded(
+            "/bin/echo",
+            &["hi"],
+            std::time::Duration::from_secs(2),
+            1024,
+        );
+        assert_eq!(out.as_deref(), Some("hi\n"));
+    }
+
+    #[test]
+    fn shell_bounded_gives_up_at_the_deadline_rather_than_hanging() {
+        let start = std::time::Instant::now();
+        let out = shell_bounded(
+            "/bin/sleep",
+            &["5"],
+            std::time::Duration::from_millis(100),
+            1024,
+        );
+        assert!(out.is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "the deadline was not enforced -- a wedged tailscaled would hang the settings sheet"
+        );
+    }
+
+    #[test]
+    fn shell_bounded_refuses_output_past_the_cap() {
+        // /usr/bin/yes floods stdout forever; a real cap must cut it off
+        // long before the (generous) timeout would.
+        let out = shell_bounded("/usr/bin/yes", &[], std::time::Duration::from_secs(2), 16);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn shell_bounded_absent_binary_yields_none_not_a_panic() {
+        assert!(shell_bounded(
+            "definitely-not-a-real-binary-xyz",
+            &[],
+            std::time::Duration::from_secs(1),
+            1024
+        )
+        .is_none());
+    }
+
+    // -------------------------------------------------------------
+    // Pairing surface: pure decisions the UI only renders.
+    // -------------------------------------------------------------
+
+    fn candidate(host: &str) -> Candidate {
+        Candidate {
+            host: host.to_string(),
+            addr: "100.64.0.2".to_string(),
+            os: "macOS".to_string(),
+        }
+    }
+
+    #[test]
+    fn pairing_starts_with_every_grant_off() {
+        let record = pair("work-mbp");
+        assert_eq!(record.label, "work-mbp");
+        assert!(!record.grants.view);
+        assert!(!record.grants.type_);
+        assert!(!record.grants.spawn);
+        assert!(secret_ok(&record.secret), "pair() must mint a valid secret");
+        assert!(!record.id.0.is_empty());
+    }
+
+    #[test]
+    fn pairing_the_same_host_twice_mints_different_credentials() {
+        // Two pairings of the same machine are two separate secrets; the
+        // caller decides whether to offer a re-pair, not this function.
+        let a = pair("work-mbp");
+        let b = pair("work-mbp");
+        assert_ne!(a.id, b.id);
+        assert_ne!(a.secret, b.secret);
+    }
+
+    #[test]
+    fn an_already_paired_host_is_not_offered_again() {
+        let candidates = vec![candidate("work-mbp"), candidate("other-mac")];
+        let paired = vec![pair("work-mbp")];
+        let offered = offerable_candidates(&candidates, &paired);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].host, "other-mac");
+    }
+
+    #[test]
+    fn with_no_peers_paired_every_candidate_is_offerable() {
+        let candidates = vec![candidate("a"), candidate("b")];
+        assert_eq!(offerable_candidates(&candidates, &[]).len(), 2);
+    }
+
+    #[test]
+    fn a_grant_toggle_flips_only_the_named_field() {
+        let base = Grants::default();
+        let viewed = toggled_grants(base, GrantKind::View);
+        assert!(viewed.view);
+        assert!(!viewed.type_);
+        assert!(!viewed.spawn);
+
+        let typed = toggled_grants(viewed, GrantKind::Type);
+        assert!(typed.view, "an unrelated toggle must not clear view");
+        assert!(typed.type_);
+        assert!(!typed.spawn);
+
+        let back = toggled_grants(typed, GrantKind::View);
+        assert!(!back.view, "toggling twice must return to the original");
+    }
+
+    #[test]
+    fn spawn_toggle_is_independent_of_the_other_two() {
+        let base = Grants {
+            view: true,
+            type_: true,
+            spawn: false,
+        };
+        let toggled = toggled_grants(base, GrantKind::Spawn);
+        assert!(toggled.spawn);
+        assert!(toggled.view);
+        assert!(toggled.type_);
+    }
+
+    // -------------------------------------------------------------
+    // THE blocking criterion: does a peer mutation need to reach the
+    // running companion immediately, rather than at the next toggle?
+    // -------------------------------------------------------------
+
+    #[test]
+    fn deleting_a_peer_requires_a_restart() {
+        let peer = pair("work-mbp");
+        let before = vec![peer];
+        let after: Vec<PeerRecord> = Vec::new();
+        assert!(peer_mutation_requires_restart(&before, &after));
+    }
+
+    #[test]
+    fn narrowing_a_grant_requires_a_restart() {
+        let mut peer = pair("work-mbp");
+        peer.grants.view = true;
+        let before = vec![peer.clone()];
+        peer.grants.view = false;
+        let after = vec![peer];
+        assert!(
+            peer_mutation_requires_restart(&before, &after),
+            "narrowing a grant is a partial revocation -- it must not wait for a toggle"
+        );
+    }
+
+    #[test]
+    fn widening_a_grant_also_requires_a_restart() {
+        // Deliberately unconditional on direction -- see the doc comment.
+        let mut peer = pair("work-mbp");
+        let before = vec![peer.clone()];
+        peer.grants.spawn = true;
+        let after = vec![peer];
+        assert!(peer_mutation_requires_restart(&before, &after));
+    }
+
+    #[test]
+    fn pairing_a_new_peer_requires_a_restart() {
+        // Otherwise the fresh secret is unrecognized by the running server
+        // until the next manual toggle -- "pairing" that silently doesn't
+        // work yet.
+        let before: Vec<PeerRecord> = Vec::new();
+        let after = vec![pair("work-mbp")];
+        assert!(peer_mutation_requires_restart(&before, &after));
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_needs_no_restart() {
+        let peers = vec![pair("work-mbp")];
+        assert!(!peer_mutation_requires_restart(&peers, &peers));
     }
 }

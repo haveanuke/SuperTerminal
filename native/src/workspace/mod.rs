@@ -347,6 +347,18 @@ pub struct Workspace {
     rename_grace: u8,
     /// Swap mode: the pane waiting to trade places, if any.
     swap_source: Option<String>,
+    /// Tailnet peers found by the last scan (see `peers::scan_candidates`).
+    peer_candidates: Vec<crate::peers::Candidate>,
+    /// A scan is in flight — guards against stacking up scans.
+    peer_scanning: bool,
+    /// One scan has completed (even if it found nothing), so the settings
+    /// sheet auto-scans at most once per session instead of re-triggering
+    /// on every render of an empty result.
+    peer_scanned_once: bool,
+    /// The label + secret of a peer just paired, shown once for QR
+    /// transfer (the phone-link flyout's `qr::matrix` pattern) until
+    /// dismissed or replaced by the next pairing.
+    peer_pairing_secret: Option<(String, String)>,
 }
 
 impl Workspace {
@@ -433,6 +445,10 @@ impl Workspace {
             rename_blur_armed: false,
             rename_grace: 0,
             swap_source: None,
+            peer_candidates: Vec::new(),
+            peer_scanning: false,
+            peer_scanned_once: false,
+            peer_pairing_secret: None,
         };
         // First launch (or a healed save): persist the hatched identity so
         // the same pet comes back next session.
@@ -3340,9 +3356,11 @@ impl Workspace {
                     ],
                     SettingsSection::Buddy => vec![self.render_buddy_row(cx).into_any_element()],
                     SettingsSection::Alerts => vec![self.render_alerts_row(cx).into_any_element()],
-                    SettingsSection::Companion => {
-                        vec![self.render_previews_row(cx).into_any_element()]
-                    }
+                    SettingsSection::Companion => vec![
+                        self.render_previews_row(cx).into_any_element(),
+                        self.group_label("peers").into_any_element(),
+                        self.render_peers_row(cx).into_any_element(),
+                    ],
                 };
 
                 let nav_item = |ws: &Self,
