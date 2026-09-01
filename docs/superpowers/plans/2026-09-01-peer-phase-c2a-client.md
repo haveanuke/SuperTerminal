@@ -231,6 +231,16 @@ stream that delivers a frame then goes silent fails after `IDLE_GAP` and not
 before; heartbeats alone keep a stream alive indefinitely (drive at least two
 gaps' worth); a frame arriving keeps it alive.
 
+**A test-design trap to avoid.** A session that is REGISTERED but has never
+PUBLISHED starts with `snapshot: None` and `revision: 0` (`hub.rs:133`), and
+`snapshot_json` returns `None` until the first publish (`hub.rs:328`). The
+server loop can then sit in its fresh-but-no-snapshot branch WITHOUT emitting
+heartbeats. In production a pane publishes on the generation check at
+companion start (`pane.rs:356`), so this does not occur — but a test that
+registers a session and never publishes is NOT a "healthy quiet server", and
+treating it as one would make an `IDLE_GAP` test pass or fail for the wrong
+reason. Publish at least one snapshot before asserting anything about liveness.
+
 - [ ] **Step 1: Write the failing tests**
 - [ ] **Step 2: Run them and observe the failure**
 - [ ] **Step 3: Implement, with the three constants named and documented**
@@ -277,6 +287,11 @@ rather than inventing it.
 - `Refused` — the peer answered 404. The session is not shared with us (or does
   not exist; the server deliberately does not distinguish those, so neither can we).
 - `Gone` — the peer answered 410, or the stream ended cleanly. The session is over.
+  Note this is also what MID-STREAM REVOCATION looks like from here: when
+  sharing is withdrawn, `serve_stream` returns and the connection closes cleanly
+  (`server.rs:907`), so an un-shared session surfaces as `Gone` rather than
+  `Refused`. Both are terminal, so behaviour is right either way — but do not
+  write a test expecting `Refused` for that path.
 - `Unavailable` — connect failed, or reconnect attempts were exhausted.
 
 `Refused` and `Gone` are terminal: do not reconnect. Retrying a 404 in a loop is
@@ -300,7 +315,10 @@ not driving the settings UI):
   reports `Fresh` again without a new frame** — drive it by stopping the server
 - attaching to a session NOT shared with this peer reaches `Refused` and does not
   reconnect (assert the attempt count does not climb)
-- `send()` delivers bytes the server's hub actually receives
+- `send()` delivers bytes the server's hub actually receives. Note the server
+  requires the JSON envelope `{"bytes":[...]}` AND `Content-Type:
+  application/companion-input`, and rejects anything else (`server.rs:807`) —
+  a raw byte body will be refused.
 - dropping the `Attachment` ends its thread rather than leaking it
 - reconnect gives up at `MAX_RECONNECTS` and settles on `Unavailable`
 
