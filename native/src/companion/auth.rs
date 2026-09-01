@@ -58,6 +58,45 @@ pub fn admits(path: &str, method: Method, principal: &Principal) -> bool {
     }
 }
 
+/// Admission's third layer: not just "may this principal use this route"
+/// (Phase A's table above) but "does this peer hold the grant the route
+/// needs". Phase A is consulted FIRST — if it denies, this denies; grants
+/// can only narrow what Phase A already admitted, never widen it, so a peer
+/// with every grant set still cannot reach `/close` or `/previews`.
+///
+/// `Principal::Phone` ignores grants entirely — grants describe peers, not
+/// the phone. `grants: None` means the presented principal resolved to no
+/// peer record at all (revoked, or never existed) and is refused
+/// everything, even routes Phase A would otherwise admit a peer to.
+pub fn admits_with_grants(
+    path: &str,
+    method: Method,
+    principal: &Principal,
+    grants: Option<crate::peers::Grants>,
+) -> bool {
+    if !admits(path, method, principal) {
+        return false;
+    }
+    match principal {
+        Principal::Phone => true,
+        Principal::Peer(_) => {
+            let Some(grants) = grants else {
+                return false;
+            };
+            match (path, method) {
+                ("/sessions", Method::Get) | ("/stream", Method::Get) => grants.view,
+                // Typing into a session you cannot see is meaningless;
+                // requiring both stops a half-configured peer typing blind.
+                ("/peer-input", Method::Post) => grants.view && grants.type_,
+                // Independent of `view`: creating a terminal is a separate
+                // authority from watching one.
+                ("/spawn", Method::Post) => grants.spawn,
+                _ => true,
+            }
+        }
+    }
+}
+
 /// Resolve a presented token to a principal. Constant-time against the
 /// phone token; Phase A has no peer secrets, so `Peer` is unreachable here.
 pub fn principal_for(phone_token: &str, presented: &str) -> Option<Principal> {
@@ -186,5 +225,109 @@ mod tests {
         assert_eq!(principal_for("abc123", "abc123"), Some(Principal::Phone));
         assert_eq!(principal_for("abc123", "wrong"), None);
         assert_eq!(principal_for("abc123", ""), None);
+    }
+
+    fn all_off() -> crate::peers::Grants {
+        crate::peers::Grants::default()
+    }
+
+    #[test]
+    fn a_peer_with_no_grants_can_do_nothing() {
+        let p = peer();
+        for (path, method) in [
+            ("/sessions", Method::Get),
+            ("/stream", Method::Get),
+            ("/peer-input", Method::Post),
+            ("/spawn", Method::Post),
+        ] {
+            assert!(
+                !admits_with_grants(path, method, &p, Some(all_off())),
+                "no-grant peer reached {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_alone_permits_looking_but_not_typing_or_spawning() {
+        let g = crate::peers::Grants {
+            view: true,
+            ..Default::default()
+        };
+        let p = peer();
+        assert!(admits_with_grants("/sessions", Method::Get, &p, Some(g)));
+        assert!(admits_with_grants("/stream", Method::Get, &p, Some(g)));
+        assert!(!admits_with_grants(
+            "/peer-input",
+            Method::Post,
+            &p,
+            Some(g)
+        ));
+        assert!(!admits_with_grants("/spawn", Method::Post, &p, Some(g)));
+    }
+
+    #[test]
+    fn typing_requires_view_as_well() {
+        // Input into a session you cannot see is meaningless; requiring both
+        // stops a half-configured peer from typing blind.
+        let g = crate::peers::Grants {
+            type_: true,
+            ..Default::default()
+        };
+        assert!(!admits_with_grants(
+            "/peer-input",
+            Method::Post,
+            &peer(),
+            Some(g)
+        ));
+    }
+
+    #[test]
+    fn spawn_is_independent_of_view() {
+        let g = crate::peers::Grants {
+            spawn: true,
+            ..Default::default()
+        };
+        assert!(admits_with_grants("/spawn", Method::Post, &peer(), Some(g)));
+    }
+
+    #[test]
+    fn the_phone_is_unaffected_by_grants() {
+        // Grants describe peers. The phone's table is unchanged.
+        for (path, method) in [
+            ("/sessions", Method::Get),
+            ("/close", Method::Post),
+            ("/previews", Method::Get),
+        ] {
+            assert!(admits_with_grants(path, method, &Principal::Phone, None));
+        }
+    }
+
+    #[test]
+    fn a_peer_with_no_record_is_refused_everything() {
+        // `None` grants means the peer resolved to no record at all.
+        assert!(!admits_with_grants("/sessions", Method::Get, &peer(), None));
+    }
+
+    #[test]
+    fn grants_can_only_narrow_never_widen() {
+        // The route table is consulted FIRST. A peer holding every grant must
+        // still not reach a phone-only route — otherwise grants become an
+        // escalation path rather than a restriction.
+        let all = crate::peers::Grants {
+            view: true,
+            type_: true,
+            spawn: true,
+        };
+        for (path, method) in [
+            ("/close", Method::Post),
+            ("/rename", Method::Post),
+            ("/previews", Method::Get),
+            ("/preview", Method::Get),
+        ] {
+            assert!(
+                !admits_with_grants(path, method, &peer(), Some(all)),
+                "a fully-granted peer reached {path}"
+            );
+        }
     }
 }

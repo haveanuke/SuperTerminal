@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::themes::Theme;
 use superterminal_core::activity::Activity;
 
-use super::auth::{admits, principal_for, Principal};
+use super::auth::{admits_with_grants, principal_for, Principal};
 use super::http::{parse_request, Method, ParseError, Request};
 use super::hub::CompanionHub;
 use super::input::{
@@ -59,6 +59,11 @@ pub struct ServerConfig {
     pub page: &'static str,
     pub previews: Arc<super::previews::PreviewStore>,
     pub thumbs: Arc<super::thumbs::Thumbnailer>,
+    /// Snapshot of paired peers' grants, resolved once at server start (the
+    /// same lifetime as `token`). Looked up by `PeerId` per request so
+    /// `admits_with_grants` can enforce the peer's own view/type/spawn
+    /// switches on top of Phase A's route table.
+    pub peers: Vec<crate::peers::PeerRecord>,
 }
 
 pub struct ServerHandle {
@@ -109,6 +114,7 @@ struct Shared<S: Clone> {
     /// Build identity, resolved once at start so `/version` never touches
     /// the filesystem per request.
     build: String,
+    peers: Vec<crate::peers::PeerRecord>,
 }
 
 pub fn start<S: InputSink>(
@@ -133,6 +139,7 @@ pub fn start<S: InputSink>(
         thumbs: cfg.thumbs,
         img: AtomicUsize::new(0),
         build: crate::settings::build_hash(),
+        peers: cfg.peers,
     });
     let acceptor_workers = Arc::clone(&workers);
     let acceptor_shared = Arc::clone(&shared);
@@ -359,10 +366,24 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
     // Admission is checked per matched route below (see `route_admitted`): a
     // principal that authenticates but is not permitted on this route gets
     // the same 404 as a bad token, never a distinguishable 401/403.
+    //
+    // Grants are resolved here, not inside `admits_with_grants`: a peer's
+    // grants live in `Settings`, which the auth layer has no business
+    // reading. `Principal::Phone` has no peer record to look up, so it
+    // always resolves to `None` — harmless, since `admits_with_grants`
+    // ignores grants entirely for the phone.
     let route_admitted = |prefix: &str| {
-        principal
-            .as_ref()
-            .is_some_and(|p| admits(prefix, request.method, p))
+        principal.as_ref().is_some_and(|p| {
+            let grants = match p {
+                Principal::Phone => None,
+                Principal::Peer(id) => shared
+                    .peers
+                    .iter()
+                    .find(|record| &record.id == id)
+                    .map(|record| record.grants),
+            };
+            admits_with_grants(prefix, request.method, p, grants)
+        })
     };
     match (request.method, path.as_str()) {
         (Method::Get, "/") => {
@@ -771,6 +792,7 @@ mod tests {
                 page: PAGE,
                 previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
                 thumbs: test_thumbs(),
+                peers: Vec::new(),
             },
         )
         .expect("server starts on loopback")
@@ -793,6 +815,7 @@ mod tests {
                 page: PAGE,
                 previews,
                 thumbs: test_thumbs(),
+                peers: Vec::new(),
             },
         )
         .expect("server starts")

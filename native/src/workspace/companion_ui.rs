@@ -115,6 +115,15 @@ impl Workspace {
         // with the store, so spawning unconditionally is free when off.
         crate::companion::blender::spawn(Arc::downgrade(&previews), cache_dir.clone());
         let thumbs = crate::companion::thumbs::Thumbnailer::new(cache_dir);
+        // Resolved ONCE here and frozen for the server's lifetime. Nothing
+        // refreshes it, and no settings change restarts the companion, so a
+        // peer edited or deleted after this point keeps its old grants until
+        // the server is next toggled — which may be the whole app session.
+        // This is NOT parity with regenerate_companion_token, which forces a
+        // restart so a rotated token is live immediately.
+        // The task that ships peer deletion must apply that same forced
+        // restart; revocation that waits for a toggle is not revocation.
+        let (peers, _peer_problems) = self.settings.peers();
         let mut started = None;
         for port in 43110..43121u16 {
             match server::start(
@@ -126,6 +135,7 @@ impl Workspace {
                     page: include_str!("../companion/page.html"),
                     previews: Arc::clone(&previews),
                     thumbs: Arc::clone(&thumbs),
+                    peers: peers.clone(),
                 },
             ) {
                 Ok(handle) => {

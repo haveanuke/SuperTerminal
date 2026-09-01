@@ -53,6 +53,7 @@ fn phone_input_round_trips_to_sse_snapshot() {
             thumbs: crate::companion::thumbs::Thumbnailer::new(
                 std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
             ),
+            peers: Vec::new(),
         },
     )
     .expect("server starts");
@@ -168,6 +169,7 @@ fn phone_sessions_list_is_unaffected_by_peer_scoping() {
             thumbs: crate::companion::thumbs::Thumbnailer::new(
                 std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
             ),
+            peers: Vec::new(),
         },
     )
     .expect("server starts");
@@ -219,6 +221,7 @@ fn the_peer_byte_sink_rejects_the_phone_token() {
             thumbs: crate::companion::thumbs::Thumbnailer::new(
                 std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
             ),
+            peers: Vec::new(),
         },
     )
     .expect("server starts");
@@ -274,6 +277,7 @@ fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
             thumbs: crate::companion::thumbs::Thumbnailer::new(
                 std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
             ),
+            peers: Vec::new(),
         },
     )
     .expect("server starts");
@@ -327,6 +331,7 @@ fn version_advertises_a_protocol_and_capabilities() {
             thumbs: crate::companion::thumbs::Thumbnailer::new(
                 std::env::temp_dir().join(format!("st-thumbcache-e2e-{}", std::process::id())),
             ),
+            peers: Vec::new(),
         },
     )
     .expect("server starts");
