@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::themes::Theme;
 use superterminal_core::activity::Activity;
 
-use super::auth::token_matches;
+use super::auth::{admits, principal_for, Principal};
 use super::http::{parse_request, Method, ParseError, Request};
 use super::hub::CompanionHub;
 use super::input::{parse_body, parse_rename, symbolic_bytes, text_bytes, InputMsg};
@@ -339,16 +339,29 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
     // Token FIRST on protected routes (constant-time; a bad token learns
     // nothing, not even that the Host was wrong), then exact Host closes
     // DNS rebinding. The static page is the one tokenless route.
-    if !(request.method == Method::Get && path == "/")
-        && !token_matches(&shared.token, token_of(&request))
-    {
-        let _ = respond(&stream, "404 Not Found", &[], b"");
-        return;
-    }
+    let principal: Option<Principal> = if request.method == Method::Get && path == "/" {
+        None
+    } else {
+        match principal_for(&shared.token, token_of(&request)) {
+            Some(principal) => Some(principal),
+            None => {
+                let _ = respond(&stream, "404 Not Found", &[], b"");
+                return;
+            }
+        }
+    };
     if !host_ok {
         let _ = respond(&stream, "400 Bad Request", &[], b"");
         return;
     }
+    // Admission is checked per matched route below (see `route_admitted`): a
+    // principal that authenticates but is not permitted on this route gets
+    // the same 404 as a bad token, never a distinguishable 401/403.
+    let route_admitted = |prefix: &str| {
+        principal
+            .as_ref()
+            .is_some_and(|p| admits(prefix, request.method, p))
+    };
     match (request.method, path.as_str()) {
         (Method::Get, "/") => {
             let _ = respond(
@@ -361,7 +374,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 shared.page.as_bytes(),
             );
         }
-        (Method::Get, "/version") => {
+        (Method::Get, "/version") if route_admitted("/version") => {
             let json = serde_json::json!({
                 "version": crate::settings::APP_VERSION,
                 "build": shared.build,
@@ -377,7 +390,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 json.as_bytes(),
             );
         }
-        (Method::Get, "/sessions") => {
+        (Method::Get, "/sessions") if route_admitted("/sessions") => {
             let sessions = shared.hub.sessions();
             let json = serde_json::to_string(
                 &sessions
@@ -403,7 +416,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 json.as_bytes(),
             );
         }
-        (Method::Get, "/previews") => {
+        (Method::Get, "/previews") if route_admitted("/previews") => {
             let snap = shared.previews.snapshot();
             // The live viewport leads the list when a frame is fresh; it is
             // independent of the watched folder's availability.
@@ -435,7 +448,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 json.as_bytes(),
             );
         }
-        (Method::Get, _) if path.starts_with("/preview/") => {
+        (Method::Get, _) if path.starts_with("/preview/") && route_admitted("/preview") => {
             // CAS admission, same shape as the SSE cap.
             let admitted = shared
                 .img
@@ -450,7 +463,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             serve_preview(shared, &stream, &request, &path);
             shared.img.fetch_sub(1, Ordering::AcqRel);
         }
-        (Method::Get, _) if path.starts_with("/stream/") => {
+        (Method::Get, _) if path.starts_with("/stream/") && route_admitted("/stream") => {
             let id = path["/stream/".len()..].to_string();
             if shared.hub.revision(&id).is_none() {
                 let _ = respond(&stream, "404 Not Found", &[], b"");
@@ -470,7 +483,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             serve_stream(shared, &stream, &id);
             shared.sse.fetch_sub(1, Ordering::AcqRel);
         }
-        (Method::Post, "/spawn") => {
+        (Method::Post, "/spawn") if route_admitted("/spawn") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
                 if origin != our_origin {
@@ -488,7 +501,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 let _ = respond(&stream, "429 Too Many Requests", &[], b"");
             }
         }
-        (Method::Post, _) if path.starts_with("/rename/") => {
+        (Method::Post, _) if path.starts_with("/rename/") && route_admitted("/rename") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
                 if origin != our_origin {
@@ -523,7 +536,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 }
             }
         }
-        (Method::Post, _) if path.starts_with("/close/") => {
+        (Method::Post, _) if path.starts_with("/close/") && route_admitted("/close") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
                 if origin != our_origin {
@@ -556,7 +569,7 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
                 }
             }
         }
-        (Method::Post, _) if path.starts_with("/input/") => {
+        (Method::Post, _) if path.starts_with("/input/") && route_admitted("/input") => {
             let our_origin = format!("http://{}", shared.host);
             if let Some(origin) = request.header("origin") {
                 if origin != our_origin {

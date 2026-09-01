@@ -3,6 +3,57 @@
 //! (fragments never appear in HTTP requests or referrers). Comparison is
 //! constant-time so timing can't leak prefix matches.
 
+use crate::companion::http::Method;
+
+/// Identity of a paired peer instance. Phase A never constructs one; it
+/// exists so the admission table is written once rather than retrofitted
+/// when Phase B adds pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PeerId(pub String);
+
+/// Who is making a request. Every protected route states which principals
+/// it admits, because a single shared token would otherwise let the phone
+/// reach peer-only surfaces and let a peer reach phone-only management.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    Phone,
+    Peer(PeerId),
+}
+
+/// The admission table. Deny by default: an unknown path admits nobody, so
+/// a new route is unreachable until it is listed here deliberately.
+pub fn admits(path: &str, method: Method, principal: &Principal) -> bool {
+    let phone_only = matches!(
+        (path, method),
+        ("/close", Method::Post)
+            | ("/rename", Method::Post)
+            | ("/previews", Method::Get)
+            | ("/preview", Method::Get)
+    );
+    let shared = matches!(
+        (path, method),
+        ("/sessions", Method::Get)
+            | ("/stream", Method::Get)
+            | ("/input", Method::Post)
+            | ("/spawn", Method::Post)
+            | ("/version", Method::Get)
+    );
+    match principal {
+        Principal::Phone => phone_only || shared,
+        Principal::Peer(_) => shared,
+    }
+}
+
+/// Resolve a presented token to a principal. Constant-time against the
+/// phone token; Phase A has no peer secrets, so `Peer` is unreachable here.
+pub fn principal_for(phone_token: &str, presented: &str) -> Option<Principal> {
+    if token_matches(phone_token, presented) {
+        Some(Principal::Phone)
+    } else {
+        None
+    }
+}
+
 pub fn generate_token() -> String {
     use std::io::Read;
     let mut bytes = [0u8; 16];
@@ -54,5 +105,63 @@ mod tests {
         assert!(!token_matches("abcd1234", "abcd12345"));
         assert!(!token_matches("abcd1234", ""));
         assert!(!token_matches("", "abcd1234"));
+    }
+
+    use crate::companion::http::Method;
+
+    fn peer() -> Principal {
+        Principal::Peer(PeerId("p1".to_string()))
+    }
+
+    #[test]
+    fn the_phone_keeps_every_route_it_has_today() {
+        // Phase A must not remove a single phone capability.
+        for (path, method) in [
+            ("/sessions", Method::Get),
+            ("/stream", Method::Get),
+            ("/input", Method::Post),
+            ("/spawn", Method::Post),
+            ("/close", Method::Post),
+            ("/rename", Method::Post),
+            ("/previews", Method::Get),
+            ("/preview", Method::Get),
+            ("/version", Method::Get),
+        ] {
+            assert!(admits(path, method, &Principal::Phone), "phone lost {path}");
+        }
+    }
+
+    #[test]
+    fn a_peer_may_view_type_and_spawn_but_not_manage() {
+        assert!(admits("/sessions", Method::Get, &peer()));
+        assert!(admits("/stream", Method::Get, &peer()));
+        assert!(admits("/spawn", Method::Post, &peer()));
+        // Management and the preview gallery are phone-only for now.
+        assert!(!admits("/close", Method::Post, &peer()), "peer got /close");
+        assert!(
+            !admits("/rename", Method::Post, &peer()),
+            "peer got /rename"
+        );
+        assert!(
+            !admits("/previews", Method::Get, &peer()),
+            "peer got /previews"
+        );
+        assert!(
+            !admits("/preview", Method::Get, &peer()),
+            "peer got /preview"
+        );
+    }
+
+    #[test]
+    fn an_unknown_route_admits_nobody() {
+        assert!(!admits("/nonexistent", Method::Get, &Principal::Phone));
+        assert!(!admits("/nonexistent", Method::Get, &peer()));
+    }
+
+    #[test]
+    fn only_the_phone_token_resolves_to_a_principal_in_this_phase() {
+        assert_eq!(principal_for("abc123", "abc123"), Some(Principal::Phone));
+        assert_eq!(principal_for("abc123", "wrong"), None);
+        assert_eq!(principal_for("abc123", ""), None);
     }
 }
