@@ -36,6 +36,17 @@ use super::{find_header_end, is_timeout, Endpoint, PeerError, MAX_HEAD, READ_CHU
 #[cfg_attr(not(test), allow(dead_code))]
 pub const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The exact [`PeerError::BadResponse`] payload [`StreamConn::next_frame`]
+/// returns when the underlying reader hit a clean EOF -- the peer closed
+/// the connection rather than merely going quiet. Named and shared with
+/// `attach` rather than left as an inline literal in two places: it is the
+/// ONLY signal that distinguishes "the peer told us it is done" (terminal
+/// -- see `attach::Status::Gone`) from every other mid-stream failure
+/// (retryable), so `attach::classify` matches on this constant instead of
+/// a duplicated string.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STREAM_CLOSED_CLEANLY: &str = "stream closed before a frame arrived";
+
 /// ROLLING budget for the established stream: healthy as long as
 /// SOMETHING -- a frame or a heartbeat -- arrives within the gap. Six
 /// seconds is three `SSE_HEARTBEAT` (2s) intervals: tight enough to notice
@@ -78,9 +89,7 @@ impl StreamConn {
         match self.frames.next_frame() {
             Ok(Some(payload)) => serde_json::from_slice(&payload)
                 .map_err(|_| PeerError::BadResponse("frame was not a valid snapshot")),
-            Ok(None) => Err(PeerError::BadResponse(
-                "stream closed before a frame arrived",
-            )),
+            Ok(None) => Err(PeerError::BadResponse(STREAM_CLOSED_CLEANLY)),
             Err(FrameError::TooLarge) => Err(PeerError::TooLarge),
             Err(FrameError::Io(e)) if is_timeout(&e) => Err(PeerError::Timeout),
             Err(FrameError::Io(e)) => Err(PeerError::Io(e)),

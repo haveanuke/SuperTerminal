@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::companion::server::INPUT_CONTENT_TYPE;
 
+pub mod attach;
 mod sse;
 mod stream;
 
@@ -33,6 +34,11 @@ const READ_CHUNK: usize = 4096;
 /// a pane is a later phase (this one only builds the client). The
 /// `cfg_attr(not(test), ...)` markers below follow the same convention as
 /// `companion::hub::Origin::Attached`.
+///
+/// `Clone` so `attach`'s background thread can hold its own copy across a
+/// blocking connect/read without keeping the owning `Arc<Attachment>` (and
+/// therefore the endpoint borrowed from it) alive for that long.
+#[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct Endpoint {
     pub addr: SocketAddr,
