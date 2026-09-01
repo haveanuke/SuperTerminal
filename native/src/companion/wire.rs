@@ -8,12 +8,17 @@
 //! phone's font metrics from drifting the grid — the page positions runs, it
 //! never flows text.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::term_session::{CellColor, CellStyle, CursorStyle, RenderableSnapshot};
 use crate::themes::{ansi_256, Theme};
 
-#[derive(Debug, Serialize, PartialEq)]
+/// `Deserialize` is derived alongside `Serialize` on all three types here so
+/// the peer client can parse exactly what this server emits, from a single
+/// definition: a field added for the server is automatically understood by
+/// the client, and a rename breaks compilation instead of silently
+/// producing empty frames on the peer side.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WireSnapshot {
     pub cols: u16,
@@ -23,20 +28,26 @@ pub struct WireSnapshot {
     pub rows: Vec<Vec<WireRun>>,
     /// Scrollback tail rendered above the live rows, oldest first. Empty
     /// (and omitted from the JSON) when there is no history yet.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// `#[serde(default)]` so a client parsing an emission that omitted it
+    /// (because it was empty) sees an empty Vec rather than a parse error.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub history: Vec<Vec<WireRun>>,
+    // The two mode booleans stay required (no `#[serde(default)]`): they
+    // are always serialized, so a missing field means the peer is running a
+    // build that predates it — defaulting to `false` would silently
+    // mis-handle paste/mouse mode rather than failing loudly.
     pub bracketed_paste: bool,
     pub mouse_tracking: bool,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WireCursor {
     pub col: u16,
     pub row: u16,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WireRun {
     pub col: u16,
@@ -412,6 +423,31 @@ mod tests {
         let json = serde_json::to_string(&wire).unwrap();
         assert!(json.contains("\"bracketedPaste\":false"), "{json}");
         assert!(json.contains("\"mouseTracking\":false"), "{json}");
+    }
+
+    #[test]
+    fn a_snapshot_survives_a_round_trip() {
+        // The client parses exactly what the server emits. Deriving both
+        // directions on one struct is what stops them drifting.
+        let mut snapshot = snap(vec![vec![cell('x', style())]]);
+        snapshot.bracketed_paste = true;
+        let wire = serialize_snapshot(&snapshot, theme());
+        let json = serde_json::to_string(&wire).unwrap();
+        let parsed: WireSnapshot =
+            serde_json::from_str(&json).expect("server output must parse as WireSnapshot");
+        assert_eq!(parsed.cols, 1);
+        assert_eq!(parsed.lines, 1);
+        assert!(parsed.bracketed_paste);
+        assert_eq!(parsed.rows.len(), 1);
+    }
+
+    #[test]
+    fn an_absent_history_field_parses_as_empty() {
+        // `history` is skipped when empty, so the client must tolerate it
+        // being absent rather than treating that as malformed.
+        let json = r#"{"cols":1,"lines":1,"cursor":null,"appCursor":false,"rows":[[]],"bracketedPaste":false,"mouseTracking":false}"#;
+        let parsed: WireSnapshot = serde_json::from_str(json).expect("must parse");
+        assert!(parsed.history.is_empty());
     }
 
     #[test]
