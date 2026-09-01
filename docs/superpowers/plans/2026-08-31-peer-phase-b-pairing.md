@@ -732,22 +732,46 @@ Parse with the serde_json already in the tree. Never panic on malformed input �
 
 Shelling `tailscale status --json` gets a total deadline and an output cap, exactly as `blender.rs` bounds its probe. `tailscale` missing from PATH means no candidates and the feature is simply absent, not an error dialog.
 
-- [ ] **Step 5: The pairing surface**
+- [ ] **Step 5: Revocation must take effect immediately (BLOCKING acceptance criterion)**
+
+`ServerConfig.peers` is a snapshot resolved once at server start (`server.rs:62`)
+and never refreshed. Nothing restarts the companion when settings change. So a
+peer deleted from the list would KEEP WORKING until the server is next toggled —
+potentially the whole app session.
+
+That is not acceptable in the task that ships "delete = revocation". The entire
+argument for per-peer pairing over one shared token was that the work Mac can be
+cut off without rotating the token the phone uses; revocation that silently waits
+for a restart is not revocation.
+
+`regenerate_companion_token` (`companion_ui.rs:220-231`) already has the pattern:
+it calls `stop_companion()` then `toggle_companion()` around the settings write,
+so the change is live immediately. Apply the same treatment to every peer
+mutation — delete, and any grant toggle, since narrowing a grant is also a
+revocation of part of that peer's authority.
+
+Add a test asserting that whatever function applies a peer change routes through
+that restart path. If a pure test is not possible because it is UI-bound, extract
+the decision ("does this settings change require a companion restart?") into a
+pure predicate in `peers.rs` and test THAT — do not ship it untested and do not
+introduce a gpui harness.
+
+- [ ] **Step 6: The pairing surface**
 
 In the settings UI: list candidates; pairing one generates a `PeerRecord` with a fresh id and secret and ALL GRANTS OFF, then shows the secret for transfer (reuse `companion/qr::matrix`, as the phone link already does). Paired peers list with their three grants as individual toggles and a delete action that is the revocation.
 
 No emoji — use `icons.rs`. Any decision logic here (which candidates are offerable, what a toggle means) goes in `peers.rs` as a pure function and is tested there; the UI only renders it.
 
-- [ ] **Step 6: Run the full suite**
+- [ ] **Step 7: Run the full suite**
 
 Run: `cargo test`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 cargo fmt
-git add native/src/peers.rs native/src/workspace/settings_ui.rs
+git add native/src/peers.rs native/src/workspace/settings_ui.rs native/src/workspace/companion_ui.rs
 git commit -m "feat(native): discover tailnet candidates and pair peers with explicit grants"
 ```
 
