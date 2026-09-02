@@ -234,9 +234,44 @@ const SCAN_MAX_BYTES: usize = 1024 * 1024;
 /// the cap all yield an empty list — the feature is simply absent, never
 /// an error dialog. Same bounded-probe discipline as
 /// `companion::blender::capture_once`.
+/// Absolute locations the Tailscale CLI is actually installed to, tried in
+/// order. A GUI-launched macOS app inherits a minimal
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` from launchd, which contains NONE
+/// of these — so resolving the bare name `tailscale` through `PATH` finds
+/// the CLI only when the app happened to be started from a shell.
+///
+/// That is what made peer discovery asymmetric in practice: two machines on
+/// the same tailnet, the same build, and one could see the other while the
+/// reverse found nothing at all, purely because of where Tailscale was
+/// installed and how the app was launched.
+///
+/// `/usr/local/bin/tailscale` is the shim the standalone app installs (it
+/// execs the path below it); Homebrew on Apple Silicon uses
+/// `/opt/homebrew/bin`; the last entry is the binary inside the app bundle
+/// itself, which exists even when no shim was ever installed.
+const TAILSCALE_BINARIES: &[&str] = &[
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+];
+
+/// First candidate that exists, else the bare name so a `PATH` that DOES
+/// carry it (a shell-launched app, or Linux) still works.
+fn resolve_binary(candidates: &[&str], exists: impl Fn(&str) -> bool) -> String {
+    candidates
+        .iter()
+        .find(|c| exists(c))
+        .map(|c| (*c).to_string())
+        .unwrap_or_else(|| "tailscale".to_string())
+}
+
+fn tailscale_binary() -> String {
+    resolve_binary(TAILSCALE_BINARIES, |p| std::path::Path::new(p).exists())
+}
+
 pub fn scan_candidates() -> Vec<Candidate> {
     match shell_bounded(
-        "tailscale",
+        &tailscale_binary(),
         &["status", "--json"],
         SCAN_TIMEOUT,
         SCAN_MAX_BYTES,
@@ -995,5 +1030,58 @@ mod tests {
     fn an_unchanged_snapshot_needs_no_restart() {
         let peers = vec![pair("work-mbp")];
         assert!(!peer_mutation_requires_restart(&peers, &peers));
+    }
+
+    #[test]
+    fn the_binary_resolver_prefers_an_absolute_path_over_the_bare_name() {
+        // The bug this fixes: a GUI-launched app gets
+        // PATH=/usr/bin:/bin:/usr/sbin:/sbin, which contains none of the
+        // places Tailscale installs to, so the bare name resolved to
+        // nothing and discovery silently returned an empty list.
+        let found = resolve_binary(TAILSCALE_BINARIES, |p| {
+            p == "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        });
+        assert_eq!(
+            found,
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        );
+    }
+
+    #[test]
+    fn the_binary_resolver_takes_the_first_candidate_that_exists() {
+        // Order is the contract, not an accident: the shim at
+        // /usr/local/bin execs the bundle binary, so preferring it keeps
+        // whatever indirection the user's install chose.
+        let all = |_: &str| true;
+        assert_eq!(
+            resolve_binary(TAILSCALE_BINARIES, all),
+            TAILSCALE_BINARIES[0]
+        );
+        let not_first = |p: &str| p != TAILSCALE_BINARIES[0];
+        assert_eq!(
+            resolve_binary(TAILSCALE_BINARIES, not_first),
+            TAILSCALE_BINARIES[1]
+        );
+    }
+
+    #[test]
+    fn the_binary_resolver_falls_back_to_the_bare_name_when_nothing_exists() {
+        // Not a failure case: a shell-launched app, or Linux, has a PATH
+        // that carries `tailscale` even though none of the macOS absolute
+        // paths exist. Returning the bare name keeps those working.
+        assert_eq!(resolve_binary(TAILSCALE_BINARIES, |_| false), "tailscale");
+    }
+
+    #[test]
+    fn every_candidate_path_is_absolute() {
+        // A relative entry would silently reintroduce the PATH dependence
+        // this list exists to remove, and would resolve differently
+        // depending on the app's working directory.
+        for c in TAILSCALE_BINARIES {
+            assert!(
+                std::path::Path::new(c).is_absolute(),
+                "{c} must be absolute"
+            );
+        }
     }
 }
