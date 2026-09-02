@@ -88,7 +88,20 @@ attaching, the client checks the peer's `/version` (which already advertises
 `protocol` and `capabilities`) and REFUSES an incompatible peer up front with a
 reason the UI can show, rather than connecting and failing per frame.
 
-Bump `protocol` and add a capability naming this field. Tests: a peer whose
+The exact values, so this is auditable rather than interpreted: `/version`
+(`server.rs:515`) currently advertises `"protocol": 1` and
+`"capabilities": ["principals", "origin", "peer-input"]`. This is a breaking
+change for native peers, so **`protocol` becomes `2`** and
+**`"snapshot-background"` joins the capability list**. Introduce both as named
+constants rather than repeating literals at the check site and the serve site —
+a hardcoded `2` in two files is how the next bump goes wrong.
+
+Note the failure this prevents is specifically NOT the generic parse error:
+without the gate, a wire-shape mismatch collapses into
+`BadResponse("frame was not a valid snapshot")` (`stream.rs:120`), repeated per
+frame, which tells the user nothing they can act on.
+
+Tests: a peer whose
 protocol matches is accepted; one that predates the field is refused BEFORE any
 stream is opened, with a distinguishable reason; the refusal is surfaced as a
 status, not a parse error.
