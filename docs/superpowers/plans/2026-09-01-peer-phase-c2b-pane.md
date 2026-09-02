@@ -70,10 +70,28 @@ Add the resolved background to `WireSnapshot` — the same `"#rrggbb"` treatment
 its foregrounds already get. It is ALWAYS serialized: an absent background and a
 default one must not be ambiguous, exactly as `bracketedPaste` is always sent.
 
-**This touches the wire the phone reads, so it is additive only.** The phone
-ignores unknown fields, so `page.html` needs no change and must not get one —
-verify no existing wire assertion moves. If a pre-existing test would have to
-change, STOP and report.
+**This touches the wire the phone reads, so it is additive only.** The phone is
+safe by inspection: `page.html` does `JSON.parse` and reads only known keys
+(`snap.cols`, `snap.rows`, `snap.history`, `snap.cursor`), so an unknown
+top-level field cannot break it. `page.html` needs no change and must not get
+one — verify no existing wire assertion moves. If a pre-existing test would have
+to change, STOP and report.
+
+**But a required field breaks NATIVE peers across versions, and that must be
+gated.** `WireSnapshot` derives `Deserialize` for the peer client. If
+`background` is required and always serialized, a NEW client attached to an
+OLDER broadcaster fails to parse EVERY frame — failing loudly, but in the worst
+possible place: mid-stream, repeatedly, with no explanation the user can act on.
+
+So this task also adds the protocol gate the design already calls for. Before
+attaching, the client checks the peer's `/version` (which already advertises
+`protocol` and `capabilities`) and REFUSES an incompatible peer up front with a
+reason the UI can show, rather than connecting and failing per frame.
+
+Bump `protocol` and add a capability naming this field. Tests: a peer whose
+protocol matches is accepted; one that predates the field is refused BEFORE any
+stream is opened, with a distinguishable reason; the refusal is surfaced as a
+status, not a parse error.
 
 Tests: the field is present and always serialized; it round-trips; it carries the
 theme's actual background rather than a hardcoded value.
@@ -89,14 +107,27 @@ theme's actual background rather than a hardcoded value.
 - Test: pure, inline
 
 Extract the point where the renderer stops needing semantics: a pure adapter
-producing RESOLVED paint rows — colours already `#rrggbb`, runs already merged,
-wide spacers already computed. A LOCAL snapshot resolves through the viewer's
-theme into those rows, exactly as today. A WIRE snapshot is already resolved and
-becomes the same rows directly, using the background from Task 1 where
-`bg: None`.
+producing RESOLVED paint runs — colours already `#rrggbb`, runs already merged.
+A LOCAL snapshot resolves through the viewer's theme and runs the existing
+coalescer to get there. A WIRE snapshot is ALREADY in that shape and becomes
+paint runs directly, using the background from Task 1 wherever `bg: None`.
 
-The existing row and cursor drawing logic is then reused unchanged for both, and
-glyph measurement and pinned-run behaviour are not duplicated.
+**One thing cannot be shared, and the plan previously claimed it could.** The
+local renderer's PINNED-RUN behaviour does per-glyph advance checks against the
+viewer's font (`pane.rs:982`). The wire has already coalesced cells into
+`WireRun { col, width, text }` (`wire.rs:116`), so once `a世b` is one string plus
+a total width, the receiver cannot tell which glyph consumed the extra cell.
+That information is gone and no adapter can recover it.
+
+Therefore: attached panes draw wire runs AS GIVEN, and per-glyph pinning is a
+LOCAL-ONLY refinement. Do not attempt to reconstruct it by guessing glyph
+widths — a wrong guess misplaces every character after it on the row.
+
+**This is a new entry in D5's degraded contract and must be recorded there:**
+wide-character alignment on an attached pane may differ subtly from the same
+terminal viewed locally. Add it to the spec's degraded list alongside the
+150-row scrollback and the absence of selection and search, so it is a stated
+limit rather than a rendering bug someone chases later.
 
 **The local path must be byte-identical.** Prove it: every pre-existing pane test
 passes untouched, and the adapter for a local snapshot produces what the renderer
@@ -125,10 +156,19 @@ a scroll offset, produce the visible rows to paint. Scrolling is LOCAL to the
 viewer — it must not resize or scroll the remote PTY, per D2's broadcaster-owned
 geometry.
 
+**The window MOVES, and the contract must say so.** The broadcaster builds its
+history tail relative to its live screen, capped at `HISTORY_TAIL = 150`
+(`term_session.rs:938`). The wire carries no row identity, so a viewer CANNOT
+hold a stable anchor on a specific historical row once it ages out of that tail.
+The honest contract is "stays scrolled back BY OFFSET", not "keeps showing the
+same row forever" — test the former and do not write a test asserting the latter.
+
 Test: offset zero shows the live rows; scrolling back reaches into history;
 scrolling past the oldest row clamps rather than panicking; a snapshot with no
 history behaves like a plain grid; a new frame arriving while scrolled back does
-not silently yank the view to the bottom (decide the behaviour, state it, test it).
+not silently yank the view to the bottom (decide the behaviour, state it, test
+it); and rows ageing out from under a scrolled-back viewer shifts what is shown
+without panicking or clamping to the wrong end.
 
 - [ ] **Step 1: failing tests** — [ ] **2: observe failure** — [ ] **3: implement** — [ ] **4: `cargo test`** — [ ] **5: commit** `feat(native): scrollback for an attached pane`
 
@@ -271,6 +311,29 @@ The degraded contract (D5) must be visible, not discovered: 150 rows of scrollba
 - [ ] **Step 5: Commit** — `feat(native): open a shared peer terminal as a pane`
 
 ---
+
+## The seams this seven-task split creates
+
+Every serious defect in this project's recent phases lived in the seam BETWEEN
+two individually-correct tasks. A review named these; each one gets checked
+deliberately at the whole-branch stage rather than assumed away:
+
+- **1 to 2** — the background field exists but the adapter mishandles a missing
+  or old-version frame.
+- **2 to 3** — paint runs are right but scrollback composition shifts the cursor
+  row or the live/history boundary.
+- **3 to 5** — local scroll offset and "scroll to bottom on input" fight.
+- **4 to 6** — accessor truthfulness needs freshness AND polled activity landing
+  in the same pane state.
+- **5 to 6** — input-queue health and stream freshness disagree; stale must
+  still win.
+- **4 to 7** — sessionless no-ops become visible UI bugs unless the workspace
+  gates them everywhere, not just where Task 7 looked.
+- **7 to D3e** — opening attached panes near `spawn_pane` can share a non-local
+  pane if the invariant is not encoded at the writer.
+- **Cross-cutting** — local rendering, remote rendering, input, selection,
+  resize and activity all mutate the same entity, so "local panes byte-identical"
+  is an integration risk, not a slogan.
 
 ## Done criteria
 
