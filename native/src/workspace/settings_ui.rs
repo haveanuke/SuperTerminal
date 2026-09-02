@@ -88,6 +88,14 @@ impl Workspace {
         for field in fields.into_iter().flatten() {
             field.update(cx, |field, field_cx| field.set_theme(theme, field_cx));
         }
+        // The companion server resolves colours server-side and captured
+        // the theme once at start; without this, the phone renders
+        // whatever theme was active when the server was last started,
+        // forever, until the app restarts. Updated in place — never a
+        // restart, which would drop every connected client.
+        if let Some(handle) = &self.companion_server {
+            handle.set_theme(theme);
+        }
         cx.notify();
     }
 

@@ -90,6 +90,10 @@ struct Published<S> {
     visible_to: HashSet<PeerId>,
 }
 
+/// One cached serialization: the revision and theme identity it was
+/// resolved against, and the JSON itself. See [`CompanionHub::cache`].
+type CachedSnapshot = (u64, usize, Arc<String>);
+
 pub struct CompanionHub<S: Clone> {
     inner: Mutex<HashMap<String, Published<S>>>,
     /// Bumped when the server (re)starts: panes compare against their own
@@ -104,7 +108,14 @@ pub struct CompanionHub<S: Clone> {
     /// workspace tick (tab state is main-thread-only).
     pending_renames: Mutex<Vec<(String, String)>>,
     pending_closes: Mutex<Vec<String>>,
-    cache: Mutex<HashMap<String, (u64, Arc<String>)>>,
+    /// Keyed on (revision, theme identity): a theme switch never bumps the
+    /// snapshot's revision, so keying on revision alone would keep serving
+    /// JSON resolved with the OLD theme forever on a quiet (never
+    /// republished) session — the theme-goes-stale bug, one layer down.
+    /// `Theme` is always `&'static` (a preset or a leaked custom import —
+    /// see `themes::customs`), so its address is a stable, cheap identity;
+    /// nothing here ever dereferences it as one.
+    cache: Mutex<HashMap<String, CachedSnapshot>>,
 }
 
 impl<S: Clone> Default for CompanionHub<S> {
@@ -327,14 +338,17 @@ impl<S: Clone> CompanionHub<S> {
 
     /// Latest serialized snapshot with its revision; memoized so N phones
     /// never re-serialize the same grid. None until first publish.
-    pub fn snapshot_json(&self, id: &str, theme: &Theme) -> Option<(u64, Arc<String>)> {
+    pub fn snapshot_json(&self, id: &str, theme: &'static Theme) -> Option<(u64, Arc<String>)> {
         let (snapshot, revision) = {
             let inner = self.inner.lock().unwrap();
             let entry = inner.get(id)?;
             (entry.snapshot.clone()?, entry.revision)
         };
-        if let Some((cached_rev, json)) = self.cache.lock().unwrap().get(id) {
-            if *cached_rev == revision {
+        // Identity, never dereferenced: two different `Theme`s are always
+        // two different `&'static` addresses (see the `cache` field doc).
+        let theme_id = theme as *const Theme as usize;
+        if let Some((cached_rev, cached_theme, json)) = self.cache.lock().unwrap().get(id) {
+            if *cached_rev == revision && *cached_theme == theme_id {
                 return Some((revision, Arc::clone(json)));
             }
         }
@@ -348,7 +362,7 @@ impl<S: Clone> CompanionHub<S> {
         self.cache
             .lock()
             .unwrap()
-            .insert(id.to_string(), (revision, Arc::clone(&json)));
+            .insert(id.to_string(), (revision, theme_id, Arc::clone(&json)));
         Some((revision, json))
     }
 
@@ -554,6 +568,45 @@ pub(crate) mod tests {
         let (rev_c, json_c) = hub.snapshot_json("t1", theme()).unwrap();
         assert_ne!(rev_a, rev_c);
         assert!(json_c.contains("world"));
+    }
+
+    #[test]
+    fn snapshot_json_cache_keys_on_theme_not_only_revision() {
+        // The bug this exists to fix, one layer down from the server: a
+        // theme switch does not bump the snapshot's revision, so a cache
+        // keyed on revision alone would keep answering with JSON resolved
+        // against the OLD theme forever on a quiet (never-republished)
+        // session. Reproduced here directly against `snapshot_json`,
+        // without needing a live server or SSE stream.
+        let (hub, _rx) = hub_with("t1", "work");
+        hub.publish_snapshot("t1", snapshot("hello"));
+        let (rev_a, json_a) = hub.snapshot_json("t1", theme()).unwrap();
+        assert!(json_a.contains(&format!("\"background\":\"#{:06x}\"", theme().background)));
+        let dracula = crate::themes::by_name("Dracula").expect("Dracula is a built-in preset");
+        assert_ne!(
+            theme().background,
+            dracula.background,
+            "the two themes must actually differ for this test to prove anything"
+        );
+        // No republish in between: the revision is exactly what it was.
+        let (rev_b, json_b) = hub.snapshot_json("t1", dracula).unwrap();
+        assert_eq!(rev_a, rev_b, "revision truly did not change");
+        assert!(
+            json_b.contains(&format!("\"background\":\"#{:06x}\"", dracula.background)),
+            "must resolve the NEW theme even though the revision was already cached: {json_b}"
+        );
+        assert!(
+            !json_b.contains(&format!("\"background\":\"#{:06x}\"", theme().background)),
+            "must not still carry the old theme's background: {json_b}"
+        );
+        // Re-request with the SAME new theme and the SAME revision: this
+        // must still hit the cache rather than re-serializing every call —
+        // staleness is not fixed by deleting the cache.
+        let (_rev_c, json_c) = hub.snapshot_json("t1", dracula).unwrap();
+        assert!(
+            Arc::ptr_eq(&json_b, &json_c),
+            "same revision AND same theme should still reuse the cached Arc"
+        );
     }
 
     #[test]
