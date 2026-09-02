@@ -14,7 +14,7 @@ use gpui::{
     SharedString, Window,
 };
 
-use crate::companion::wire::WireSnapshot;
+use crate::companion::wire::{WireRun, WireSnapshot};
 use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
@@ -71,6 +71,19 @@ pub struct TerminalPane {
     target: Target,
     session: Option<TermSession>,
     snapshot: RenderableSnapshot,
+    /// Latest frame received from an attached peer. `None` for every local
+    /// pane, always — `render()` takes the exact pre-Task-3
+    /// `local_paint_frame` path whenever this is `None`, so a local pane's
+    /// output is untouched. Nothing sets this to `Some` yet: a later task
+    /// populates it from the attachment's own `.latest()` snapshot.
+    attached_frame: Option<std::sync::Arc<WireSnapshot>>,
+    /// Rows scrolled back from an attached peer's live bottom, LOCAL to
+    /// this viewer only. Never sent to the broadcaster: D2 makes geometry
+    /// broadcaster-owned, so scrolling an attached pane can only change
+    /// which slice of the RECEIVED scrollback this viewer currently shows,
+    /// never the remote PTY. Meaningless (and unread) while `attached_frame`
+    /// is `None`.
+    attached_scroll_offset: usize,
     focus_handle: FocusHandle,
     theme: &'static Theme,
     font_family: SharedString,
@@ -415,6 +428,8 @@ impl TerminalPane {
             target,
             session,
             snapshot,
+            attached_frame: None,
+            attached_scroll_offset: 0,
             focus_handle: cx.focus_handle(),
             theme,
             font_family: font_family.into(),
@@ -1199,27 +1214,12 @@ fn local_paint_frame(
 /// LOCAL-ONLY refinement (see D5 in the peer-instances design doc) —
 /// reconstructing it here by guessing glyph widths would misplace every
 /// character after a wrong guess.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 3's attached view
 fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
     let background = parse_wire_hex(&wire.background);
     let rows = wire
         .rows
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|run| Run {
-                    col: run.col as usize,
-                    cells: run.width as usize,
-                    safe: true, // no per-glyph pinning check applies to wire runs
-                    text: run.text.clone(),
-                    fg: parse_wire_hex(&run.fg),
-                    bg: Some(run.bg.as_deref().map(parse_wire_hex).unwrap_or(background)),
-                    bold: run.b,
-                    italic: run.i,
-                    underline: run.u,
-                })
-                .collect()
-        })
+        .map(|row| decode_wire_row(row, background))
         .collect();
     let cursor = wire
         .cursor
@@ -1241,12 +1241,32 @@ fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
     }
 }
 
+/// Decode one already-coalesced wire row into paint runs, substituting
+/// `background` for any run that left its `bg` unset. Shared by
+/// [`wire_paint_frame`] (the live rows) and [`attached_paint_frame`] (a
+/// scrolled-back window over `history` + `rows`) so there is exactly one
+/// place that turns a `WireRun` into a `Run`.
+fn decode_wire_row(row: &[WireRun], background: u32) -> Vec<Run> {
+    row.iter()
+        .map(|run| Run {
+            col: run.col as usize,
+            cells: run.width as usize,
+            safe: true, // no per-glyph pinning check applies to wire runs
+            text: run.text.clone(),
+            fg: parse_wire_hex(&run.fg),
+            bg: Some(run.bg.as_deref().map(parse_wire_hex).unwrap_or(background)),
+            bold: run.b,
+            italic: run.i,
+            underline: run.u,
+        })
+        .collect()
+}
+
 /// Decode a wire "#rrggbb" string into `0xRRGGBB` — the inverse of
 /// `wire::hex`. The wire always emits this exact shape (enforced by the
 /// `/version` capability check before a peer ever attaches), so a malformed
 /// string here means a build mismatch slipped past that gate; fall back to
 /// black rather than let a bad color panic the render loop.
-#[cfg_attr(not(test), allow(dead_code))] // wired by Task 3's attached view
 fn parse_wire_hex(s: &str) -> u32 {
     let s = s.trim_start_matches('#');
     // `is_ascii_hexdigit` first because `from_str_radix` also accepts a
@@ -1256,6 +1276,99 @@ fn parse_wire_hex(s: &str) -> u32 {
         u32::from_str_radix(s, 16).unwrap_or(0)
     } else {
         0
+    }
+}
+
+/// The largest offset an attached pane can actually scroll to: every row
+/// available above the live window, i.e. exactly `history_len` — beyond
+/// that there is nothing more to show. The live window ([`wire_paint_frame`]
+/// / offset 0) is always exactly `wire.rows`, so scrolling back can only
+/// ever reach as far as the history behind it, never resize that window.
+fn clamp_attached_offset(history_len: usize, offset: usize) -> usize {
+    offset.min(history_len)
+}
+
+/// The window of rows an attached pane shows: `offset` (clamped) rows of
+/// `history` immediately above the live bottom, followed by however many of
+/// the newest `rows` are needed to keep the window exactly `rows.len()`
+/// tall — the same height either way, just anchored further back.
+///
+/// **The window MOVES.** The broadcaster's `history` is a tail relative to
+/// ITS live screen, capped at `HISTORY_TAIL` (`term_session.rs`), and the
+/// wire carries no row identity — so calling this again with the SAME
+/// `offset` against a LATER snapshot does not reveal the same historical
+/// row; it reveals whatever is now `offset` rows back from the new bottom.
+/// The contract is "stays scrolled back by `offset` rows", never "keeps
+/// showing the same row forever".
+fn windowed_wire_rows<'a>(
+    history: &'a [Vec<WireRun>],
+    rows: &'a [Vec<WireRun>],
+    offset: usize,
+) -> Vec<&'a Vec<WireRun>> {
+    let clamped = clamp_attached_offset(history.len(), offset);
+    // Index into the conceptual `history ++ rows` sequence where the
+    // window starts; always in `0..=history.len()` since `clamped <=
+    // history.len()`, so this never underflows.
+    let start = history.len() - clamped;
+    (0..rows.len())
+        .map(|i| {
+            let idx = start + i;
+            if idx < history.len() {
+                &history[idx]
+            } else {
+                &rows[idx - history.len()]
+            }
+        })
+        .collect()
+}
+
+/// Resolve an attached pane's [`PaintFrame`] at a LOCAL scroll `offset`.
+/// Scrolling is local to the viewer only (D2: geometry is
+/// broadcaster-owned) — this never resizes or scrolls the remote PTY, it
+/// only picks which slice of the already-received `history` + `rows` to
+/// paint.
+///
+/// At offset 0 (after clamping — e.g. a snapshot with no history ignores
+/// any requested offset) this is exactly [`wire_paint_frame`], cursor
+/// included. Scrolled back, the cursor is hidden: its row/col describe the
+/// LIVE screen, which is not what a historical window shows, so there is
+/// nothing correct to draw it at.
+fn attached_paint_frame(wire: &WireSnapshot, offset: usize) -> PaintFrame {
+    let clamped = clamp_attached_offset(wire.history.len(), offset);
+    if clamped == 0 {
+        return wire_paint_frame(wire);
+    }
+    let background = parse_wire_hex(&wire.background);
+    let rows = windowed_wire_rows(&wire.history, &wire.rows, clamped)
+        .into_iter()
+        .map(|row| decode_wire_row(row, background))
+        .collect();
+    PaintFrame {
+        background,
+        rows,
+        cursor: None,
+        cursor_style: CursorStyle::Hidden,
+    }
+}
+
+/// The pane container's background for one frame — D5's ruling: an attached
+/// pane is NEVER translucent, however the workspace has `translucent` set.
+/// Its foregrounds were chosen against the BROADCASTER's background, so
+/// letting a local background image show through would restore exactly the
+/// unreadability Task 1 removed. A local pane keeps the prior behaviour:
+/// fully transparent when translucent (the image layer already applies the
+/// user's chosen opacity), else the resolved theme background.
+#[derive(Debug, PartialEq)]
+enum ContainerBg {
+    Transparent,
+    Opaque(u32),
+}
+
+fn container_background(background: u32, translucent: bool, attached: bool) -> ContainerBg {
+    if translucent && !attached {
+        ContainerBg::Transparent
+    } else {
+        ContainerBg::Opaque(background)
     }
 }
 
@@ -1461,11 +1574,17 @@ impl Render for TerminalPane {
                 .is_some_and(|adv| (adv - expected).abs() <= expected * 0.02)
         };
 
-        // One resolved paint frame, fed by the local snapshot: theme
-        // resolution, selection/search/inverse/dim/hidden, and coalescing
-        // all happen inside `local_paint_frame` now (`PaintFrame` doc). A
-        // wire-fed pane reaches the same shape through `wire_paint_frame`.
-        let frame = local_paint_frame(snapshot, theme, &advance_safe);
+        // One resolved paint frame. A local pane's theme resolution,
+        // selection/search/inverse/dim/hidden, and coalescing all happen
+        // inside `local_paint_frame` (`PaintFrame` doc). An attached pane
+        // (`attached_frame` populated) reaches the same shape through
+        // `attached_paint_frame`, which windows `history` + `rows` by the
+        // viewer's own local scroll offset (D2: never scrolls the remote
+        // PTY) and falls back to `wire_paint_frame` at offset 0.
+        let frame = match &self.attached_frame {
+            Some(wire) => attached_paint_frame(wire, self.attached_scroll_offset),
+            None => local_paint_frame(snapshot, theme, &advance_safe),
+        };
         let mut row_divs = Vec::with_capacity(frame.rows.len());
         for runs in frame.rows {
             // Runs are pinned at col * cell_width instead of flowed: flowed
@@ -1541,14 +1660,19 @@ impl Render for TerminalPane {
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .relative()
-            .bg(if self.translucent {
-                // Fully transparent over a background image: the image layer
-                // already applies the user's chosen opacity, so any alpha here
-                // would dim it a second time.
-                gpui::rgba(0x0000_0000)
-            } else {
-                gpui::rgba((frame.background << 8) | 0xFF)
-            })
+            .bg(
+                match container_background(
+                    frame.background,
+                    self.translucent,
+                    self.attached_frame.is_some(),
+                ) {
+                    // Fully transparent over a background image: the image
+                    // layer already applies the user's chosen opacity, so
+                    // any alpha here would dim it a second time.
+                    ContainerBg::Transparent => gpui::rgba(0x0000_0000),
+                    ContainerBg::Opaque(bg) => gpui::rgba((bg << 8) | 0xFF),
+                },
+            )
             .p(px(PADDING))
             .overflow_hidden()
             .font_family(
@@ -1794,8 +1918,9 @@ impl TerminalPane {
 #[cfg(test)]
 mod tests {
     use super::{
-        busy_dot, coalesce_runs, drag_scroll_lines, local_paint_frame, may_broadcast_locally,
-        parse_wire_hex, wire_paint_frame, CellLook, Run, COMPANION_BUSY_WINDOW,
+        attached_paint_frame, busy_dot, clamp_attached_offset, coalesce_runs, container_background,
+        drag_scroll_lines, local_paint_frame, may_broadcast_locally, parse_wire_hex,
+        windowed_wire_rows, wire_paint_frame, CellLook, ContainerBg, Run, COMPANION_BUSY_WINDOW,
     };
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
@@ -2402,5 +2527,234 @@ mod tests {
         );
         let frame = wire_paint_frame(&wire);
         assert_eq!(frame.rows[0].len(), 2);
+    }
+
+    // -- attached-pane scrollback view model --------------------------------
+    //
+    // The broadcaster's history tail (`term_session::HISTORY_TAIL`) is
+    // relative to ITS live screen and carries no row identity, so a viewer
+    // cannot hold a stable anchor on one historical row once it ages out.
+    // The contract these tests pin is "stays scrolled back BY OFFSET", never
+    // "keeps showing the same row forever" — see `windowed_wire_rows`'s doc.
+
+    /// A one-run row whose text is `label`, so a test can identify exactly
+    /// which source row survived into a window by reading `.text` — no
+    /// numeric index bookkeeping to get wrong.
+    fn labeled_row(label: &str) -> Vec<WireRun> {
+        vec![wire_run(0, 1, label, "#ffffff", None)]
+    }
+
+    fn row_labels(rows: &[Vec<Run>]) -> Vec<&str> {
+        rows.iter().map(|r| r[0].text.as_str()).collect()
+    }
+
+    fn wire_snapshot_with_history(
+        history: Vec<Vec<WireRun>>,
+        rows: Vec<Vec<WireRun>>,
+        background: &str,
+    ) -> WireSnapshot {
+        let mut wire = wire_snapshot(rows, background);
+        wire.history = history;
+        wire
+    }
+
+    #[test]
+    fn clamp_attached_offset_passes_a_requested_offset_through_when_history_covers_it() {
+        assert_eq!(clamp_attached_offset(5, 3), 3);
+    }
+
+    #[test]
+    fn clamp_attached_offset_clamps_to_the_oldest_available_row() {
+        // History only has 5 rows; asking for 999 must not go negative or
+        // panic, and must land exactly on the oldest row, not merely "some"
+        // in-bounds value.
+        assert_eq!(clamp_attached_offset(5, 999), 5);
+    }
+
+    #[test]
+    fn clamp_attached_offset_is_zero_with_no_history_regardless_of_request() {
+        assert_eq!(clamp_attached_offset(0, 7), 0);
+    }
+
+    fn five_history_three_live() -> (Vec<Vec<WireRun>>, Vec<Vec<WireRun>>) {
+        let history = vec!["h0", "h1", "h2", "h3", "h4"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        let rows = vec!["r0", "r1", "r2"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        (history, rows)
+    }
+
+    #[test]
+    fn offset_zero_window_is_exactly_the_live_rows() {
+        let (history, rows) = five_history_three_live();
+        let windowed = windowed_wire_rows(&history, &rows, 0);
+        let texts: Vec<&str> = windowed.iter().map(|r| r[0].text.as_str()).collect();
+        assert_eq!(texts, vec!["r0", "r1", "r2"]);
+    }
+
+    #[test]
+    fn scrolling_back_reaches_into_history() {
+        let (history, rows) = five_history_three_live();
+        let windowed = windowed_wire_rows(&history, &rows, 1);
+        let texts: Vec<&str> = windowed.iter().map(|r| r[0].text.as_str()).collect();
+        // Drops the newest live row, prepends the newest history row — the
+        // window stays the same height, anchored one row further back.
+        assert_eq!(texts, vec!["h4", "r0", "r1"]);
+    }
+
+    #[test]
+    fn scrolling_past_the_oldest_row_clamps_rather_than_panicking() {
+        let (history, rows) = five_history_three_live();
+        let windowed = windowed_wire_rows(&history, &rows, 999);
+        let texts: Vec<&str> = windowed.iter().map(|r| r[0].text.as_str()).collect();
+        // Clamped to the SPECIFIC oldest window, not just "didn't crash".
+        assert_eq!(texts, vec!["h0", "h1", "h2"]);
+    }
+
+    #[test]
+    fn a_snapshot_with_no_history_behaves_like_a_plain_grid() {
+        let (_, rows) = five_history_three_live();
+        let windowed = windowed_wire_rows(&[], &rows, 50);
+        let texts: Vec<&str> = windowed.iter().map(|r| r[0].text.as_str()).collect();
+        assert_eq!(texts, vec!["r0", "r1", "r2"]);
+    }
+
+    #[test]
+    fn attached_frame_at_offset_zero_matches_a_plain_wire_frame() {
+        let (history, rows) = five_history_three_live();
+        let mut wire = wire_snapshot_with_history(history, rows, "#123456");
+        wire.cursor = Some(WireCursor {
+            col: 2,
+            row: 1,
+            shape: "block".into(),
+        });
+        let attached = attached_paint_frame(&wire, 0);
+        assert_eq!(attached, wire_paint_frame(&wire));
+        assert!(
+            attached.cursor.is_some(),
+            "fixture must carry a cursor, or this proves nothing"
+        );
+    }
+
+    #[test]
+    fn attached_frame_scrolled_back_hides_the_cursor() {
+        // The cursor's row/col describe the LIVE screen; a historical
+        // window has nothing correct to draw it at.
+        let (history, rows) = five_history_three_live();
+        let mut wire = wire_snapshot_with_history(history, rows, "#123456");
+        wire.cursor = Some(WireCursor {
+            col: 2,
+            row: 1,
+            shape: "block".into(),
+        });
+        let attached = attached_paint_frame(&wire, 1);
+        assert_eq!(attached.cursor, None);
+    }
+
+    #[test]
+    fn attached_frame_scrolled_back_shows_history_rows() {
+        let (history, rows) = five_history_three_live();
+        let wire = wire_snapshot_with_history(history, rows, "#123456");
+        let attached = attached_paint_frame(&wire, 2);
+        assert_eq!(row_labels(&attached.rows), vec!["h3", "h4", "r0"]);
+    }
+
+    #[test]
+    fn attached_frame_with_no_history_ignores_a_requested_offset() {
+        let (_, rows) = five_history_three_live();
+        let wire = wire_snapshot(rows, "#123456");
+        assert_eq!(
+            attached_paint_frame(&wire, 50),
+            wire_paint_frame(&wire),
+            "no history means nothing to scroll back into"
+        );
+    }
+
+    #[test]
+    fn scrolling_back_survives_a_new_frame_without_snapping_to_the_bottom() {
+        // Simulates one tick of the broadcaster's window moving forward:
+        // the oldest history row (h0) ages out, and what used to be the
+        // newest live row (r0) becomes history. A viewer holding a fixed
+        // offset of 2 must still see a SCROLLED-BACK view of the new frame,
+        // not be silently snapped back to its live bottom.
+        let history_b: Vec<Vec<WireRun>> = vec!["h1", "h2", "h3", "h4", "r0"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        let rows_b: Vec<Vec<WireRun>> = vec!["r1", "r2", "r3"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        let wire_b = wire_snapshot_with_history(history_b, rows_b, "#123456");
+        let attached = attached_paint_frame(&wire_b, 2);
+        assert_ne!(
+            attached,
+            wire_paint_frame(&wire_b),
+            "a fixed offset must not collapse back to the live frame on new data"
+        );
+    }
+
+    #[test]
+    fn rows_ageing_out_shift_the_scrolled_back_window_without_panicking_or_misclamping() {
+        // Same fixed offset (2), one frame apart: A is the older frame, B is
+        // exactly what A becomes after one more row of output ages h0 out of
+        // history and folds the old r0 into it. The window must shift
+        // forward by exactly one row — never panic, never clamp back to A's
+        // window, never jump all the way to B's live bottom.
+        let (history_a, rows_a) = five_history_three_live();
+        let wire_a = wire_snapshot_with_history(history_a, rows_a, "#123456");
+        let history_b: Vec<Vec<WireRun>> = vec!["h1", "h2", "h3", "h4", "r0"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        let rows_b: Vec<Vec<WireRun>> = vec!["r1", "r2", "r3"]
+            .into_iter()
+            .map(labeled_row)
+            .collect();
+        let wire_b = wire_snapshot_with_history(history_b, rows_b, "#123456");
+
+        let frame_a = attached_paint_frame(&wire_a, 2);
+        let frame_b = attached_paint_frame(&wire_b, 2);
+        assert_eq!(row_labels(&frame_a.rows), vec!["h3", "h4", "r0"]);
+        assert_eq!(row_labels(&frame_b.rows), vec!["h4", "r0", "r1"]);
+        assert_ne!(
+            frame_a, frame_b,
+            "the window must have moved, not held still"
+        );
+    }
+
+    #[test]
+    fn attached_container_ignores_translucency_and_paints_the_broadcasters_background() {
+        // D5's ruling: an attached pane is never translucent, because the
+        // foregrounds it received were chosen against the BROADCASTER's
+        // background — showing a local background image through would
+        // restore the unreadability Task 1 removed.
+        let translucent_on = container_background(0x112233, true, true);
+        let translucent_off = container_background(0x112233, false, true);
+        assert_eq!(translucent_on, ContainerBg::Opaque(0x112233));
+        assert_eq!(translucent_off, ContainerBg::Opaque(0x112233));
+        assert_eq!(
+            translucent_on, translucent_off,
+            "the translucency setting must not change an attached pane's container colour"
+        );
+    }
+
+    #[test]
+    fn local_container_still_honors_translucency() {
+        // Pins the pre-Task-3 local-pane behaviour exactly: translucent ->
+        // fully transparent (the background image shows through);
+        // otherwise the theme background.
+        assert_eq!(
+            container_background(0x112233, true, false),
+            ContainerBg::Transparent
+        );
+        assert_eq!(
+            container_background(0x112233, false, false),
+            ContainerBg::Opaque(0x112233)
+        );
     }
 }
