@@ -135,7 +135,13 @@ pub struct Attachment {
     endpoint: Endpoint,
     session_id: String,
     state: Mutex<AttachState>,
-    /// Count of connection attempts (`stream::open` calls) made so far.
+    /// Count of connection attempts made so far — one per `run` loop
+    /// iteration, which is NOT the same as one per `stream::open`: an
+    /// attempt refused by `check_peer_version` increments this without
+    /// ever opening a stream. That is deliberate, and it is what lets a
+    /// test assert `attempts() == 1` for a peer that was turned away
+    /// before any stream existed.
+    ///
     /// Not part of the documented interface; exists so tests can prove a
     /// terminal status really did stop the thread from trying again,
     /// rather than inferring it from status alone.
@@ -306,9 +312,7 @@ fn check_peer_version(endpoint: &Endpoint) -> Result<(), Outcome> {
     match super::get(endpoint, "/version", VERSION_CHECK_DEADLINE) {
         Ok(body) => match version::check_version(&body) {
             version::VersionCheck::Compatible => Ok(()),
-            version::VersionCheck::Incompatible | version::VersionCheck::Unparseable => {
-                Err(Outcome::Terminal(Status::Incompatible))
-            }
+            version::VersionCheck::Incompatible => Err(Outcome::Terminal(Status::Incompatible)),
         },
         Err(err) => Err(classify(&err)),
     }
@@ -1140,65 +1144,6 @@ mod tests {
             "one initial attempt plus MAX_RECONNECTS retries, no more and no fewer, \
              even though every one of them connected"
         );
-    }
-
-    #[test]
-    fn a_peer_advertising_the_current_protocol_and_capability_is_accepted() {
-        // `start()` serves a REAL `/version` -- after this task's
-        // `server.rs` change it already advertises `PROTOCOL_VERSION` and
-        // `CAP_SNAPSHOT_BACKGROUND`, so reaching `Live` here proves the
-        // gate let a compatible peer through rather than merely never
-        // having been wired in. Same setup as
-        // `attaching_to_a_shared_session_reaches_live_and_receives_a_snapshot`,
-        // named separately so the gate's PASS half is asserted explicitly
-        // rather than only incidentally.
-        let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
-        let hub = Arc::new(Hub::new());
-        hub.register("t1", "attach-version-ok", session.input_sender());
-        let peer_id = PeerId("peerVersionOk".into());
-        hub.set_visible_to("t1", &peer_id, true);
-        hub.publish_snapshot("t1", Arc::new(seeded_snapshot("hello")));
-
-        const SECRET: &str = "versionokversionokversionokverso";
-        let handle = start(
-            Arc::clone(&hub),
-            crate::themes::default_theme(),
-            ServerConfig {
-                bind: "127.0.0.1:0".parse().unwrap(),
-                token: "phonephonephonephonephonephoneph".into(),
-                page: "<title>attach-version-ok-test</title>",
-                previews: previews(),
-                thumbs: thumbs(),
-                peers: vec![PeerRecord {
-                    id: peer_id,
-                    host: "peer.local".into(),
-                    label: "peer".into(),
-                    secret: SECRET.into(),
-                    grants: full_grants(),
-                }],
-            },
-        )
-        .expect("server starts");
-        let endpoint = Endpoint {
-            addr: handle.addr(),
-            secret: SECRET.into(),
-        };
-
-        let attachment = spawn(endpoint, "t1");
-        assert!(
-            wait_until(
-                || attachment.status() == Status::Live && attachment.latest().is_some(),
-                Duration::from_secs(5)
-            ),
-            "status: {:?}, latest present: {}",
-            attachment.status(),
-            attachment.latest().is_some()
-        );
-
-        handle.stop();
-        session
-            .shutdown()
-            .join_with_deadline(Duration::from_secs(5));
     }
 
     #[test]

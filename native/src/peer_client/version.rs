@@ -10,11 +10,11 @@
 use crate::companion::wire::{CAP_SNAPSHOT_BACKGROUND, PROTOCOL_VERSION};
 
 /// The verdict [`check_version`] reaches from an already-fetched
-/// `/version` response body. `Incompatible` and `Unparseable` are kept
-/// distinct even though `attach::check_peer_version` currently treats both
-/// as the same terminal `Status::Incompatible` — this is what makes a
-/// version REFUSAL distinguishable from a generic parse failure, one layer
-/// down from where that distinction actually matters (see
+/// `/version` response body. Two verdicts, because the caller acts on
+/// exactly two: attach, or refuse. What matters is that the refusal is
+/// reached HERE, before a stream opens, so it stays distinguishable from
+/// the generic per-frame parse failure at `stream.rs`'s
+/// `BadResponse("frame was not a valid snapshot")` (see
 /// `attach::Status::Incompatible`'s doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionCheck {
@@ -24,13 +24,18 @@ pub enum VersionCheck {
     /// peer's wire shape contains rather than a number a peer could get
     /// out of sync with its own capabilities.
     Compatible,
-    /// Parsed as valid `/version` JSON, but the peer speaks a different
-    /// protocol, or is missing the capability this build needs.
+    /// Anything else: a peer speaking a different protocol, one missing
+    /// the capability this build needs, one whose `/version` is not valid
+    /// JSON, and one that answers with JSON lacking `protocol` entirely.
+    ///
+    /// These were once three variants. They are one because the only
+    /// caller (`attach::check_peer_version`) mapped every non-`Compatible`
+    /// verdict to the same terminal `Status::Incompatible`, so the extra
+    /// variants distinguished nothing any caller could observe — and the
+    /// test that pinned them asserted this enum's shape rather than any
+    /// behaviour. Split them again when something actually says a
+    /// different thing to the user for each; not before.
     Incompatible,
-    /// Not valid JSON, or missing the fields this check reads (`protocol`
-    /// above all) — an old-enough, broken, or entirely different server
-    /// that doesn't even look like a companion server's `/version`.
-    Unparseable,
 }
 
 /// Pure: takes an already-fetched `/version` response body and returns a
@@ -38,10 +43,10 @@ pub enum VersionCheck {
 /// the actual GET (`peer_client::get`) and hands this function the bytes.
 pub fn check_version(body: &[u8]) -> VersionCheck {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return VersionCheck::Unparseable;
+        return VersionCheck::Incompatible;
     };
     let Some(protocol) = value.get("protocol").and_then(|v| v.as_u64()) else {
-        return VersionCheck::Unparseable;
+        return VersionCheck::Incompatible;
     };
     let has_capability = value
         .get("capabilities")
@@ -107,25 +112,23 @@ mod tests {
     }
 
     #[test]
-    fn garbage_bytes_are_unparseable_distinct_from_incompatible() {
-        // The distinction this whole module exists for: a peer that
-        // answers with recognizable-but-wrong JSON (`Incompatible`) is a
-        // DIFFERENT situation from one that doesn't answer sensibly at all
-        // (`Unparseable`) — collapsing them back into one generic parse
-        // failure is exactly what `stream.rs:120`'s per-frame error does,
-        // and exactly what this module is for NOT doing again here.
-        assert_eq!(check_version(b"not json at all"), VersionCheck::Unparseable);
-        assert_ne!(
+    fn a_response_that_is_not_version_json_at_all_is_refused() {
+        // The BEHAVIOUR, not this enum's shape: whatever the reason, a
+        // peer whose `/version` cannot be read as a compatible answer must
+        // be refused rather than optimistically attached. Pointing the
+        // client at something that is not a companion server is the real
+        // case here.
+        assert_eq!(
             check_version(b"not json at all"),
-            check_version(
-                r#"{"protocol":1,"capabilities":["principals","origin","peer-input"]}"#.as_bytes()
-            )
+            VersionCheck::Incompatible
         );
     }
 
     #[test]
-    fn valid_json_missing_the_protocol_field_is_unparseable() {
+    fn valid_json_missing_the_protocol_field_is_refused() {
+        // JSON, but not a companion `/version`: absent `protocol` must
+        // never read as "compatible by default".
         let body = serde_json::json!({ "capabilities": [CAP_SNAPSHOT_BACKGROUND] }).to_string();
-        assert_eq!(check_version(body.as_bytes()), VersionCheck::Unparseable);
+        assert_eq!(check_version(body.as_bytes()), VersionCheck::Incompatible);
     }
 }

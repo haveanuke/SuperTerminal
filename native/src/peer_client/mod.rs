@@ -1,7 +1,8 @@
 //! A bounded, hand-rolled, ONE-SHOT HTTP client for talking to another
 //! SuperTerminal instance's companion server as a paired peer.
 //!
-//! Scope: one-shot requests only -- `/sessions` and `/peer-input/<id>`. A
+//! Scope: one-shot requests only -- `/version`, `/sessions` and
+//! `/peer-input/<id>`. A
 //! TOTAL round-trip deadline is correct here, matching
 //! `companion::blender::capture_once`. It is NOT correct for `/stream/<id>`,
 //! which the server holds open forever -- that route needs a different
