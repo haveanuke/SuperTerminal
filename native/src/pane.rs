@@ -17,7 +17,8 @@ use gpui::{
 use crate::companion::wire::{WireRun, WireSnapshot};
 use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
-use crate::peer_client::attach::Attachment;
+use crate::peer_client::attach::{Attachment, Freshness, Status};
+use crate::peer_client::sessions::{SessionPoller, SessionReport};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use superterminal_core::activity::Activity;
 
@@ -105,6 +106,19 @@ pub struct TerminalPane {
     /// thread through here and are sent on a thread of their own. See
     /// [`PeerInput`].
     peer_input: Option<PeerInput>,
+    /// The peer's `/sessions` poller, shared with every OTHER pane attached
+    /// to the same machine — one poller per peer, never one per pane (see
+    /// [`crate::peer_client::sessions`]). This is where an attached pane's
+    /// ACTIVITY comes from; the attachment beside it supplies only
+    /// freshness, and neither alone is the answer. `Some` exactly when
+    /// `attachment` is: [`Self::set_attachment`] takes both together so a
+    /// pane can never end up reading one peer's frames beside another
+    /// peer's session list.
+    ///
+    /// Read on the UI thread by the activity accessors: every method on it
+    /// is a mutex read, and the blocking `/sessions` round trip happens on
+    /// the poller's own thread.
+    peer_sessions: Option<std::sync::Arc<SessionPoller>>,
     focus_handle: FocusHandle,
     theme: &'static Theme,
     font_family: SharedString,
@@ -488,6 +502,7 @@ impl TerminalPane {
             scroll_accum: 0.0,
             attachment: None,
             peer_input: None,
+            peer_sessions: None,
             focus_handle: cx.focus_handle(),
             theme,
             font_family: font_family.into(),
@@ -567,10 +582,11 @@ impl TerminalPane {
 
     /// A live shell sits behind this pane (spawned successfully and not
     /// exited) — or, for an attached pane, a shell on ANOTHER machine that
-    /// the attachment is still delivering frames from. See [`shell_is_live`].
+    /// the peer has not told us has ended. See [`shell_is_live`].
     pub fn has_live_shell(&self) -> bool {
         shell_is_live(
-            self.attached_frame.is_some(),
+            self.attachment.is_some(),
+            self.remote_session_ended(),
             self.session.as_ref().is_some_and(|s| !s.is_exited()),
         )
     }
@@ -589,8 +605,11 @@ impl TerminalPane {
     /// `Target::Remote` pane, which has no telemetry — is `Unknown`. See
     /// [`crate::hosts::pane_activity`].
     pub fn foreground_activity(&self) -> Activity {
-        let session_activity = self.session.as_ref().map(|s| s.foreground_activity());
-        crate::hosts::pane_activity(&self.target, session_activity)
+        pane_reported_activity(
+            &self.target,
+            self.peer_activity(),
+            self.session.as_ref().map(|s| s.foreground_activity()),
+        )
     }
 
     /// The phone's busy dot. A foreground app alone is not "working" —
@@ -626,6 +645,7 @@ impl TerminalPane {
         companion_activity_of(
             &self.target,
             self.session.as_ref().map(|_| self.companion_busy()),
+            self.peer_activity(),
         )
     }
 
@@ -633,10 +653,19 @@ impl TerminalPane {
     /// cwd is `None` either way; the activity half follows `target` — see
     /// [`Self::foreground_activity`] and [`crate::hosts::pane_activity`].
     pub fn status_activity(&self) -> (Option<String>, Activity) {
-        match self.session.as_ref() {
-            Some(session) => session.status_activity(),
-            None => (None, crate::hosts::pane_activity(&self.target, None)),
-        }
+        let (cwd, local) = match self.session.as_ref() {
+            Some(session) => {
+                let (cwd, activity) = session.status_activity();
+                (cwd, Some(activity))
+            }
+            // The wire carries no cwd, so an attached pane's stays `None`
+            // whatever the peer says its terminal is doing.
+            None => (None, None),
+        };
+        (
+            cwd,
+            pane_reported_activity(&self.target, self.peer_activity(), local),
+        )
     }
 
     pub fn focus(&self, window: &mut Window) {
@@ -679,6 +708,11 @@ impl TerminalPane {
         // joins off-thread, there is nothing here worth waiting for.
         self.peer_input = None;
         self.attachment = None;
+        // Dropping this handle is also what eventually stops the peer's
+        // `/sessions` thread — but only once EVERY pane attached to that
+        // peer has dropped its own clone, which is the point of one poller
+        // per peer. The workspace holds the other clone and prunes it.
+        self.peer_sessions = None;
         self.session.take().map(TermSession::shutdown)
     }
 
@@ -691,7 +725,17 @@ impl TerminalPane {
     /// called — see [`Self::views_remote`]. A remote pane with no attachment
     /// drops its input rather than typing it into a local shell.
     #[allow(dead_code)] // the workspace that attaches a pane arrives in Task 7
-    pub fn set_attachment(&mut self, attachment: std::sync::Arc<Attachment>) {
+    pub fn set_attachment(
+        &mut self,
+        attachment: std::sync::Arc<Attachment>,
+        sessions: std::sync::Arc<SessionPoller>,
+    ) {
+        // Taken together, never separately: the poller answers questions
+        // about the session this ATTACHMENT streams, so a pane holding one
+        // peer's frames beside another peer's session list would read
+        // activity for a terminal it is not showing — and, worse, would see
+        // its own session missing from that list and declare it ended.
+        self.peer_sessions = Some(sessions);
         // The drain thread holds a WEAK reference, matching the lifecycle
         // rule `attach.rs` already documents for its own thread: a strong one
         // would keep the attachment — and its socket — alive for up to a
@@ -825,6 +869,67 @@ impl TerminalPane {
     /// method rather than three spellings.
     fn views_remote(&self) -> bool {
         !self.target.is_local()
+    }
+
+    /// Which peer this pane needs `/sessions` polled for, so the workspace
+    /// can keep exactly one poller alive per peer and drop the rest. `None`
+    /// for every local pane and for a remote pane nothing has attached yet.
+    #[allow(dead_code)] // the workspace prune that reads this lands with Task 7's attach
+    pub fn attached_peer(&self) -> Option<crate::companion::auth::PeerId> {
+        self.peer_sessions.as_ref().map(|p| p.peer().clone())
+    }
+
+    /// What the peer's last `/sessions` poll says about the ONE session this
+    /// pane is a view of. `Unpolled` without both halves — a pane with no
+    /// attachment has no session id to look up, and one with no poller has
+    /// nothing to look it up in.
+    fn peer_report(&self) -> SessionReport {
+        match (self.peer_sessions.as_ref(), self.attachment.as_ref()) {
+            (Some(sessions), Some(attachment)) => sessions.report_for(attachment.session_id()),
+            _ => SessionReport::Unpolled,
+        }
+    }
+
+    /// Whether frames are still arriving. `Stale` with no attachment at all,
+    /// which is the honest answer: nothing is arriving.
+    fn attachment_freshness(&self) -> Freshness {
+        match self.attachment.as_ref() {
+            Some(attachment) => attachment.freshness(std::time::Instant::now()),
+            None => Freshness::Stale,
+        }
+    }
+
+    /// The activity this pane's PEER answers with, already combined under
+    /// the stale-wins rule. `None` — deferring to the local probe — for
+    /// every pane that does not view another machine.
+    ///
+    /// Keyed on [`Self::views_remote`], not on "a frame arrived": a remote
+    /// pane between attaching and its first frame must report the peer's
+    /// answer (`Unknown`, since nothing is fresh yet), never this Mac's.
+    fn peer_activity(&self) -> Option<Activity> {
+        self.views_remote()
+            .then(|| attached_activity(self.attachment_freshness(), self.peer_report()))
+    }
+
+    /// Whether the terminal on the other end is gone for good. See
+    /// [`remote_session_ended`].
+    fn remote_session_ended(&self) -> bool {
+        remote_session_ended(
+            self.peer_report(),
+            self.attachment.as_ref().map(|a| a.status()),
+        )
+    }
+
+    /// The one predicate behind both the overlay and "any key closes an
+    /// exited pane", so the two can never disagree about whether this pane
+    /// has died — or about WHICH machine's terminal died. See
+    /// [`exit_notice`].
+    fn exit_notice(&self) -> ExitNotice {
+        exit_notice(
+            self.views_remote(),
+            self.snapshot.exited.is_some(),
+            self.remote_session_ended(),
+        )
     }
 
     /// The mode booleans to encode this pane's input with. See
@@ -1091,11 +1196,12 @@ impl TerminalPane {
         // workspace to close it (contract rev 1, shutdown section). Routed
         // through the same predicate as the overlay that advertises it, so
         // the two can never disagree about whether this pane has died.
-        if exit_notice(
-            self.attached_frame.is_some(),
-            self.snapshot.exited.is_some(),
-        ) == ExitNotice::LocalProcessExited
-        {
+        // BOTH notices close: a pane whose remote session ended has exactly
+        // as little left to type into as one whose local shell exited, and
+        // the overlay it is showing says so. For a local pane the two
+        // conditions are the same one — `exit_notice` can only ever answer
+        // `LocalProcessExited` there.
+        if self.exit_notice() != ExitNotice::None {
             cx.emit(PaneEvent::Exited);
             return;
         }
@@ -1498,12 +1604,115 @@ fn auto_run_for<T>(config: Option<T>, views_remote: bool) -> Option<T> {
 
 /// Whether a live shell sits behind this pane.
 ///
-/// For an attached pane that is the ATTACHMENT's liveness, not the absence of
-/// a local session: the shell is real, it is simply on another machine.
-/// Today "attached" means "a frame has arrived"; Task 6 refines it to
-/// "the attachment is still fresh" (`peer_client::attach::Freshness`).
-fn shell_is_live(attached: bool, local_shell_live: bool) -> bool {
-    attached || local_shell_live
+/// For an attached pane that is the REMOTE shell's liveness, not the absence
+/// of a local session: the shell is real, it is simply on another machine.
+///
+/// Task 4 handed this forward as "make `attached` mean the attachment is
+/// FRESH". That would be wrong, and the correction is worth stating.
+/// Freshness is a fact about the DATA, not about the shell: a broadcaster
+/// sitting at a prompt publishes nothing and goes stale within six seconds
+/// (`stream::IDLE_GAP`) while its shell is perfectly alive. Keying liveness
+/// on freshness would make `has_live_shell` false for every quiet remote
+/// terminal. The fact that actually answers the question is whether the
+/// session has ENDED — see [`remote_session_ended`].
+///
+/// `attached` is "this pane has an attachment", NOT "a frame has arrived":
+/// a remote pane between attaching and its first frame has a live shell on
+/// the other end, and a restored `Target::Remote` pane that never attached
+/// has neither an attachment nor a local session, so it correctly falls
+/// through to `local_shell_live` and answers false.
+fn shell_is_live(attached: bool, remote_ended: bool, local_shell_live: bool) -> bool {
+    if attached {
+        !remote_ended
+    } else {
+        local_shell_live
+    }
+}
+
+/// **The stale-wins rule**, which is this phase's whole reason for having
+/// two signals instead of one.
+///
+/// `freshness` says whether frames are still arriving
+/// (`attach::Attachment::freshness`); `report` says what the peer's last
+/// `/sessions` poll claimed about this session
+/// (`sessions::SessionPoller::report_for`). Neither alone is the pane's
+/// activity:
+///
+/// * The attachment cannot report activity at all — a `WireSnapshot` carries
+///   geometry, rows, cursor and two mode flags, never activity.
+/// * The poll can, but a poll answers about a session, not about the stream
+///   this pane is painting. If frames have stopped, a cached "busy" from
+///   thirty seconds ago is exactly the stale signal `Unknown` exists to
+///   represent, and letting the fresher poll override the stale stream would
+///   have this pane assert something about a terminal it is no longer
+///   receiving.
+///
+/// So: STALE WINS, unconditionally. And within a fresh attachment, only a
+/// current successful poll may speak — an unpolled or unreachable peer is
+/// `Unknown`, and a session the peer no longer lists is `Unknown` too, not
+/// `Idle`: "gone from the list" cannot distinguish a shell that exited from
+/// a share that was revoked (see [`SessionReport::Ended`]), and the second
+/// case may well still be busy. `Idle` is only ever the peer, reachable and
+/// current, saying `"idle"` about a session whose frames are still arriving.
+fn attached_activity(freshness: Freshness, report: SessionReport) -> Activity {
+    if freshness == Freshness::Stale {
+        return Activity::Unknown;
+    }
+    match report {
+        SessionReport::Listed(activity) => activity,
+        SessionReport::Unpolled | SessionReport::Ended => Activity::Unknown,
+    }
+}
+
+/// **Protocol 2's missing exit signal.** The wire has no "the shell exited"
+/// frame, so an attached pane whose broadcaster's terminal goes away paints
+/// its last frame forever: a dead terminal that looks alive. Freshness does
+/// not cover it — a peer still serving frames for a session it no longer
+/// offers is fresh and wrong, and conversely a quiet-but-live broadcaster
+/// goes stale without having ended anything.
+///
+/// Two independent facts close it, and either one alone is enough:
+///
+/// 1. A SUCCESSFUL `/sessions` poll that no longer offers this session (or
+///    offers it as no longer `alive`, which is what `Hub::retire` sets while
+///    the broadcaster's pane tears down). This is the cheap one: the poll
+///    already runs for activity.
+/// 2. `Status::Gone` on the attachment — the peer answered 410, or the
+///    stream ENDED CLEANLY, which is what `serve_stream` does the moment the
+///    session is unregistered. Faster than the poll, and it is the same
+///    event seen from the other socket.
+///
+/// The other statuses are deliberately NOT ended. `Unavailable` is about our
+/// reach, never about the peer's session (`attach.rs` says so at the
+/// variant); `Connecting` has not concluded anything; and `Refused`
+/// (404 at attach time) and `Incompatible` are failures to EVER attach,
+/// which want an attach-failure surface rather than a notice claiming a
+/// session ended that this pane never had.
+///
+/// What this proves and does not prove is `SessionReport::Ended`'s: the peer
+/// will not serve us this session any more. Whether the shell exited, the
+/// pane was closed, or sharing was revoked is not knowable from here, so
+/// nothing built on this may say "exited".
+fn remote_session_ended(report: SessionReport, status: Option<Status>) -> bool {
+    matches!(report, SessionReport::Ended) || matches!(status, Some(Status::Gone))
+}
+
+/// What a pane reports its terminal is doing, from the two signals that
+/// could answer it.
+///
+/// `peer` is `Some` exactly when this pane views another machine, and is
+/// already [`attached_activity`]'s combined answer. It WINS over any local
+/// probe, for the same reason [`input_route`] does: a pane showing another
+/// machine's terminal must never report this one's state as though it were
+/// that terminal's. `local` is the probe a local pane has always used —
+/// which of the three (foreground, phone dot, status bar) it is depends on
+/// the caller, and none of them changes for a local pane.
+fn pane_reported_activity(
+    target: &Target,
+    peer: Option<Activity>,
+    local: Option<Activity>,
+) -> Activity {
+    crate::hosts::pane_activity(target, peer.or(local))
 }
 
 /// The phone's busy dot as a tri-state.
@@ -1512,11 +1721,16 @@ fn shell_is_live(attached: bool, local_shell_live: bool) -> bool {
 /// shape ran `Activity::from_local_busy(companion_busy())` unconditionally,
 /// which turned "no local busy signal at all" into `Idle` — the absence of
 /// evidence read as evidence of a prompt, which is the precise failure the
-/// tri-state exists to prevent. Routing through `hosts::pane_activity` keeps
-/// all three activity accessors on one rule and leaves `None` for Task 6 to
-/// replace with the peer's own reported activity.
-fn companion_activity_of(target: &Target, local_busy: Option<bool>) -> Activity {
-    crate::hosts::pane_activity(target, local_busy.map(Activity::from_local_busy))
+/// tri-state exists to prevent. Routing through [`pane_reported_activity`]
+/// keeps all three activity accessors on one rule, including the one that
+/// matters here: for a pane viewing another machine, `peer` answers and this
+/// Mac's dot heuristic does not.
+fn companion_activity_of(
+    target: &Target,
+    local_busy: Option<bool>,
+    peer: Option<Activity>,
+) -> Activity {
+    pane_reported_activity(target, peer, local_busy.map(Activity::from_local_busy))
 }
 
 /// What a plain left click starts.
@@ -1568,21 +1782,48 @@ fn click_gesture(
 enum ExitNotice {
     None,
     LocalProcessExited,
+    /// The terminal on the other end of an attachment is gone. Worded as
+    /// "ended" rather than "exited" on purpose — see
+    /// [`remote_session_ended`] for what the signal can and cannot prove.
+    RemoteSessionEnded,
 }
 
-/// `snapshot.exited` describes a process on THIS Mac. For an attached pane it
-/// is permanently `None` (nothing ever syncs that snapshot), so the overlay
-/// would never appear when the REMOTE process exits — a dead terminal looking
-/// alive indefinitely. The honest answer is not to substitute the local
-/// state: protocol 2 carries no exit signal at all (`companion::wire::WireSnapshot`
-/// has no such field), so an attached pane must say NOTHING rather than say
-/// the local thing. Task 6 supplies the missing signal from the attachment's
-/// own `Freshness`/`Status`, at which point this gains a third state.
-fn exit_notice(attached: bool, local_exited: bool) -> ExitNotice {
-    if !attached && local_exited {
+/// `snapshot.exited` describes a process on THIS Mac, and a pane viewing
+/// another machine must never borrow it: that snapshot is the empty
+/// placeholder `from_parts` built and nothing ever syncs it, so it would
+/// answer for the wrong terminal forever. Protocol 2 carries no exit signal
+/// on the wire either (`companion::wire::WireSnapshot` has no such field) —
+/// so the remote answer comes from the two out-of-band facts
+/// [`remote_session_ended`] combines.
+///
+/// Keyed on `views_remote` (the pane's target), not on "a frame arrived":
+/// the notice must be able to appear on a pane whose peer went away before
+/// its first frame ever landed.
+fn exit_notice(views_remote: bool, local_exited: bool, remote_ended: bool) -> ExitNotice {
+    if views_remote {
+        if remote_ended {
+            ExitNotice::RemoteSessionEnded
+        } else {
+            ExitNotice::None
+        }
+    } else if local_exited {
         ExitNotice::LocalProcessExited
     } else {
         ExitNotice::None
+    }
+}
+
+/// The overlay text for a notice, or `None` for a pane that is not dead.
+///
+/// Separate from [`exit_notice`] so the WORDING is pinned by a test rather
+/// than only by a reviewer's eye: the local string must not drift (it is a
+/// local pane's visible behaviour), and the remote one must not claim the
+/// remote process "exited", which is precisely what the signal cannot prove.
+fn exit_message(notice: ExitNotice) -> Option<&'static str> {
+    match notice {
+        ExitNotice::None => None,
+        ExitNotice::LocalProcessExited => Some("[process exited - press any key to close]"),
+        ExitNotice::RemoteSessionEnded => Some("[remote session ended - press any key to close]"),
     }
 }
 
@@ -2501,28 +2742,20 @@ impl Render for TerminalPane {
             })
             .child(div().flex().flex_col().children(row_divs))
             .children(cursor_div)
-            // "[process exited]" describes a process on THIS Mac. An attached
-            // pane must never borrow it to describe a terminal on another —
-            // see [`exit_notice`], and the Task 6 gap it names.
-            .children(
-                (exit_notice(attached, self.snapshot.exited.is_some())
-                    == ExitNotice::LocalProcessExited)
-                    .then(|| {
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(theme.background))
-                            .opacity(0.85)
-                            .child(
-                                div()
-                                    .text_color(rgb(theme.ui_text_muted))
-                                    .child("[process exited - press any key to close]"),
-                            )
-                    }),
-            )
+            // "[process exited]" describes a process on THIS Mac; a pane
+            // viewing another machine gets its own wording, from its own
+            // signal — see [`exit_notice`] and [`remote_session_ended`].
+            .children(exit_message(self.exit_notice()).map(|message| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(theme.background))
+                    .opacity(0.85)
+                    .child(div().text_color(rgb(theme.ui_text_muted)).child(message))
+            }))
     }
 }
 
@@ -3712,15 +3945,15 @@ mod attached_honesty_tests {
     #[test]
     fn an_attached_panes_shell_liveness_is_the_attachments_not_the_local_sessions() {
         assert!(
-            shell_is_live(true, false),
+            shell_is_live(true, false, false),
             "a remote shell is live because the attachment is, not because a local PTY exists"
         );
         assert!(
-            shell_is_live(false, true),
+            shell_is_live(false, false, true),
             "unchanged for a live local pane"
         );
         assert!(
-            !shell_is_live(false, false),
+            !shell_is_live(false, false, false),
             "a local pane whose shell never started or has exited is still dead"
         );
     }
@@ -3731,9 +3964,12 @@ mod attached_honesty_tests {
     fn a_pane_with_no_local_busy_signal_reports_unknown_to_the_phone_not_idle() {
         // `Activity::from_local_busy(false)` is `Idle`, and that is the bug:
         // the ABSENCE of a busy signal is not the observation of a prompt.
-        assert_eq!(companion_activity_of(&remote(), None), Activity::Unknown);
+        assert_eq!(
+            companion_activity_of(&remote(), None, None),
+            Activity::Unknown
+        );
         assert_ne!(
-            companion_activity_of(&remote(), None),
+            companion_activity_of(&remote(), None, None),
             Activity::Idle,
             "the tri-state exists precisely so this is not Idle"
         );
@@ -3742,16 +3978,16 @@ mod attached_honesty_tests {
     #[test]
     fn a_local_panes_phone_dot_is_unchanged_in_all_three_cases() {
         assert_eq!(
-            companion_activity_of(&Target::Local, None),
+            companion_activity_of(&Target::Local, None, None),
             Activity::Idle,
             "a local pane with no session was Idle before and must stay Idle"
         );
         assert_eq!(
-            companion_activity_of(&Target::Local, Some(true)),
+            companion_activity_of(&Target::Local, Some(true), None),
             Activity::Busy
         );
         assert_eq!(
-            companion_activity_of(&Target::Local, Some(false)),
+            companion_activity_of(&Target::Local, Some(false), None),
             Activity::Idle
         );
     }
@@ -3827,14 +4063,17 @@ mod attached_honesty_tests {
         // `snapshot.exited` describes THIS Mac. The wire carries no exit
         // signal at protocol 2, so the honest answer for an attached pane is
         // "say nothing", never "say the local thing".
-        assert_eq!(exit_notice(true, true), ExitNotice::None);
-        assert_eq!(exit_notice(true, false), ExitNotice::None);
+        assert_eq!(exit_notice(true, true, false), ExitNotice::None);
+        assert_eq!(exit_notice(true, false, false), ExitNotice::None);
     }
 
     #[test]
     fn a_local_pane_still_shows_the_overlay_exactly_when_its_process_exited() {
-        assert_eq!(exit_notice(false, true), ExitNotice::LocalProcessExited);
-        assert_eq!(exit_notice(false, false), ExitNotice::None);
+        assert_eq!(
+            exit_notice(false, true, false),
+            ExitNotice::LocalProcessExited
+        );
+        assert_eq!(exit_notice(false, false, false), ExitNotice::None);
     }
 
     // --- the cursor overlay colour -----------------------------------------
@@ -4389,5 +4628,525 @@ mod attached_input_tests {
             "nothing typed after the destination went away may be delivered"
         );
         drop(tx);
+    }
+}
+
+/// Task 6: what an attached pane reports it knows, and how it learns the
+/// terminal on the other end is gone. Two signals arrive on different
+/// clocks — frames (`attach::Freshness`) and a `/sessions` poll
+/// (`sessions::SessionReport`) — and every test here is about what happens
+/// when they disagree.
+#[cfg(test)]
+mod attached_activity_tests {
+    use super::{
+        attached_activity, companion_activity_of, exit_message, exit_notice,
+        pane_reported_activity, remote_session_ended, shell_is_live, ExitNotice,
+    };
+    use crate::hosts::{ProfileId, Target};
+    use crate::peer_client::attach::{Freshness, Status};
+    use crate::peer_client::sessions::SessionReport;
+    use superterminal_core::activity::Activity;
+
+    fn remote() -> Target {
+        Target::Remote(ProfileId("peer-1".to_string()))
+    }
+
+    /// Every report a poll can produce, so a table below is exhaustive by
+    /// construction rather than by the author remembering all five.
+    const EVERY_REPORT: [SessionReport; 5] = [
+        SessionReport::Unpolled,
+        SessionReport::Ended,
+        SessionReport::Listed(Activity::Busy),
+        SessionReport::Listed(Activity::Idle),
+        SessionReport::Listed(Activity::Unknown),
+    ];
+
+    const EVERY_STATUS: [Status; 6] = [
+        Status::Connecting,
+        Status::Live,
+        Status::Refused,
+        Status::Gone,
+        Status::Unavailable,
+        Status::Incompatible,
+    ];
+
+    // --- the stale-wins rule ------------------------------------------------
+
+    #[test]
+    fn stale_frames_beat_every_answer_a_poll_could_give() {
+        // The rule `attach.rs` wrote down for this phase to inherit. A poll
+        // is about a SESSION; this pane is showing a STREAM. Once the stream
+        // stops, what the peer said thirty seconds ago is exactly the stale
+        // signal `Unknown` exists to represent — including, especially, a
+        // cached "busy", which a fresher poll would otherwise keep asserting
+        // about a terminal this pane is no longer receiving.
+        for report in EVERY_REPORT {
+            assert_eq!(
+                attached_activity(Freshness::Stale, report),
+                Activity::Unknown,
+                "a stale attachment reported something other than Unknown for {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_attachment_reports_exactly_what_a_current_poll_said() {
+        // The other half: with frames arriving, the poll is the only thing
+        // that knows what the terminal is DOING, so it passes through
+        // untouched — all three states, not just the two a boolean could
+        // carry.
+        assert_eq!(
+            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Busy)),
+            Activity::Busy
+        );
+        assert_eq!(
+            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Idle)),
+            Activity::Idle
+        );
+        assert_eq!(
+            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Unknown)),
+            Activity::Unknown
+        );
+    }
+
+    #[test]
+    fn nothing_but_a_reachable_peer_naming_a_live_session_may_produce_idle() {
+        // `Idle` authorises: it releases the caffeinate hold, permits cues,
+        // and reads as "at a prompt". Enumerated over the whole input space
+        // so no combination can quietly acquire it — in particular, neither
+        // "no poll has succeeded" nor "the peer no longer lists it" may,
+        // since a session gone from the list may equally be one whose SHARE
+        // was revoked while it keeps right on working.
+        for freshness in [Freshness::Fresh, Freshness::Stale] {
+            for report in EVERY_REPORT {
+                let answer = attached_activity(freshness, report);
+                let earned = freshness == Freshness::Fresh
+                    && report == SessionReport::Listed(Activity::Idle);
+                assert_eq!(
+                    answer == Activity::Idle,
+                    earned,
+                    "{freshness:?} + {report:?} answered {answer:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unpolled_or_ended_session_is_unknown_even_while_frames_still_arrive() {
+        // Freshness alone is not activity: a stream can be perfectly healthy
+        // while nothing has told us what the terminal is doing.
+        assert_eq!(
+            attached_activity(Freshness::Fresh, SessionReport::Unpolled),
+            Activity::Unknown
+        );
+        assert_eq!(
+            attached_activity(Freshness::Fresh, SessionReport::Ended),
+            Activity::Unknown
+        );
+    }
+
+    // --- the exit signal ----------------------------------------------------
+
+    #[test]
+    fn a_session_gone_from_a_successful_poll_has_ended_whatever_the_socket_thinks() {
+        // The cheap signal: the poll already runs for activity. It must hold
+        // even while the stream is `Live` — a peer still serving frames for
+        // a session it no longer offers is fresh and wrong, which is exactly
+        // why freshness alone cannot carry this.
+        for status in EVERY_STATUS {
+            assert!(
+                remote_session_ended(SessionReport::Ended, Some(status)),
+                "a poll that no longer lists the session must end it, even at {status:?}"
+            );
+        }
+        assert!(remote_session_ended(SessionReport::Ended, None));
+    }
+
+    #[test]
+    fn a_cleanly_closed_stream_ends_the_session_before_the_next_poll_lands() {
+        // `serve_stream` returns the moment a session is unregistered or
+        // un-shared, which reaches us as `Status::Gone`. It arrives sooner
+        // than the poll, so it is worth having in its own right.
+        assert!(remote_session_ended(
+            SessionReport::Unpolled,
+            Some(Status::Gone)
+        ));
+        assert!(remote_session_ended(
+            SessionReport::Listed(Activity::Busy),
+            Some(Status::Gone)
+        ));
+    }
+
+    #[test]
+    fn a_peer_we_merely_cannot_reach_has_not_ended_anything() {
+        // The failure this guards: closing a live pane because a laptop lid
+        // shut. `Unavailable` is a statement about OUR reach, `Connecting`
+        // has concluded nothing, and an unpolled report is silence — none of
+        // them is the peer saying the session is over. `Refused` and
+        // `Incompatible` are failures to ever attach, which want an
+        // attach-failure surface, not a claim that something ended.
+        for status in [
+            Status::Connecting,
+            Status::Live,
+            Status::Unavailable,
+            Status::Refused,
+            Status::Incompatible,
+        ] {
+            for report in [
+                SessionReport::Unpolled,
+                SessionReport::Listed(Activity::Busy),
+                SessionReport::Listed(Activity::Idle),
+                SessionReport::Listed(Activity::Unknown),
+            ] {
+                assert!(
+                    !remote_session_ended(report, Some(status)),
+                    "{report:?} at {status:?} was read as an ending"
+                );
+            }
+        }
+        assert!(!remote_session_ended(SessionReport::Unpolled, None));
+    }
+
+    // --- what the pane then shows ------------------------------------------
+
+    #[test]
+    fn a_pane_viewing_another_machine_says_the_session_ended_never_that_a_process_exited() {
+        assert_eq!(
+            exit_notice(true, false, true),
+            ExitNotice::RemoteSessionEnded,
+            "the remote ending must produce a notice of its own"
+        );
+        assert_eq!(
+            exit_message(ExitNotice::RemoteSessionEnded),
+            Some("[remote session ended - press any key to close]")
+        );
+        // The wording is load-bearing: "gone from the list" cannot tell an
+        // exited shell from a revoked share, so the notice must not claim
+        // the remote PROCESS did anything.
+        assert!(
+            !exit_message(ExitNotice::RemoteSessionEnded)
+                .unwrap()
+                .contains("exited"),
+            "the remote notice must not claim a process exited"
+        );
+        // And the local snapshot still cannot speak for the other machine,
+        // in either direction.
+        assert_eq!(exit_notice(true, true, false), ExitNotice::None);
+        assert_eq!(
+            exit_notice(true, true, true),
+            ExitNotice::RemoteSessionEnded
+        );
+    }
+
+    #[test]
+    fn a_local_panes_overlay_and_its_exact_wording_are_untouched() {
+        // `remote_ended` cannot be true for a local pane, but if it ever
+        // were, it must change nothing here.
+        for remote_ended in [false, true] {
+            assert_eq!(
+                exit_notice(false, true, remote_ended),
+                ExitNotice::LocalProcessExited
+            );
+            assert_eq!(exit_notice(false, false, remote_ended), ExitNotice::None);
+        }
+        assert_eq!(
+            exit_message(ExitNotice::LocalProcessExited),
+            Some("[process exited - press any key to close]"),
+            "a local pane's overlay text must not drift"
+        );
+        assert_eq!(exit_message(ExitNotice::None), None);
+    }
+
+    #[test]
+    fn an_attached_panes_shell_stops_being_live_when_its_session_ends() {
+        assert!(
+            shell_is_live(true, false, false),
+            "an attachment whose session the peer still offers has a live shell"
+        );
+        assert!(
+            !shell_is_live(true, true, false),
+            "once the session has ended there is no shell behind this pane"
+        );
+        assert!(
+            !shell_is_live(true, true, true),
+            "and a stray local session must not resurrect it"
+        );
+        assert!(
+            !shell_is_live(false, true, false),
+            "a remote pane that never attached has no shell to end"
+        );
+    }
+
+    // --- which signal answers ----------------------------------------------
+
+    #[test]
+    fn the_peers_answer_wins_over_any_local_probe() {
+        // Same rule as `input_route`: a pane showing another machine's
+        // terminal must never report this one's state as though it were
+        // that terminal's. The dangerous row is a remote pane that somehow
+        // has a local session — the peer's `Unknown` must still win over a
+        // local probe that would say `Idle`.
+        for local in [None, Some(Activity::Idle), Some(Activity::Busy)] {
+            assert_eq!(
+                pane_reported_activity(&remote(), Some(Activity::Unknown), local),
+                Activity::Unknown,
+                "a local probe ({local:?}) answered for a remote terminal"
+            );
+            assert_eq!(
+                pane_reported_activity(&remote(), Some(Activity::Busy), local),
+                Activity::Busy
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_with_no_peer_signal_reports_exactly_what_it_always_did() {
+        // The byte-identity guard: with `peer` absent this is
+        // `hosts::pane_activity` unchanged, for every input.
+        for activity in [Activity::Idle, Activity::Busy, Activity::Unknown] {
+            assert_eq!(
+                pane_reported_activity(&Target::Local, None, Some(activity)),
+                activity
+            );
+            assert_eq!(
+                pane_reported_activity(&remote(), None, Some(activity)),
+                activity
+            );
+        }
+        assert_eq!(
+            pane_reported_activity(&Target::Local, None, None),
+            Activity::Idle,
+            "a local pane with no session was Idle before and must stay Idle"
+        );
+        assert_eq!(
+            pane_reported_activity(&remote(), None, None),
+            Activity::Unknown,
+            "a remote pane nothing has attached to still has no signal"
+        );
+    }
+
+    /// The one test here that is not over hand-made enums: a real companion
+    /// server, a real `Attachment` streaming from it, and a real
+    /// `SessionPoller` polling it, composed exactly as
+    /// `TerminalPane::peer_activity` composes them. It exists because the
+    /// two signals are produced by different modules on different clocks,
+    /// and the whole task is about what happens when they disagree — a
+    /// table over the enums cannot show that the enums the real producers
+    /// emit are the ones this rule was written for.
+    #[test]
+    fn the_two_real_signals_compose_the_way_the_rule_says_they_do() {
+        use crate::companion::auth::PeerId;
+        use crate::companion::hub::tests::RegisterLocalPty;
+        use crate::companion::hub::Hub;
+        use crate::companion::server::{start, ServerConfig};
+        use crate::peer_client::sessions;
+        use crate::peer_client::Endpoint;
+        use crate::term_session::{
+            CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell, SnapshotCursor,
+            TermSession,
+        };
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if cond() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return cond();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn one_row(text: &str) -> RenderableSnapshot {
+            let cell = |ch: char| SnapshotCell {
+                ch,
+                style: CellStyle {
+                    fg: CellColor::Default,
+                    bg: CellColor::Default,
+                    bold: false,
+                    italic: false,
+                    dim: false,
+                    underline: false,
+                    inverse: false,
+                    hidden: false,
+                },
+                wide_spacer: false,
+            };
+            RenderableSnapshot {
+                cols: text.chars().count().max(1),
+                lines: 1,
+                rows: vec![text.chars().map(cell).collect()],
+                cursor: SnapshotCursor {
+                    col: 0,
+                    row: Some(0),
+                    style: CursorStyle::Block,
+                },
+                display_offset: 0,
+                selection: Vec::new(),
+                app_cursor_mode: false,
+                bracketed_paste: false,
+                mouse_tracking: false,
+                alt_screen: false,
+                focused_title: None,
+                exited: None,
+                selection_text: None,
+                search_matches: Vec::new(),
+                history_rows: Vec::new(),
+            }
+        }
+
+        let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+        let hub = Arc::new(Hub::new());
+        hub.register("t1", "compose-live", session.input_sender());
+        let peer_id = PeerId("peerCompose".into());
+        hub.set_visible_to("t1", &peer_id, true);
+        // BUSY, deliberately: the hub's default is Idle, so a poller that
+        // never actually read the field would still look right against an
+        // idle fixture.
+        hub.set_meta_activity("t1", "compose-live", true, Activity::Busy);
+        // A registered-but-never-published session emits no frames at all,
+        // so the attachment could never be Fresh. (Same trap `attach`'s own
+        // tests document.)
+        hub.publish_snapshot("t1", Arc::new(one_row("hello")));
+
+        const SECRET: &str = "composecomposecomposecomposecomp";
+        let handle = start(
+            Arc::clone(&hub),
+            crate::themes::default_theme(),
+            ServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token: "phonephonephonephonephonephoneph".into(),
+                page: "<title>compose-test</title>",
+                previews: Arc::new(crate::companion::previews::PreviewStore::new(None)),
+                thumbs: crate::companion::thumbs::Thumbnailer::new(
+                    std::env::temp_dir()
+                        .join(format!("st-thumbcache-compose-{}", std::process::id())),
+                ),
+                peers: vec![crate::peers::PeerRecord {
+                    id: peer_id.clone(),
+                    host: "peer.local".into(),
+                    label: "peer".into(),
+                    secret: SECRET.into(),
+                    grants: crate::peers::Grants {
+                        view: true,
+                        type_: true,
+                        spawn: true,
+                    },
+                }],
+            },
+        )
+        .expect("server starts");
+        let endpoint = Endpoint {
+            addr: handle.addr(),
+            secret: SECRET.into(),
+        };
+
+        let attachment = crate::peer_client::attach::spawn(endpoint.clone(), "t1");
+        let poller = sessions::spawn(peer_id, endpoint);
+        assert!(
+            wait_until(
+                || attachment.latest().is_some()
+                    && poller.report_for("t1") == SessionReport::Listed(Activity::Busy),
+                Duration::from_secs(10)
+            ),
+            "frames: {}, poll: {:?}",
+            attachment.latest().is_some(),
+            poller.last_poll()
+        );
+
+        // Frames arriving + the peer saying busy: the pane is busy.
+        let now = Instant::now();
+        let report = poller.report_for("t1");
+        assert_eq!(attachment.freshness(now), Freshness::Fresh);
+        assert_eq!(
+            attached_activity(attachment.freshness(now), report),
+            Activity::Busy
+        );
+        assert!(!remote_session_ended(report, Some(attachment.status())));
+
+        // Nothing changes on the wire — the server, hub, session and socket
+        // are all still running and the poll still says busy — but the
+        // clock moves past the frame gap. The cached "busy" must NOT
+        // survive it.
+        let much_later = now + Duration::from_secs(600);
+        assert_eq!(attachment.freshness(much_later), Freshness::Stale);
+        assert_eq!(
+            poller.report_for("t1"),
+            SessionReport::Listed(Activity::Busy),
+            "the poll must still be saying busy, or this proves nothing"
+        );
+        assert_eq!(
+            attached_activity(attachment.freshness(much_later), poller.report_for("t1")),
+            Activity::Unknown,
+            "a fresher poll must never override a stale attachment"
+        );
+
+        // The broadcaster's pane closes, exactly as its workspace sweep does
+        // it. BOTH signals must fire on that one event, and the order is
+        // the reason the faster one is worth carrying: `serve_stream`
+        // returns immediately, so `Status::Gone` lands while the poll is
+        // still inside its interval and still saying "busy".
+        hub.unregister("t1");
+        assert!(
+            wait_until(
+                || attachment.status() == Status::Gone,
+                Duration::from_secs(10)
+            ),
+            "the stream never ended: {:?}",
+            attachment.status()
+        );
+        assert!(
+            remote_session_ended(poller.report_for("t1"), Some(attachment.status())),
+            "the closed stream alone must end the session, before any poll confirms it"
+        );
+        // ...and the poll catches up as the backstop, which is what covers
+        // a broadcaster that goes away while we are between streams.
+        assert!(
+            wait_until(
+                || poller.report_for("t1") == SessionReport::Ended,
+                Duration::from_secs(10)
+            ),
+            "the poll never noticed: {:?}",
+            poller.last_poll()
+        );
+        assert_eq!(
+            attached_activity(Freshness::Fresh, poller.report_for("t1")),
+            Activity::Unknown,
+            "an ended session is Unknown, never Idle: it may equally have been un-shared"
+        );
+        assert_eq!(
+            exit_notice(true, false, true),
+            ExitNotice::RemoteSessionEnded,
+            "and the pane says so instead of painting its last frame forever"
+        );
+
+        handle.stop();
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_phone_dot_of_an_attached_pane_is_the_remote_terminals() {
+        // `companion_busy` runs an agent/output heuristic over a LOCAL pty.
+        // An attached pane has none, and the peer's answer is what the dot
+        // must show — including when the two would disagree.
+        assert_eq!(
+            companion_activity_of(&remote(), None, Some(Activity::Busy)),
+            Activity::Busy
+        );
+        assert_eq!(
+            companion_activity_of(&remote(), Some(false), Some(Activity::Busy)),
+            Activity::Busy,
+            "a local busy probe must not answer for another machine's terminal"
+        );
+        assert_eq!(
+            companion_activity_of(&remote(), Some(true), Some(Activity::Unknown)),
+            Activity::Unknown
+        );
     }
 }

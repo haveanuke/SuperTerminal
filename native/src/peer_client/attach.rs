@@ -171,6 +171,15 @@ impl Drop for Attachment {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl Attachment {
+    /// Which session on the peer this is attached to. Fixed for the
+    /// attachment's whole life (see [`spawn`]), which is what lets a caller
+    /// look the same session up in that peer's `/sessions` list — the other
+    /// half of C2b's activity answer, and the only place its exit signal
+    /// can come from.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// The most recent snapshot successfully parsed off the wire, if any
     /// has arrived yet.
     pub fn latest(&self) -> Option<Arc<WireSnapshot>> {

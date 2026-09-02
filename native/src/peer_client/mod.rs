@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::companion::server::INPUT_CONTENT_TYPE;
 
 pub mod attach;
+pub mod sessions;
 mod sse;
 mod stream;
 mod version;

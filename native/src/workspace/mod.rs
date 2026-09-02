@@ -25,6 +25,7 @@ use crate::layout::{
     collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
 };
 use crate::pane::{BroadcastHub, PaneEvent, TerminalPane};
+use crate::peer_client::sessions::SessionPoller as PeerSessionPoller;
 use crate::settings::Settings;
 use crate::term_session::ShutdownHandle;
 use crate::text_field::{TextField, TextFieldEvent};
@@ -213,6 +214,24 @@ fn may_write_cd(target: &crate::hosts::Target, activity: Activity) -> bool {
     target.is_local() && activity.is_idle()
 }
 
+/// Which per-peer `/sessions` pollers to stop, given the ones currently
+/// held and the peers some open pane still needs polled.
+///
+/// This is what "one poller per PEER, not per attachment" actually means at
+/// runtime: closing ONE of two panes open on the same machine must leave
+/// that machine's poller running for the other, and only the last pane
+/// closing stops it. Keyed on the peer, so a pane closing has no effect
+/// unless it was the last one there.
+fn pollers_to_drop(
+    held: &[crate::companion::auth::PeerId],
+    needed: &[crate::companion::auth::PeerId],
+) -> Vec<crate::companion::auth::PeerId> {
+    held.iter()
+        .filter(|peer| !needed.contains(peer))
+        .cloned()
+        .collect()
+}
+
 /// Whether this pane gives the app a usable LOCAL directory: the gate for
 /// buddy repo probing and the focused-bar directory control.
 fn local_context_available(target: &crate::hosts::Target, cwd: Option<String>) -> bool {
@@ -396,6 +415,16 @@ pub struct Workspace {
     /// dismissed or replaced by the next pairing. Keyed by id, not label —
     /// see `Workspace::delete_peer`.
     peer_pairing_secret: Option<(crate::companion::auth::PeerId, String, String)>,
+    /// One `/sessions` poller per PEER we have a pane attached to — never
+    /// one per pane. Two panes open on the same machine ask that machine
+    /// one question, not two, and the answer is identical for both, so the
+    /// poller is shared by `Arc` (see `peer_client::sessions`).
+    ///
+    /// The `Workspace` holds a clone alongside each pane's, so a peer whose
+    /// last pane just closed still has its poller dropped by
+    /// `prune_peer_pollers` on the next tick rather than lingering until
+    /// something else happens to touch the map.
+    peer_sessions: HashMap<crate::companion::auth::PeerId, Arc<PeerSessionPoller>>,
 }
 
 impl Workspace {
@@ -495,6 +524,7 @@ impl Workspace {
             peer_scanning: false,
             peer_scanned_once: false,
             peer_pairing_secret: None,
+            peer_sessions: HashMap::new(),
         };
         // First launch (or a healed save): persist the hatched identity so
         // the same pet comes back next session.
@@ -677,6 +707,46 @@ impl Workspace {
         .detach();
     }
 
+    /// The poller for one peer, spawning it the first time a pane attaches
+    /// to that machine and handing out the SAME one to every pane after.
+    ///
+    /// `endpoint` is only used on a first spawn: an existing poller keeps
+    /// the endpoint it was created with, so a peer whose address changed
+    /// needs its pollers dropped (every pane on it closed) rather than
+    /// re-derived here, and a caller must never assume this re-points one.
+    #[allow(dead_code)] // the attach flow that calls this arrives in Task 7
+    fn peer_session_poller(
+        &mut self,
+        peer: &crate::companion::auth::PeerId,
+        endpoint: crate::peer_client::Endpoint,
+    ) -> Arc<PeerSessionPoller> {
+        if let Some(existing) = self.peer_sessions.get(peer) {
+            return Arc::clone(existing);
+        }
+        let poller = crate::peer_client::sessions::spawn(peer.clone(), endpoint);
+        self.peer_sessions.insert(peer.clone(), Arc::clone(&poller));
+        poller
+    }
+
+    /// Stop polling peers no open pane is attached to any more. Cheap and
+    /// unconditional: with no attached panes the map is empty and this
+    /// returns before touching a single pane.
+    fn prune_peer_pollers(&mut self, cx: &App) {
+        if self.peer_sessions.is_empty() {
+            return;
+        }
+        let needed: Vec<crate::companion::auth::PeerId> = self
+            .panes
+            .values()
+            .filter_map(|pane| pane.read(cx).attached_peer())
+            .collect();
+        let held: Vec<crate::companion::auth::PeerId> =
+            self.peer_sessions.keys().cloned().collect();
+        for peer in pollers_to_drop(&held, &needed) {
+            self.peer_sessions.remove(&peer);
+        }
+    }
+
     /// 300ms heartbeat for the pet: 900ms art frames, occasional blinks, hop
     /// decay, and speech-bubble expiry.
     fn pet_tick(&mut self, cx: &mut Context<Self>) {
@@ -712,6 +782,13 @@ impl Workspace {
                 self.sync_caffeinate();
                 cx.notify();
             }
+        }
+        // Peers nothing is attached to any more stop being polled. On the
+        // same ~900ms cadence as the other sweeps, and independent of the
+        // companion server: this is us calling OUT to a peer, which has
+        // nothing to do with whether we are serving anything ourselves.
+        if self.pet_tick_count.is_multiple_of(3) {
+            self.prune_peer_pollers(cx);
         }
         // Auto keep-awake: probe on the ~900ms cadence (one ioctl per pane,
         // skipped entirely while the setting is off). The hold machine keeps
@@ -4380,6 +4457,34 @@ impl Render for Workspace {
 mod tests {
     use super::*;
     use crate::hosts::{ProfileId, Target};
+
+    #[test]
+    fn a_peers_poller_survives_until_its_last_pane_closes() {
+        // The whole point of keying pollers on the PEER: two panes open on
+        // the same machine ask it one question. Closing one of them must
+        // not stop the other's activity signal — and only when the last one
+        // goes does the peer stop being polled at all.
+        use crate::companion::auth::PeerId;
+        let a = PeerId("peer-a".into());
+        let b = PeerId("peer-b".into());
+        let held = vec![a.clone(), b.clone()];
+
+        // Two panes on A, one on B: nothing is dropped.
+        assert!(pollers_to_drop(&held, &[a.clone(), a.clone(), b.clone()]).is_empty());
+        // One of A's two panes closes: A is STILL needed.
+        assert!(pollers_to_drop(&held, &[a.clone(), b.clone()]).is_empty());
+        // A's last pane closes: only A goes, and B is untouched.
+        assert_eq!(
+            pollers_to_drop(&held, std::slice::from_ref(&b)),
+            vec![a.clone()]
+        );
+        // Every pane closes: both go.
+        let mut dropped = pollers_to_drop(&held, &[]);
+        dropped.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(dropped, vec![a, b.clone()]);
+        // A peer we hold no poller for is never "dropped" into existence.
+        assert!(pollers_to_drop(&[], std::slice::from_ref(&b)).is_empty());
+    }
 
     #[test]
     fn only_the_helper_assigns_focus() {
