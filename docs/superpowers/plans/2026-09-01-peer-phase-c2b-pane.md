@@ -296,6 +296,26 @@ The verified sixteen, with their enclosing functions: `cwd()` 481,
   the user searches an attached pane and nothing happens, with no explanation.
   Gating them is Task 7's job; name the requirement here so it is not lost.
 
+**Three more sites, found by the Task 3 review — and note what they have in
+common.** None of them contains the word `session`. The real category is "reads
+LOCAL state to answer a question about a REMOTE terminal", and grepping for a
+token was always going to miss it:
+
+- `bounds_for_range` anchors the IME candidate window from
+  `self.snapshot.cursor`. On an attached pane that snapshot is a placeholder, so
+  a Japanese or Chinese composition would pop its candidate window at a phantom
+  cursor — and worse, it contradicts the rule Task 3 just established that a
+  scrolled-back attached frame shows NO cursor. Anchor it from the paint frame.
+- The cursor overlay draws `theme.cursor` — the VIEWER's colour — over the
+  broadcaster's background. Same reasoning as the translucency ruling, which
+  does not cover it. Cosmetic and latent, but decide it rather than inherit it.
+- `attached_scroll_offset` is never re-clamped when a frame arrives. If the
+  broadcaster runs `clear`, history drops to zero and the viewer lands at the
+  bottom; once 150 rows regrow, it silently jumps back to 150-rows-scrolled with
+  no user action. That follows from the stateless contract, so it is not a bug
+  yet — but the task that wires the scroll gesture owns deciding it deliberately
+  and testing the decision.
+
 **Also in scope, found during Task 3:** `render()`'s "[process exited]" overlay
 reads `self.snapshot.exited` directly. For an attached pane that snapshot is
 empty or describes something else, so the overlay would never appear when the
