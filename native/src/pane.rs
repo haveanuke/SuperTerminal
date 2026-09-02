@@ -1191,6 +1191,7 @@ fn local_paint_frame(
 /// LOCAL-ONLY refinement (see D5 in the peer-instances design doc) —
 /// reconstructing it here by guessing glyph widths would misplace every
 /// character after a wrong guess.
+#[cfg_attr(not(test), allow(dead_code))] // wired by Task 3's attached view
 fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
     let background = parse_wire_hex(&wire.background);
     let rows = wire
@@ -1228,6 +1229,7 @@ fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
 /// `/version` capability check before a peer ever attaches), so a malformed
 /// string here means a build mismatch slipped past that gate; fall back to
 /// black rather than let a bad color panic the render loop.
+#[cfg_attr(not(test), allow(dead_code))] // wired by Task 3's attached view
 fn parse_wire_hex(s: &str) -> u32 {
     let s = s.trim_start_matches('#');
     if s.len() == 6 {
