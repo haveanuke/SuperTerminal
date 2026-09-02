@@ -319,8 +319,16 @@ impl TerminalPane {
                     // ~16ms). ESC lands escape_delay into each cycle without
                     // stretching the cycle. Writes go straight to this pane's
                     // PTY — a timer must never fan out over broadcast.
+                    //
+                    // LOCAL ONLY, and this guard is load-bearing. `write_self`
+                    // now routes to the peer for a pane viewing another
+                    // machine; before that it dropped the bytes, so auto-run
+                    // was harmless on a remote pane by accident. Without this
+                    // check an unattended repeating command would fire on
+                    // SOMEONE ELSE'S Mac, on a timer, with nobody watching the
+                    // window it lands in.
                     if let Some((command, interval, send_escape, escape_delay)) =
-                        pane.auto_run.clone()
+                        auto_run_for(pane.auto_run.clone(), pane.views_remote())
                     {
                         pane.auto_run_tick += 1;
                         let interval_ticks = interval.max(1) * 62;
@@ -690,6 +698,16 @@ impl TerminalPane {
         // full send deadline after the pane that owns it is gone.
         self.peer_input = Some(PeerInput::spawn(std::sync::Arc::downgrade(&attachment)));
         self.attachment = Some(attachment);
+        // The previous peer's frame must not outlive its attachment. It
+        // carries that machine's INPUT MODES, so a pane re-attached from A to
+        // B would encode for A until B's first frame lands — and if A had
+        // bracketed paste on where B does not, a multi-line paste arrives
+        // unframed and the remote shell runs every line. Clearing here makes
+        // the "no frame yet" refusal cover the re-attach window too, rather
+        // than relying on callers only ever attaching fresh panes.
+        self.attached_frame = None;
+        self.attached_scroll_offset = 0;
+        self.scroll_accum = 0.0;
     }
 
     /// Hand this pane the newest frame from its attachment. Called from the
@@ -1361,30 +1379,42 @@ fn frame_is_new(
 /// Where an attached pane's outbound bytes go. In production this is a
 /// `Weak<Attachment>`; the indirection exists so the drain loop below can be
 /// driven end to end by a test with no peer to talk to.
+/// What one batch's delivery says about what the drain loop should do next.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Delivery {
+    /// The peer took the bytes.
+    Sent,
+    /// The round trip failed. The peer may well still be there — a single
+    /// dropped request must not silence the pane for the rest of its life —
+    /// but THESE bytes did not land, and neither may whatever was typed
+    /// behind them. See [`drain_peer_input`].
+    Failed,
+    /// The destination is gone for good; the drain loop ends.
+    Gone,
+}
+
 trait PeerSink: Send + 'static {
-    /// Deliver one batch of PTY bytes. Returns whether the DESTINATION is
-    /// still there; `false` ends the drain loop for good. One failed round
-    /// trip is not that — a peer that is merely unreachable right now must
-    /// keep being tried, or a single dropped packet would silence the pane
-    /// for the rest of its life.
-    fn deliver(&self, bytes: &[u8]) -> bool;
+    /// Deliver one batch of PTY bytes.
+    fn deliver(&self, bytes: &[u8]) -> Delivery;
 }
 
 impl PeerSink for std::sync::Weak<Attachment> {
-    fn deliver(&self, bytes: &[u8]) -> bool {
+    fn deliver(&self, bytes: &[u8]) -> Delivery {
         match self.upgrade() {
             Some(attachment) => {
-                // Whether the peer ACCEPTED the bytes is deliberately not
-                // acted on here: `send` succeeding or failing says nothing
-                // about the attachment's health (`attach.rs` says so at the
-                // method itself), and health is Task 6's, reported from
-                // frames arriving rather than from one request's fate.
-                let _ = attachment.send(bytes);
-                true
+                // A failed send still says nothing about the attachment's
+                // HEALTH — that is Task 6's, read from frames arriving rather
+                // than from one request's fate — but it does say these bytes
+                // did not land, which the drain loop must act on.
+                if attachment.send(bytes) {
+                    Delivery::Sent
+                } else {
+                    Delivery::Failed
+                }
             }
             // The pane was torn down while this batch was queued: there is
             // no terminal left to type into.
-            None => false,
+            None => Delivery::Gone,
         }
     }
 }
@@ -1428,16 +1458,42 @@ impl PeerInput {
 /// guesses "paste" from read-chunk size may read as one. It is reachable
 /// only while a peer is stalling, and the alternative — a backlog draining
 /// at one keystroke per round trip — is worse.
+/// A failed batch takes the queue behind it with it. That is the difference
+/// between losing a command and RUNNING A TRUNCATED ONE: a peer stalling
+/// mid-word drops what was typed, and if the Enter typed after the stall
+/// were then delivered on its own, the remote shell would execute whatever
+/// fragment of the line did arrive. Each batch is an independent POST here,
+/// so unlike a single ssh stream there is nothing else keeping the line
+/// atomic. All-or-nothing per stall is the only safe rule.
 fn drain_peer_input(rx: std::sync::mpsc::Receiver<Vec<u8>>, sink: impl PeerSink) {
     while let Ok(first) = rx.recv() {
         let mut batch = first;
         while let Ok(more) = rx.try_recv() {
             batch.extend_from_slice(&more);
         }
-        if !sink.deliver(&batch) {
-            return;
+        match sink.deliver(&batch) {
+            Delivery::Sent => {}
+            Delivery::Failed => {
+                // Everything typed behind the failed batch is part of the
+                // same lost line; delivering it alone is worse than
+                // delivering nothing.
+                while rx.try_recv().is_ok() {}
+            }
+            Delivery::Gone => return,
         }
     }
+}
+
+/// The auto-run config that may actually fire on this pane, which is none at
+/// all when the pane views another machine.
+///
+/// This guard is load-bearing rather than defensive. `write_self` routes to
+/// the peer for a remote pane; before that it dropped the bytes, so auto-run
+/// was harmless on a remote pane BY ACCIDENT. Without this, an unattended
+/// repeating command fires on someone else's Mac, on a timer, in a window
+/// nobody is looking at.
+fn auto_run_for<T>(config: Option<T>, views_remote: bool) -> Option<T> {
+    config.filter(|_| !views_remote)
 }
 
 /// Whether a live shell sits behind this pane.
@@ -3936,7 +3992,7 @@ mod attached_honesty_tests {
 
 #[cfg(test)]
 mod attached_input_tests {
-    use super::{drain_peer_input, frame_is_new, input_modes, InputModes, PeerSink};
+    use super::{drain_peer_input, frame_is_new, input_modes, Delivery, InputModes, PeerSink};
     use crate::companion::input::text_bytes;
     use crate::companion::wire::{WireRun, WireSnapshot};
     use std::sync::mpsc;
@@ -4106,16 +4162,28 @@ mod attached_input_tests {
         gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         /// What `deliver` reports about the destination still being there.
         destination_alive: bool,
+        /// When set, the FIRST `deliver` reports a failed round trip rather
+        /// than a successful one — the stalled-peer case.
+        fail_first: bool,
+        first_done: Mutex<bool>,
     }
 
     impl PeerSink for FakeSink {
-        fn deliver(&self, bytes: &[u8]) -> bool {
+        fn deliver(&self, bytes: &[u8]) -> Delivery {
             self.batches.lock().unwrap().push(bytes.to_vec());
             if let Some((entered, release)) = self.gate.lock().unwrap().take() {
                 entered.send(()).unwrap();
                 release.recv().unwrap();
             }
-            self.destination_alive
+            if !self.destination_alive {
+                return Delivery::Gone;
+            }
+            let mut first_done = self.first_done.lock().unwrap();
+            if self.fail_first && !*first_done {
+                *first_done = true;
+                return Delivery::Failed;
+            }
+            Delivery::Sent
         }
     }
 
@@ -4128,12 +4196,102 @@ mod attached_input_tests {
     }
 
     #[test]
+    fn auto_run_never_fires_on_a_pane_that_views_another_machine() {
+        // A timer that types on its own is fine aimed at your own shell and
+        // is not fine aimed at someone else's. This became reachable the
+        // moment write_self learned to route to a peer.
+        let config = Some(("echo hi".to_string(), 5u64, false, 1u64));
+        assert_eq!(
+            super::auto_run_for(config.clone(), true),
+            None,
+            "a remote pane must not run a timed command"
+        );
+        assert_eq!(
+            super::auto_run_for(config.clone(), false),
+            config,
+            "and a local pane must be entirely unaffected"
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_takes_the_queue_behind_it_rather_than_running_a_truncated_line() {
+        // The hazard: each batch is an INDEPENDENT POST, so unlike one ssh
+        // stream nothing keeps a command line atomic. If a stalled peer drops
+        // "rm -rf /tmp/x" and the Enter typed behind it is then delivered on
+        // its own, the remote shell executes whatever fragment did arrive.
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = FakeSink {
+            batches: Arc::clone(&batches),
+            gate: Mutex::new(Some((entered_tx, release_rx))),
+            destination_alive: true,
+            fail_first: true,
+            first_done: Mutex::new(false),
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || drain_peer_input(rx, sink));
+
+        // First batch enters `deliver` and stalls there.
+        tx.send(b"rm -rf /tmp/x".to_vec()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The user keeps typing through the stall, including the Enter.
+        tx.send(b"\r".to_vec()).unwrap();
+        release_tx.send(()).unwrap();
+
+        drop(tx);
+        assert!(wait_for_exit(&handle), "the drain loop must finish");
+        let seen = batches.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the failed batch may have been attempted; the tail must be dropped, got {seen:?}"
+        );
+        assert!(
+            !seen.concat().contains(&b'\r'),
+            "the Enter typed behind a failed batch must never reach the peer alone"
+        );
+    }
+
+    #[test]
+    fn a_later_batch_still_sends_after_an_earlier_one_failed() {
+        // The other half: a dropped request must not silence the pane for
+        // good. Once the queue behind the failure is cleared, the NEXT thing
+        // typed is a new line and must be delivered normally.
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = FakeSink {
+            batches: Arc::clone(&batches),
+            gate: Mutex::new(None),
+            destination_alive: true,
+            fail_first: true,
+            first_done: Mutex::new(false),
+        };
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let handle = std::thread::spawn(move || drain_peer_input(rx, sink));
+        tx.send(b"lost".to_vec()).unwrap();
+        // Wait for the first to be consumed before queueing the second, so
+        // they cannot coalesce into one batch.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        tx.send(b"echo ok\r".to_vec()).unwrap();
+        drop(tx);
+        assert!(wait_for_exit(&handle), "the drain loop must finish");
+        let seen = batches.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the loop must keep running after a failure");
+        assert_eq!(seen[1], b"echo ok\r".to_vec());
+    }
+
+    #[test]
     fn keystrokes_reach_the_peer_in_the_order_they_were_typed() {
         let batches = Arc::new(Mutex::new(Vec::new()));
         let sink = FakeSink {
             batches: Arc::clone(&batches),
             gate: Mutex::new(None),
             destination_alive: true,
+            fail_first: false,
+            first_done: Mutex::new(false),
         };
         let (tx, rx) = mpsc::channel();
         let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
@@ -4168,6 +4326,8 @@ mod attached_input_tests {
             batches: Arc::clone(&batches),
             gate: Mutex::new(Some((entered_tx, release_rx))),
             destination_alive: true,
+            fail_first: false,
+            first_done: Mutex::new(false),
         };
         let (tx, rx) = mpsc::channel();
         let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
@@ -4206,6 +4366,8 @@ mod attached_input_tests {
             batches: Arc::clone(&batches),
             gate: Mutex::new(Some((entered_tx, release_rx))),
             destination_alive: false,
+            fail_first: false,
+            first_done: Mutex::new(false),
         };
         let (tx, rx) = mpsc::channel();
         let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
