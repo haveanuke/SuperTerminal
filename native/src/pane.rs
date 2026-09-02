@@ -344,6 +344,11 @@ impl TerminalPane {
                                     } else {
                                         pane.snapshot.lines.saturating_sub(1)
                                     };
+                                    // Unreachable for an attached pane, and
+                                    // structurally so: `selecting` is the
+                                    // only way in, and `click_gesture`
+                                    // refuses to set it while attached
+                                    // (`set_attached_frame` also clears it).
                                     if let Some(session) = pane.session.as_mut() {
                                         session.queue_scroll(lines);
                                         session.queue_selection_update(col, row);
@@ -373,7 +378,16 @@ impl TerminalPane {
                         let generation = hub.generation.load(std::sync::atomic::Ordering::Relaxed);
                         if dirty || generation != pane.companion_generation {
                             pane.companion_generation = generation;
-                            if let Some(session) = pane.session.as_mut() {
+                            // D4, said out loud. `session` being `None` on an
+                            // attached pane is what stops it re-publishing a
+                            // terminal it does not own — an accident that
+                            // happens to enforce the rule. State the rule so
+                            // a later change cannot quietly undo it.
+                            let publishable = may_publish_to_companion(
+                                pane.attached_frame.is_some(),
+                                pane.session.is_some(),
+                            );
+                            if let Some(session) = pane.session.as_mut().filter(|_| publishable) {
                                 let (display, live) = session.sync_and_snapshot_with_live();
                                 pane.snapshot = display;
                                 pane.snapshot_fresh = true;
@@ -507,9 +521,14 @@ impl TerminalPane {
         self.write_self(text.as_bytes().to_vec());
     }
 
-    /// A live shell is attached (spawned successfully and not exited).
+    /// A live shell sits behind this pane (spawned successfully and not
+    /// exited) — or, for an attached pane, a shell on ANOTHER machine that
+    /// the attachment is still delivering frames from. See [`shell_is_live`].
     pub fn has_live_shell(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| !s.is_exited())
+        shell_is_live(
+            self.attached_frame.is_some(),
+            self.session.as_ref().is_some_and(|s| !s.is_exited()),
+        )
     }
 
     /// Cheap busy probe (no cwd lookup) for the always-on cue poll.
@@ -554,8 +573,16 @@ impl TerminalPane {
     /// Tri-state form of the phone's dot. Local behaviour is unchanged:
     /// the agent/output heuristic in [`busy_dot`] still decides, and is
     /// deliberately NOT merged with [`Self::foreground_activity`].
+    ///
+    /// With no local PTY there is no heuristic to run, and `busy_dot`
+    /// answering `false` is the ABSENCE of a signal, not the observation of
+    /// a prompt — so the probe is offered as `None` rather than as
+    /// `Some(false)`. See [`companion_activity_of`].
     pub fn companion_activity(&self) -> Activity {
-        Activity::from_local_busy(self.companion_busy())
+        companion_activity_of(
+            &self.target,
+            self.session.as_ref().map(|_| self.companion_busy()),
+        )
     }
 
     /// Tri-state (cwd, foreground-job-running) probe. With no session the
@@ -591,7 +618,42 @@ impl TerminalPane {
             hub.retire(&self.id);
         }
         self.broadcast.members.lock().unwrap().remove(&self.id);
+        // An attached pane has no PTY to reap, so `None` here is right — but
+        // it does still hold the last frame it received. Dropping it stops a
+        // torn-down pane painting a terminal on another machine, and resets
+        // the viewer's scroll window so a rebuilt pane starts at the live
+        // bottom. Closing the attachment's own stream lands with the
+        // `Attachment` field in Task 5.
+        self.attached_frame = None;
+        self.attached_scroll_offset = 0;
         self.session.take().map(TermSession::shutdown)
+    }
+
+    /// Hand this pane the newest frame from its attachment. Task 5 calls
+    /// this from the attachment's own thread hop; nothing calls it yet.
+    ///
+    /// This is where an attached pane's FRESHNESS comes from. The pump's
+    /// `take_dirty()` cannot supply it — there is no local grid to go dirty,
+    /// so it answers "never dirty" forever — and it must keep answering that,
+    /// because `dirty` also drives `process_events` and the companion
+    /// publish. Refresh for an attached pane is therefore pushed by the
+    /// arriving frame, not polled off a local session.
+    #[allow(dead_code)] // the attachment that calls this arrives in Task 5
+    pub fn set_attached_frame(
+        &mut self,
+        frame: std::sync::Arc<WireSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.attached_scroll_offset = scroll_after_frame(self.attached_scroll_offset, &frame);
+        self.attached_frame = Some(frame);
+        self.last_activity = std::time::Instant::now();
+        // A selection drag can only ever have been started on a LOCAL grid
+        // (`click_gesture` refuses one while attached); becoming attached
+        // invalidates any in-flight drag rather than leaving the pump
+        // auto-scrolling off stale state.
+        self.selecting = false;
+        self.drag_position = None;
+        cx.notify();
     }
 
     fn process_events(&mut self, cx: &mut Context<Self>) {
@@ -638,10 +700,24 @@ impl TerminalPane {
         self.write_self(bytes);
     }
 
-    /// Write to this pane's PTY only, ignoring broadcast (timers, escapes).
+    /// Write to this pane's own terminal only, ignoring broadcast (timers,
+    /// escapes). See [`input_route`] for why the destination is decided
+    /// rather than inferred from "there happens to be a session".
     fn write_self(&self, bytes: Vec<u8>) {
-        if let Some(session) = &self.session {
-            session.write(bytes);
+        match input_route(self.attached_frame.is_some(), self.session.is_some()) {
+            InputRoute::LocalPty => {
+                if let Some(session) = &self.session {
+                    session.write(bytes);
+                }
+            }
+            // Dropped DELIBERATELY, not incidentally: there is no route to
+            // the remote PTY yet, and writing these into the local shell
+            // would type into the wrong machine. Task 5 replaces this arm
+            // with `Attachment::send`, hopped off the gpui path (`send()`
+            // blocks up to 5s).
+            InputRoute::Peer => {}
+            // No shell at all: the spawn failed, or the process has exited.
+            InputRoute::Nowhere => {}
         }
     }
 
@@ -867,8 +943,14 @@ impl TerminalPane {
         let m = &ks.modifiers;
 
         // Restarting a dead pane: any key on an exited pane asks the
-        // workspace to close it (contract rev 1, shutdown section).
-        if self.snapshot.exited.is_some() {
+        // workspace to close it (contract rev 1, shutdown section). Routed
+        // through the same predicate as the overlay that advertises it, so
+        // the two can never disagree about whether this pane has died.
+        if exit_notice(
+            self.attached_frame.is_some(),
+            self.snapshot.exited.is_some(),
+        ) == ExitNotice::LocalProcessExited
+        {
             cx.emit(PaneEvent::Exited);
             return;
         }
@@ -944,7 +1026,13 @@ impl TerminalPane {
     }
 
     fn scroll_to_bottom_on_input(&mut self, cx: &mut Context<Self>) {
-        if self.snapshot.display_offset > 0 {
+        if self.attached_frame.is_some() {
+            // The local analogue of the `display_offset` reset below: typing
+            // lands at the broadcaster's live bottom, so the viewer's own
+            // scrollback window snaps there too. D2 — this changes only
+            // which slice THIS viewer paints, never the remote PTY.
+            self.attached_scroll_offset = 0;
+        } else if self.snapshot.display_offset > 0 {
             if let Some(session) = self.session.as_mut() {
                 session.queue_scroll(-(self.snapshot.display_offset as i32));
             }
@@ -987,6 +1075,215 @@ fn broadcast_register(hub: &std::sync::Arc<BroadcastHub>, id: &str, sender: Even
         .lock()
         .unwrap()
         .insert(id.to_string(), (true, sender));
+}
+
+// ---------------------------------------------------------------------------
+// Answering honestly with no local session.
+//
+// An ATTACHED pane (`attached_frame` populated) is a view of a terminal
+// running on another machine: no PTY, no local process, and a `snapshot`
+// that is still the empty placeholder `from_parts` built. Every predicate
+// below exists because the naive answer — whatever `Option::None` happens to
+// produce — is PLAUSIBLE and WRONG at that pane, and a plausible wrong answer
+// does not fail; it quietly misleads a consumer.
+//
+// Each takes `attached` explicitly rather than reading it off the pane, so
+// the decision is testable without a gpui harness (there is none, and none
+// may be introduced).
+// ---------------------------------------------------------------------------
+
+/// Whether this pane may publish its own screen to THIS Mac's companion hub
+/// (the phone).
+///
+/// D4. Today the pump enforces this by accident — its publish arm is
+/// `if let Some(session) = pane.session.as_mut()`, and an attached pane has
+/// no session — so the rule holds for a reason that has nothing to do with
+/// the rule. Stated here so it survives: an attached pane is a VIEW of
+/// another machine's terminal, and re-publishing it would offer the phone a
+/// remote view of a remote view, attributed to this Mac. That must stay true
+/// even if an attached pane ever acquires a session for some other purpose.
+fn may_publish_to_companion(attached: bool, has_local_session: bool) -> bool {
+    has_local_session && !attached
+}
+
+/// Where a pane's input bytes go.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum InputRoute {
+    /// This pane's own PTY.
+    LocalPty,
+    /// A terminal on another machine, reached through the attachment.
+    Peer,
+    /// Nowhere: the shell never started, or has already exited.
+    Nowhere,
+}
+
+/// Attachment wins over the presence of a local session, always. A pane that
+/// is showing another machine's terminal must never type into a shell on
+/// this one — that is a wrong-machine keystroke, not a dropped one.
+fn input_route(attached: bool, has_local_session: bool) -> InputRoute {
+    if attached {
+        InputRoute::Peer
+    } else if has_local_session {
+        InputRoute::LocalPty
+    } else {
+        InputRoute::Nowhere
+    }
+}
+
+/// Whether a live shell sits behind this pane.
+///
+/// For an attached pane that is the ATTACHMENT's liveness, not the absence of
+/// a local session: the shell is real, it is simply on another machine.
+/// Today "attached" means "a frame has arrived"; Task 6 refines it to
+/// "the attachment is still fresh" (`peer_client::attach::Freshness`).
+fn shell_is_live(attached: bool, local_shell_live: bool) -> bool {
+    attached || local_shell_live
+}
+
+/// The phone's busy dot as a tri-state.
+///
+/// `local_busy` is `Some` exactly when there IS a local PTY to probe. The old
+/// shape ran `Activity::from_local_busy(companion_busy())` unconditionally,
+/// which turned "no local busy signal at all" into `Idle` — the absence of
+/// evidence read as evidence of a prompt, which is the precise failure the
+/// tri-state exists to prevent. Routing through `hosts::pane_activity` keeps
+/// all three activity accessors on one rule and leaves `None` for Task 6 to
+/// replace with the peer's own reported activity.
+fn companion_activity_of(target: &Target, local_busy: Option<bool>) -> Activity {
+    crate::hosts::pane_activity(target, local_busy.map(Activity::from_local_busy))
+}
+
+/// What a plain left click starts.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ClickGesture {
+    /// Click-to-move: encode arrows from the cursor to the clicked cell.
+    MoveCursor,
+    /// Begin a selection drag.
+    StartSelection,
+    /// Neither gesture has a correct answer here.
+    Ignore,
+}
+
+/// Both gestures are computed from the LOCAL grid, and an attached pane's
+/// local grid is the empty placeholder — so both must be refused there, not
+/// answered from it.
+///
+/// Click-to-move is the dangerous one: every guard below (`!mouse_tracking`,
+/// `!alt_screen`, `display_offset == 0`, no selection) passes on that
+/// placeholder, so an attached pane would encode a burst of arrow keys from
+/// a phantom cursor at (0, 0) against a phantom width of 80. It is inert
+/// today only because `write()` has nowhere to send them; Task 5 gives it
+/// somewhere.
+///
+/// Selection is refused for a different reason: selection does not cross the
+/// wire (D5). Refusing it here also keeps `selecting` false on an attached
+/// pane, which is what makes the pump's drag auto-scroll and the mouse-move
+/// selection update structurally unreachable rather than merely inert.
+fn click_gesture(
+    attached: bool,
+    mouse_tracking: bool,
+    alt_screen: bool,
+    display_offset: usize,
+    has_selection: bool,
+) -> ClickGesture {
+    if attached {
+        return ClickGesture::Ignore;
+    }
+    if !mouse_tracking && !alt_screen && display_offset == 0 && !has_selection {
+        ClickGesture::MoveCursor
+    } else {
+        ClickGesture::StartSelection
+    }
+}
+
+/// Whether to draw the "[process exited]" overlay, and say the same thing to
+/// `on_key_down`'s "any key closes an exited pane".
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ExitNotice {
+    None,
+    LocalProcessExited,
+}
+
+/// `snapshot.exited` describes a process on THIS Mac. For an attached pane it
+/// is permanently `None` (nothing ever syncs that snapshot), so the overlay
+/// would never appear when the REMOTE process exits — a dead terminal looking
+/// alive indefinitely. The honest answer is not to substitute the local
+/// state: protocol 2 carries no exit signal at all (`companion::wire::WireSnapshot`
+/// has no such field), so an attached pane must say NOTHING rather than say
+/// the local thing. Task 6 supplies the missing signal from the attachment's
+/// own `Freshness`/`Status`, at which point this gains a third state.
+fn exit_notice(attached: bool, local_exited: bool) -> ExitNotice {
+    if !attached && local_exited {
+        ExitNotice::LocalProcessExited
+    } else {
+        ExitNotice::None
+    }
+}
+
+/// The colour to draw the cursor overlay in.
+///
+/// The cursor sits on the BROADCASTER's canvas, so it has to be legible
+/// against the broadcaster's background — the same reasoning as D5's
+/// translucency ruling, which covers the pane's background but not the
+/// overlay drawn on top of it. The wire carries no cursor colour, so the
+/// viewer's own is used, nudged clear of the broadcaster's background when
+/// it would otherwise vanish into it.
+///
+/// A LOCAL pane is untouched: `contrast_boost` is deliberately NOT applied
+/// there, because a theme whose own cursor sits close to its own background
+/// would then be silently recoloured, which is a change to a local terminal.
+fn cursor_color(theme_cursor: u32, frame_background: u32, attached: bool) -> u32 {
+    if attached {
+        crate::themes::contrast_boost(theme_cursor, frame_background)
+    } else {
+        theme_cursor
+    }
+}
+
+/// Where an attached pane's cursor is being PAINTED, in viewport cells — the
+/// same decision [`attached_paint_frame`] makes, without decoding a row.
+///
+/// Exists so the IME candidate window anchors at the cursor the user can
+/// actually see. Anchoring from `self.snapshot.cursor` instead reads a
+/// placeholder that describes nothing, and contradicts Task 3's rule that a
+/// scrolled-back attached frame shows no cursor at all.
+fn attached_cursor_cell(wire: &WireSnapshot, offset: usize) -> Option<(usize, usize)> {
+    if clamp_attached_offset(wire.history.len(), offset) != 0 {
+        return None;
+    }
+    wire.cursor
+        .as_ref()
+        .map(|cursor| (cursor.col as usize, cursor.row as usize))
+}
+
+/// The attached pane's new local scroll offset after a wheel gesture.
+///
+/// D2: geometry and scrollback are broadcaster-owned, so this moves only
+/// which slice of the ALREADY-RECEIVED history this viewer paints — never
+/// the remote PTY. The sign convention is inherited from the local path
+/// (`queue_scroll(lines)`, positive = back into history) and from
+/// [`drag_scroll_lines`], which returns positive when the pointer sits above
+/// the top edge.
+fn attached_scroll_after_wheel(previous: usize, lines: i32, history_len: usize) -> usize {
+    let next = previous as i64 + lines as i64;
+    clamp_attached_offset(history_len, next.max(0) as usize)
+}
+
+/// Fold an arriving frame into the viewer's own scroll offset.
+///
+/// The offset is clamped against the NEW frame's history and the clamp is
+/// KEPT. That is the deliberate choice: when the broadcaster runs `clear`,
+/// history drops to zero and the viewer lands at the live bottom; when
+/// history regrows, the viewer stays at the bottom instead of silently
+/// springing back to where it was scrolled before, with no user action.
+/// Clamping only at paint time would produce that spring-back.
+///
+/// It clamps against `history` alone — never `history + rows` — because the
+/// live window is always exactly `rows.len()` tall (see
+/// [`windowed_wire_rows`]), so scrolling back can only reach as far as the
+/// history behind it.
+fn scroll_after_frame(previous_offset: usize, frame: &WireSnapshot) -> usize {
+    clamp_attached_offset(frame.history.len(), previous_offset)
 }
 
 /// Scale an 0xRRGGBB color's channels by 2/3 (DIM), never via alpha.
@@ -1444,11 +1741,19 @@ impl gpui::EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<gpui::Bounds<Pixels>> {
-        // Anchor the IME candidate window at the cursor cell.
-        let row = self.snapshot.cursor.row?;
+        // Anchor the IME candidate window at the cursor cell — the one being
+        // PAINTED, not the one in `self.snapshot`. For an attached pane that
+        // snapshot is the empty placeholder `from_parts` built, so anchoring
+        // from it would pop a Japanese or Chinese composition's candidate
+        // window at a phantom cursor; and a scrolled-back attached frame
+        // paints no cursor at all (Task 3), so it offers no anchor rather
+        // than a wrong one.
+        let (cursor_col, row) = match &self.attached_frame {
+            Some(wire) => attached_cursor_cell(wire, self.attached_scroll_offset)?,
+            None => (self.snapshot.cursor.col, self.snapshot.cursor.row?),
+        };
         let origin = gpui::point(
-            element_bounds.origin.x
-                + px(PADDING + self.snapshot.cursor.col as f32 * f32::from(self.cell_width)),
+            element_bounds.origin.x + px(PADDING + cursor_col as f32 * f32::from(self.cell_width)),
             element_bounds.origin.y + px(PADDING + row as f32 * f32::from(self.line_height)),
         );
         Some(gpui::Bounds {
@@ -1581,10 +1886,12 @@ impl Render for TerminalPane {
         // `attached_paint_frame`, which windows `history` + `rows` by the
         // viewer's own local scroll offset (D2: never scrolls the remote
         // PTY) and falls back to `wire_paint_frame` at offset 0.
+        let attached = self.attached_frame.is_some();
         let frame = match &self.attached_frame {
             Some(wire) => attached_paint_frame(wire, self.attached_scroll_offset),
             None => local_paint_frame(snapshot, theme, &advance_safe),
         };
+        let frame_background = frame.background;
         let mut row_divs = Vec::with_capacity(frame.rows.len());
         for runs in frame.rows {
             // Runs are pinned at col * cell_width instead of flowed: flowed
@@ -1628,6 +1935,11 @@ impl Render for TerminalPane {
         // Cursor overlay (2px bar focused, hollow block unfocused; hidden when
         // the app hides it or it scrolled out of view).
         let blink_visible = !focused || self.blink_on;
+        // The cursor is drawn ON the frame's canvas, so its colour is judged
+        // against that canvas — the broadcaster's background for an attached
+        // pane, the viewer's own theme background (unchanged, untouched) for
+        // a local one. See [`cursor_color`].
+        let cursor_rgb = cursor_color(theme.cursor, frame_background, attached);
         let cursor_div = match frame.cursor {
             None => None,
             Some(_) if !blink_visible => None,
@@ -1636,14 +1948,14 @@ impl Render for TerminalPane {
                 let top = px(PADDING + row as f32 * f32::from(line_h));
                 let d = div().absolute().left(left).top(top).h(line_h);
                 Some(if !focused {
-                    d.w(cell_w).border_1().border_color(rgb(theme.cursor))
+                    d.w(cell_w).border_1().border_color(rgb(cursor_rgb))
                 } else {
                     match frame.cursor_style {
                         CursorStyle::Underline => {
-                            d.w(cell_w).border_b_2().border_color(rgb(theme.cursor))
+                            d.w(cell_w).border_b_2().border_color(rgb(cursor_rgb))
                         }
-                        CursorStyle::Block => d.w(cell_w).bg(rgb(theme.cursor)).opacity(0.7),
-                        _ => d.w(px(2.0)).bg(rgb(theme.cursor)),
+                        CursorStyle::Block => d.w(cell_w).bg(rgb(cursor_rgb)).opacity(0.7),
+                        _ => d.w(px(2.0)).bg(rgb(cursor_rgb)),
                     }
                 })
             }
@@ -1661,11 +1973,7 @@ impl Render for TerminalPane {
             .size_full()
             .relative()
             .bg(
-                match container_background(
-                    frame.background,
-                    self.translucent,
-                    self.attached_frame.is_some(),
-                ) {
+                match container_background(frame_background, self.translucent, attached) {
                     // Fully transparent over a background image: the image
                     // layer already applies the user's chosen opacity, so
                     // any alpha here would dim it a second time.
@@ -1724,6 +2032,9 @@ impl Render for TerminalPane {
             .on_mouse_move(
                 cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
                     let _ = &pane_for_move;
+                    // Unreachable while attached: `selecting` is only ever
+                    // set by `handle_click`, which refuses both gestures on
+                    // an attached pane (`click_gesture`).
                     if this.selecting && event.dragging() {
                         this.drag_position = Some((event.position.x, event.position.y));
                         let (col, row) = this.cell_at(
@@ -1763,8 +2074,25 @@ impl Render for TerminalPane {
                     let delta = event.delta.pixel_delta(this.line_height).y;
                     let lines = (f32::from(delta) / f32::from(this.line_height)).round() as i32;
                     if lines != 0 {
-                        if let Some(session) = this.session.as_mut() {
-                            session.queue_scroll(lines);
+                        // The one site that makes an attached pane's
+                        // scrollback reachable at all: Task 3 built the
+                        // windowing and wired it into `render()`, but
+                        // nothing moved the offset. D2 keeps this local —
+                        // it repicks the slice of the RECEIVED history this
+                        // viewer paints and never touches the remote PTY.
+                        match this.attached_frame.as_ref().map(|w| w.history.len()) {
+                            Some(history_len) => {
+                                this.attached_scroll_offset = attached_scroll_after_wheel(
+                                    this.attached_scroll_offset,
+                                    lines,
+                                    history_len,
+                                );
+                            }
+                            None => {
+                                if let Some(session) = this.session.as_mut() {
+                                    session.queue_scroll(lines);
+                                }
+                            }
                         }
                         cx.notify();
                     }
@@ -1802,21 +2130,28 @@ impl Render for TerminalPane {
             })
             .child(div().flex().flex_col().children(row_divs))
             .children(cursor_div)
-            .children(self.snapshot.exited.is_some().then(|| {
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(rgb(theme.background))
-                    .opacity(0.85)
-                    .child(
+            // "[process exited]" describes a process on THIS Mac. An attached
+            // pane must never borrow it to describe a terminal on another —
+            // see [`exit_notice`], and the Task 6 gap it names.
+            .children(
+                (exit_notice(attached, self.snapshot.exited.is_some())
+                    == ExitNotice::LocalProcessExited)
+                    .then(|| {
                         div()
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child("[process exited - press any key to close]"),
-                    )
-            }))
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(theme.background))
+                            .opacity(0.85)
+                            .child(
+                                div()
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child("[process exited - press any key to close]"),
+                            )
+                    }),
+            )
     }
 }
 
@@ -1883,12 +2218,20 @@ impl TerminalPane {
         let snapshot = &self.snapshot;
         // Click-to-move guards (ported from the web app): prompt row only, at
         // bottom, no selection, no app mouse tracking, normal buffer implied
-        // by mouse_tracking check + display_offset.
-        if !snapshot.mouse_tracking
-            && !snapshot.alt_screen
-            && snapshot.display_offset == 0
-            && snapshot.selection.is_empty()
-        {
+        // by mouse_tracking check + display_offset. Both gestures read the
+        // LOCAL grid, so an attached pane refuses both — see
+        // [`click_gesture`] for why click-to-move is the dangerous half.
+        let gesture = click_gesture(
+            self.attached_frame.is_some(),
+            snapshot.mouse_tracking,
+            snapshot.alt_screen,
+            snapshot.display_offset,
+            !snapshot.selection.is_empty(),
+        );
+        if gesture == ClickGesture::Ignore {
+            return;
+        }
+        if gesture == ClickGesture::MoveCursor {
             if let Some(cursor_row) = snapshot.cursor.row {
                 if let Some(bytes) = keys::click_to_move_bytes(
                     col,
@@ -1904,7 +2247,10 @@ impl TerminalPane {
                 }
             }
         }
-        // Otherwise: begin a selection drag.
+        // Otherwise: begin a selection drag. Only ever reached on a
+        // non-attached pane, which is what keeps `selecting` — and so the
+        // pump's drag auto-scroll and the mouse-move selection update —
+        // structurally unreachable while attached.
         if let Some(session) = self.session.as_mut() {
             session.queue_selection_clear();
             session.queue_selection_start(col, row);
@@ -2788,6 +3134,376 @@ mod tests {
         assert_eq!(
             container_background(0x112233, false, false),
             ContainerBg::Opaque(0x112233)
+        );
+    }
+}
+
+/// Task 4: honesty without a local session. Every predicate here answers a
+/// question an ATTACHED pane is asked — one whose naive `Option`-shaped
+/// answer is plausible and wrong.
+#[cfg(test)]
+mod attached_honesty_tests {
+    use super::{
+        attached_cursor_cell, attached_paint_frame, attached_scroll_after_wheel,
+        clamp_attached_offset, click_gesture, companion_activity_of, cursor_color,
+        drag_scroll_lines, exit_notice, input_route, may_publish_to_companion, scroll_after_frame,
+        shell_is_live, ClickGesture, ExitNotice, InputRoute,
+    };
+    use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
+    use crate::hosts::{ProfileId, Target};
+    use superterminal_core::activity::Activity;
+
+    fn run(col: u16, text: &str) -> WireRun {
+        WireRun {
+            col,
+            width: text.chars().count() as u16,
+            text: text.to_string(),
+            fg: "#c0caf5".to_string(),
+            bg: None,
+            b: false,
+            i: false,
+            u: false,
+        }
+    }
+
+    fn snapshot(history: usize, live: usize, cursor: Option<(u16, u16)>) -> WireSnapshot {
+        WireSnapshot {
+            cols: 8,
+            lines: live as u16,
+            cursor: cursor.map(|(col, row)| WireCursor {
+                col,
+                row,
+                shape: "block".to_string(),
+            }),
+            app_cursor: false,
+            rows: (0..live).map(|i| vec![run(0, &format!("r{i}"))]).collect(),
+            history: (0..history)
+                .map(|i| vec![run(0, &format!("h{i}"))])
+                .collect(),
+            bracketed_paste: false,
+            mouse_tracking: false,
+            background: "#1a1b26".to_string(),
+        }
+    }
+
+    fn remote() -> Target {
+        Target::Remote(ProfileId("peer-1".to_string()))
+    }
+
+    // --- site 3: the load-bearing None -------------------------------------
+
+    #[test]
+    fn an_attached_pane_may_never_publish_to_this_macs_companion() {
+        // D4. Today this is enforced by ACCIDENT: the pump's publish arm is
+        // `if let Some(session) = pane.session.as_mut()`, and an attached
+        // pane has no session. That accident is what this pins — the
+        // (attached, has_session) = (true, true) row is the one a later
+        // "fix" that hands an attached pane a session would break, turning
+        // the phone into a remote view of a remote view.
+        assert!(
+            !may_publish_to_companion(true, true),
+            "an attached pane must not publish even if it somehow has a session"
+        );
+        assert!(!may_publish_to_companion(true, false));
+        assert!(
+            may_publish_to_companion(false, true),
+            "a local pane with a session must publish exactly as before"
+        );
+        assert!(!may_publish_to_companion(false, false));
+    }
+
+    // --- site 13: write_self -----------------------------------------------
+
+    #[test]
+    fn input_from_an_attached_pane_never_reaches_a_local_pty() {
+        // The dangerous row is (true, true): attachment must win over the
+        // presence of a local session, or a keystroke meant for another
+        // machine gets typed into this one.
+        assert_eq!(input_route(true, true), InputRoute::Peer);
+        assert_eq!(input_route(true, false), InputRoute::Peer);
+        assert_eq!(input_route(false, true), InputRoute::LocalPty);
+        assert_eq!(input_route(false, false), InputRoute::Nowhere);
+    }
+
+    // --- site 5: has_live_shell --------------------------------------------
+
+    #[test]
+    fn an_attached_panes_shell_liveness_is_the_attachments_not_the_local_sessions() {
+        assert!(
+            shell_is_live(true, false),
+            "a remote shell is live because the attachment is, not because a local PTY exists"
+        );
+        assert!(
+            shell_is_live(false, true),
+            "unchanged for a live local pane"
+        );
+        assert!(
+            !shell_is_live(false, false),
+            "a local pane whose shell never started or has exited is still dead"
+        );
+    }
+
+    // --- the phone's dot: Idle vs Unknown ----------------------------------
+
+    #[test]
+    fn a_pane_with_no_local_busy_signal_reports_unknown_to_the_phone_not_idle() {
+        // `Activity::from_local_busy(false)` is `Idle`, and that is the bug:
+        // the ABSENCE of a busy signal is not the observation of a prompt.
+        assert_eq!(companion_activity_of(&remote(), None), Activity::Unknown);
+        assert_ne!(
+            companion_activity_of(&remote(), None),
+            Activity::Idle,
+            "the tri-state exists precisely so this is not Idle"
+        );
+    }
+
+    #[test]
+    fn a_local_panes_phone_dot_is_unchanged_in_all_three_cases() {
+        assert_eq!(
+            companion_activity_of(&Target::Local, None),
+            Activity::Idle,
+            "a local pane with no session was Idle before and must stay Idle"
+        );
+        assert_eq!(
+            companion_activity_of(&Target::Local, Some(true)),
+            Activity::Busy
+        );
+        assert_eq!(
+            companion_activity_of(&Target::Local, Some(false)),
+            Activity::Idle
+        );
+    }
+
+    // --- site 21 + click-to-move -------------------------------------------
+
+    #[test]
+    fn a_click_on_an_attached_pane_starts_neither_gesture() {
+        // These are EXACTLY the field values of the placeholder snapshot
+        // `from_parts` builds and an attached pane never replaces: no mouse
+        // tracking, normal buffer, offset 0, no selection. Every
+        // click-to-move guard passes, so an implementation that ignored
+        // `attached` would answer MoveCursor and encode arrow keys from a
+        // phantom cursor.
+        assert_eq!(
+            click_gesture(true, false, false, 0, false),
+            ClickGesture::Ignore
+        );
+        assert_eq!(
+            click_gesture(false, false, false, 0, false),
+            ClickGesture::MoveCursor,
+            "the same inputs on a local pane must still move the cursor"
+        );
+    }
+
+    #[test]
+    fn an_attached_pane_ignores_a_click_whatever_its_local_grid_says() {
+        for &mouse_tracking in &[false, true] {
+            for &alt_screen in &[false, true] {
+                for &offset in &[0usize, 3] {
+                    for &has_selection in &[false, true] {
+                        assert_eq!(
+                            click_gesture(true, mouse_tracking, alt_screen, offset, has_selection),
+                            ClickGesture::Ignore,
+                            "attached must ignore regardless of local grid state"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_click_chooses_move_or_selection_exactly_as_before() {
+        // Mirrors the pre-Task-4 guard: prompt row only, at the bottom, no
+        // selection, no app mouse tracking, normal buffer.
+        assert_eq!(
+            click_gesture(false, false, false, 0, false),
+            ClickGesture::MoveCursor
+        );
+        assert_eq!(
+            click_gesture(false, true, false, 0, false),
+            ClickGesture::StartSelection
+        );
+        assert_eq!(
+            click_gesture(false, false, true, 0, false),
+            ClickGesture::StartSelection
+        );
+        assert_eq!(
+            click_gesture(false, false, false, 1, false),
+            ClickGesture::StartSelection
+        );
+        assert_eq!(
+            click_gesture(false, false, false, 0, true),
+            ClickGesture::StartSelection
+        );
+    }
+
+    // --- the "[process exited]" overlay ------------------------------------
+
+    #[test]
+    fn an_attached_pane_never_shows_the_local_process_exited_overlay() {
+        // `snapshot.exited` describes THIS Mac. The wire carries no exit
+        // signal at protocol 2, so the honest answer for an attached pane is
+        // "say nothing", never "say the local thing".
+        assert_eq!(exit_notice(true, true), ExitNotice::None);
+        assert_eq!(exit_notice(true, false), ExitNotice::None);
+    }
+
+    #[test]
+    fn a_local_pane_still_shows_the_overlay_exactly_when_its_process_exited() {
+        assert_eq!(exit_notice(false, true), ExitNotice::LocalProcessExited);
+        assert_eq!(exit_notice(false, false), ExitNotice::None);
+    }
+
+    // --- the cursor overlay colour -----------------------------------------
+
+    #[test]
+    fn a_local_panes_cursor_colour_is_the_theme_value_untouched() {
+        // Even a theme whose own cursor barely contrasts with its own
+        // background must come through verbatim: recolouring it would
+        // change a LOCAL pane.
+        assert_eq!(cursor_color(0x1c1c1c, 0x1a1a1a, false), 0x1c1c1c);
+        assert_eq!(cursor_color(0xf0f0f0, 0x101010, false), 0xf0f0f0);
+    }
+
+    #[test]
+    fn an_attached_panes_cursor_is_pushed_clear_of_the_broadcasters_background() {
+        // The cursor is drawn over the BROADCASTER's canvas, so it must be
+        // legible against that, not against the viewer's theme background —
+        // the same reasoning as D5's translucency ruling.
+        let vanishing = cursor_color(0x1c1c1c, 0x1a1a1a, true);
+        assert_ne!(
+            vanishing, 0x1c1c1c,
+            "a cursor that would vanish into the broadcaster's background must be boosted"
+        );
+        // Already-legible pairs pass through, so an attached pane keeps the
+        // viewer's cursor identity wherever it works.
+        assert_eq!(cursor_color(0xf0f0f0, 0x101010, true), 0xf0f0f0);
+    }
+
+    // --- the IME anchor -----------------------------------------------------
+
+    #[test]
+    fn the_ime_anchor_reports_the_wire_cursor_at_the_live_bottom() {
+        let wire = snapshot(4, 3, Some((5, 2)));
+        assert_eq!(attached_cursor_cell(&wire, 0), Some((5, 2)));
+    }
+
+    #[test]
+    fn the_ime_anchor_offers_no_cell_at_all_once_scrolled_back() {
+        // Task 3 established that a scrolled-back attached frame paints NO
+        // cursor. An anchor at a cursor nobody can see is a phantom.
+        let wire = snapshot(4, 3, Some((5, 2)));
+        assert_eq!(attached_cursor_cell(&wire, 1), None);
+        assert_eq!(attached_cursor_cell(&wire, 4), None);
+    }
+
+    #[test]
+    fn the_ime_anchor_ignores_an_offset_no_history_can_satisfy() {
+        // No history means offset 0 after clamping, so the live cursor is
+        // still the right anchor.
+        let wire = snapshot(0, 3, Some((1, 1)));
+        assert_eq!(attached_cursor_cell(&wire, 9), Some((1, 1)));
+    }
+
+    #[test]
+    fn the_ime_anchor_never_disagrees_with_the_cursor_actually_painted() {
+        // The whole point of the fix: the candidate window must sit where
+        // the cursor IS. Asserting the two functions agree across every
+        // reachable offset is what stops them drifting apart later.
+        for history in [0usize, 1, 4] {
+            for cursor in [None, Some((0u16, 0u16)), Some((5, 2))] {
+                let wire = snapshot(history, 3, cursor);
+                for offset in 0..=history + 2 {
+                    assert_eq!(
+                        attached_cursor_cell(&wire, offset),
+                        attached_paint_frame(&wire, offset).cursor,
+                        "history={history} cursor={cursor:?} offset={offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- site 19: the wheel, which is what makes scrollback reachable -------
+
+    #[test]
+    fn the_wheel_scrolls_an_attached_pane_back_into_history() {
+        assert_eq!(attached_scroll_after_wheel(0, 3, 10), 3);
+        assert_eq!(attached_scroll_after_wheel(3, 2, 10), 5);
+    }
+
+    #[test]
+    fn the_wheel_stops_at_the_oldest_row_it_has() {
+        assert_eq!(attached_scroll_after_wheel(8, 5, 10), 10);
+        assert_eq!(
+            attached_scroll_after_wheel(0, 7, 0),
+            0,
+            "no history means nothing to scroll back into"
+        );
+    }
+
+    #[test]
+    fn the_wheel_never_scrolls_past_the_live_bottom() {
+        assert_eq!(attached_scroll_after_wheel(2, -5, 10), 0);
+        assert_eq!(
+            attached_scroll_after_wheel(0, -1, 10),
+            0,
+            "must not underflow below the live window"
+        );
+    }
+
+    #[test]
+    fn the_wheels_sign_convention_matches_the_drag_autoscrolls() {
+        // The brief fixes the convention by pointing at `drag_scroll_lines`:
+        // positive means "toward history". Feeding its own output in rather
+        // than restating the sign is what makes this a check and not a
+        // duplicate of the implementation.
+        let above_top = drag_scroll_lines(0.0, 100.0, 300.0);
+        let below_bottom = drag_scroll_lines(400.0, 100.0, 300.0);
+        assert!(above_top > 0 && below_bottom < 0, "fixture sanity");
+        assert!(
+            attached_scroll_after_wheel(5, above_top, 20) > 5,
+            "dragging above the top edge must reveal older rows"
+        );
+        assert!(
+            attached_scroll_after_wheel(5, below_bottom, 20) < 5,
+            "dragging below the bottom edge must return toward the live screen"
+        );
+    }
+
+    // --- the re-clamp on frame arrival -------------------------------------
+
+    #[test]
+    fn an_arriving_frame_clamps_the_offset_against_history_only() {
+        // history 3, live rows 5. An implementation that clamped against
+        // `history + rows` (or against `rows`) would answer 6 or 5; only
+        // "history" answers 3.
+        let wire = snapshot(3, 5, None);
+        assert_eq!(scroll_after_frame(6, &wire), 3);
+        assert_eq!(clamp_attached_offset(wire.history.len(), 6), 3);
+    }
+
+    #[test]
+    fn an_arriving_frame_leaves_a_satisfiable_offset_alone() {
+        let wire = snapshot(10, 3, None);
+        assert_eq!(scroll_after_frame(4, &wire), 4);
+    }
+
+    #[test]
+    fn a_cleared_broadcaster_truncates_the_offset_and_it_does_not_spring_back() {
+        // The decision this task owns. `clear` on the broadcaster drops
+        // history to zero: the viewer lands at the live bottom. When 150
+        // rows regrow, a viewer that had kept the raw offset would silently
+        // jump back to 150-rows-scrolled with no user action. Persisting the
+        // clamp is what prevents that.
+        let mut offset = 120usize;
+        offset = scroll_after_frame(offset, &snapshot(0, 24, None));
+        assert_eq!(offset, 0, "a cleared screen puts the viewer at the bottom");
+        offset = scroll_after_frame(offset, &snapshot(150, 24, None));
+        assert_eq!(
+            offset, 0,
+            "regrown history must not silently restore the old scroll position"
         );
     }
 }
