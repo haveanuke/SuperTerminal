@@ -254,12 +254,22 @@ The verified sixteen, with their enclosing functions: `cwd()` 481,
   broadcaster-owned rather than letting a resize silently do nothing.
 - **Needs a target/attachment-aware answer:** `foreground_activity()` (513),
   `status_activity()` (549), `shutdown()` (578), `write_self()` (627),
-  probably `scroll_to_bottom_on_input()` (932), and **`has_live_shell()` (496)**.
-  That last one is the site the phantom hid, and it is not cosmetic: it gates the
-  folder picker's `cd` at `workspace/mod.rs:2270`. Left as `None -> false`, a user
-  picks a folder for an attached pane and NOTHING HAPPENS, with no explanation —
-  the same silent-no-op failure this task exists to prevent. A remote pane's shell
-  liveness is the ATTACHMENT's liveness, not the absence of a local session.
+  probably `scroll_to_bottom_on_input()` (932), and `has_live_shell()` (496).
+
+  **CORRECTION — an earlier version of this brief was wrong about why.** It
+  claimed `has_live_shell()` gates the folder picker's `cd`, so an attached pane
+  would swallow it silently. That is false: the guard at `workspace/mod.rs:2270`
+  is `has_live_shell() && may_write_cd(target, activity)`, and `may_write_cd` is
+  `target.is_local() && activity.is_idle()`. A remote pane fails `is_local()`, so
+  the arm cannot fire whatever `has_live_shell()` returns — and the very next arm
+  catches remote panes deliberately, pinned by
+  `the_folder_picker_refuses_a_remote_pane_even_when_idle`. The claimed
+  silent-swallowed-cd never existed.
+
+  Change `has_live_shell()` anyway, because it is wrong BY NAME — a remote pane's
+  shell liveness is its attachment's liveness, not the absence of a local session
+  — but it is inert at every consumer today. Do not cite it as a fixed
+  user-visible bug.
 - **Plausible-but-wrong if left to return `None -> false/idle`:**
   `foreground_busy()` (501) through `companion_busy()`/`companion_activity()`
   (526/541). A remote pane would look IDLE rather than unknown or peer-reported —
@@ -336,6 +346,13 @@ not the literal token.
 
 ### Task 5: Typing into a remote terminal
 
+**Carried from the Task 4 review — do not lose this:** `bracketed_paste` is a
+second mode boolean the local encoder reads (`pane.rs`'s paste path), alongside
+`app_cursor_mode`. Both are on the wire. A paste into an attached pane that
+ignores the broadcaster's bracketed-paste mode will submit pasted text as
+though typed, which for a multi-line paste means running every line. Take it
+from the WIRE snapshot, not from the local placeholder.
+
 **Files:**
 - Modify: `native/src/pane.rs`
 
@@ -366,6 +383,13 @@ Test the encode-and-route decision as a pure function. The gpui event plumbing i
 
 ### Task 6: Activity, and the stale-wins rule
 
+**Carried from the Task 4 review:** protocol 2 has NO exit signal. An attached
+pane whose broadcaster's shell exits keeps showing its last frame indefinitely —
+a dead terminal that looks alive. Freshness alone does not cover it: a peer that
+is still serving frames for an exited session is fresh and wrong. Decide the
+signal (a session dropping out of `/sessions` is the cheapest candidate, since
+this task already polls it) and close the pane's state on it.
+
 **Files:**
 - Modify: `native/src/pane.rs`, `native/src/workspace/`
 - Create: a per-peer session-list poller
@@ -390,6 +414,16 @@ The combining function is pure — test it exhaustively over freshness × report
 ---
 
 ### Task 7: Opening one, and discharging D3e
+
+**Carried from the Task 4 review:** the degraded list in this task names "no
+selection, no search, no mouse reporting" but omits **Cmd+click URLs**.
+`url_at` is a silent no-op on an attached pane. Note that the reasoning
+recorded during Task 4 — that wire runs cannot be reassembled into row text —
+is too strong: `WireRun` carries both `col` and `width`, which is enough to
+blit runs into a column-indexed row and pad the gaps, so the concatenation
+hazard is avoidable. Either implement it or add it to D5 as a stated limit, but
+do not leave it as an unowned silent no-op: a click that does nothing with no
+explanation is the failure mode this phase exists to prevent.
 
 **Files:**
 - Modify: `native/src/workspace/`

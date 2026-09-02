@@ -1307,12 +1307,14 @@ impl Workspace {
                     )),
             )
             .child(self.hint(hints::PEER_CANDIDATES))
-            .children(
-                candidates_empty.then(|| self.hint("Nothing yet. Both Macs need Tailscale running and SuperTerminal open.")),
-            )
+            .children(candidates_empty.then(|| {
+                self.hint("Nothing yet. Both Macs need Tailscale running and SuperTerminal open.")
+            }))
             .children(candidate_rows)
             .child(self.group_label("paired"))
-            .children(peers_empty.then(|| self.hint("None yet. Pair a Mac above to start sharing terminals with it.")))
+            .children(peers_empty.then(|| {
+                self.hint("None yet. Pair a Mac above to start sharing terminals with it.")
+            }))
             .children(peer_rows)
             .child(self.hint(hints::PAIRED_PEERS))
             .children(pairing_panel)

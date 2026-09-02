@@ -2259,7 +2259,25 @@ impl TerminalPane {
         // LOCAL grid, so an attached pane refuses both — see
         // [`click_gesture`] for why click-to-move is the dangerous half.
         let gesture = click_gesture(
-            self.attached_frame.is_some(),
+            // NOT `attached_frame.is_some()`. That asks "has a frame
+            // arrived", and a remote pane between attaching and its first
+            // frame answers NO — taking the local branch and re-encoding
+            // arrows from the placeholder cursor at (0,0), which is the very
+            // bug this guard exists to stop. The placeholder passes every
+            // other guard by construction (`from_parts`: cursor (0,0), no
+            // selection, no mouse tracking, no alt screen, zero offset), so
+            // that window is reachable rather than theoretical.
+            //
+            // `!is_local()` asks the question that actually matters. It is
+            // strictly stronger than the old spelling today, since only
+            // `TerminalPane::dead` builds a remote pane and those carry no
+            // session.
+            //
+            // NOTE: which expression is passed here is wiring, not logic —
+            // `click_gesture` itself is covered by tests, but this argument
+            // is verified by reading. There is no gpui harness to reach
+            // inside `render`.
+            !self.target.is_local(),
             snapshot.mouse_tracking,
             snapshot.alt_screen,
             snapshot.display_offset,
@@ -3277,6 +3295,7 @@ mod attached_honesty_tests {
         drag_scroll_lines, exit_notice, input_route, may_publish_to_companion, scroll_after_frame,
         shell_is_live, ClickGesture, ExitNotice, InputRoute,
     };
+
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
     use superterminal_core::activity::Activity;
