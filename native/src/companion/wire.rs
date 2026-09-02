@@ -55,6 +55,28 @@ pub struct WireSnapshot {
 pub struct WireCursor {
     pub col: u16,
     pub row: u16,
+    /// The broadcaster's cursor SHAPE — "bar", "block" or "underline".
+    /// `Hidden` never reaches here: a hidden cursor is `cursor: null`.
+    ///
+    /// Carried because shape is load-bearing, not decorative: an editor in
+    /// insert mode shows a bar and in normal mode a block, so an attached
+    /// pane that always drew one shape would silently break the mode
+    /// indicator its user reads constantly. Added alongside `background`
+    /// in the same unshipped protocol 2, which is what makes it one field
+    /// rather than a second bump.
+    pub shape: String,
+}
+
+/// The wire spelling of a [`CursorStyle`]. `Hidden` has no spelling — it is
+/// represented by omitting the cursor entirely — so it maps to `None` and
+/// the caller must have already filtered it out.
+pub fn cursor_shape(style: CursorStyle) -> Option<&'static str> {
+    match style {
+        CursorStyle::Bar => Some("bar"),
+        CursorStyle::Block => Some("block"),
+        CursorStyle::Underline => Some("underline"),
+        CursorStyle::Hidden => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -197,6 +219,9 @@ pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireS
         (Some(row), style) if style != CursorStyle::Hidden => Some(WireCursor {
             col: snapshot.cursor.col as u16,
             row: *row as u16,
+            // The guard above already excluded `Hidden`, the only style
+            // with no wire spelling.
+            shape: cursor_shape(style).unwrap_or("bar").to_string(),
         }),
         _ => None,
     };
@@ -405,8 +430,39 @@ mod tests {
         let s3 = snap(vec![vec![cell('a', style())]]);
         assert_eq!(
             serialize_snapshot(&s3, theme()).cursor,
-            Some(WireCursor { col: 0, row: 0 })
+            Some(WireCursor {
+                col: 0,
+                row: 0,
+                // `snap`'s cursor is a Block, and the shape is carried
+                // rather than defaulted — a literal here, so a regression
+                // that dropped the real style and sent a fixed spelling
+                // would fail rather than quietly agree.
+                shape: "block".into(),
+            })
         );
+    }
+
+    #[test]
+    fn every_visible_cursor_style_has_a_distinct_wire_spelling() {
+        // Shape is only worth carrying if the spellings differ: if two
+        // styles collapsed to one string, an attached pane could not tell
+        // insert mode from normal mode, which is the reason this field
+        // exists at all.
+        for (cursor_style, expected) in [
+            (CursorStyle::Bar, "bar"),
+            (CursorStyle::Block, "block"),
+            (CursorStyle::Underline, "underline"),
+        ] {
+            let mut s = snap(vec![vec![cell('a', style())]]);
+            s.cursor.style = cursor_style;
+            assert_eq!(
+                serialize_snapshot(&s, theme()).cursor.map(|c| c.shape),
+                Some(expected.to_string()),
+                "{cursor_style:?} must have its own spelling"
+            );
+        }
+        // Hidden has no spelling: it is represented by omitting the cursor.
+        assert_eq!(cursor_shape(CursorStyle::Hidden), None);
     }
 
     #[test]

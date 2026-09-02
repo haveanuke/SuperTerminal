@@ -156,6 +156,27 @@ absent; a wide character and its spacer.
 
 ### Task 3: An attached view model with real scrollback
 
+**Carried from the Task 2 review — two things this task must settle, not
+inherit silently:**
+
+1. **Translucency.** `wire_paint_frame` gives every run a concrete `bg`, so on a
+   pane with `translucent == true` (container painted `rgba(0)` so a background
+   image shows through) an attached pane would paint an opaque slab over the
+   image. The ruling is recorded in D5: an attached pane is NOT translucent — it
+   paints the broadcaster's background, because the foregrounds it received were
+   chosen against THAT background. Wire it so the container paints
+   `frame.background` for an attached pane regardless of the translucency
+   setting, and test that the setting does not change an attached pane's
+   container colour.
+
+2. **The snapshot JSON cache is keyed on revision, not theme** (`hub.rs`,
+   `snapshot_json`). A theme change on the broadcaster does not bump the
+   revision, so a QUIET session keeps serving its old cached JSON — and now that
+   the background travels in that JSON, an attached viewer would keep painting
+   the broadcaster's PREVIOUS background until the next output. Pre-existing and
+   invisible to the phone (it supplies its own `--bg`); this task is where it
+   becomes visible. Fix it or state why it can wait.
+
 **Files:**
 - Modify: `native/src/pane.rs`
 - Test: pure, inline

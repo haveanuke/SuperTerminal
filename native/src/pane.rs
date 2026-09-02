@@ -1095,6 +1095,13 @@ struct PaintFrame {
     /// all. Already collapses "hidden style" (local) or "omitted from the
     /// wire" (wire) into one `None` — the caller layers blink/focus on top.
     cursor: Option<(usize, usize)>,
+    /// The SHAPE to draw at `cursor`. Carried on the frame rather than read
+    /// back off the pane's own snapshot: for a wire frame the pane's
+    /// snapshot describes a terminal on another machine's screen, or is
+    /// empty, so reading the style from it would draw the local default
+    /// regardless of what the broadcaster is actually showing. Meaningless
+    /// when `cursor` is `None`.
+    cursor_style: CursorStyle,
 }
 
 /// Resolve a LOCAL snapshot into a [`PaintFrame`]: theme-resolved colors
@@ -1173,6 +1180,7 @@ fn local_paint_frame(
         background: theme.background,
         rows,
         cursor,
+        cursor_style: snapshot.cursor.style,
     }
 }
 
@@ -1217,10 +1225,19 @@ fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
         .cursor
         .as_ref()
         .map(|c| (c.col as usize, c.row as usize));
+    // An unrecognized spelling falls back to Bar rather than refusing the
+    // frame: a wrong cursor shape is a cosmetic flaw, and dropping the
+    // whole frame over one would blank a working terminal.
+    let cursor_style = match wire.cursor.as_ref().map(|c| c.shape.as_str()) {
+        Some("block") => CursorStyle::Block,
+        Some("underline") => CursorStyle::Underline,
+        _ => CursorStyle::Bar,
+    };
     PaintFrame {
         background,
         rows,
         cursor,
+        cursor_style,
     }
 }
 
@@ -1232,7 +1249,10 @@ fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
 #[cfg_attr(not(test), allow(dead_code))] // wired by Task 3's attached view
 fn parse_wire_hex(s: &str) -> u32 {
     let s = s.trim_start_matches('#');
-    if s.len() == 6 {
+    // `is_ascii_hexdigit` first because `from_str_radix` also accepts a
+    // leading `+`, which would let "#+abcde" decode as 0x0abcde instead of
+    // taking the documented black fallback.
+    if s.len() == 6 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         u32::from_str_radix(s, 16).unwrap_or(0)
     } else {
         0
@@ -1499,7 +1519,7 @@ impl Render for TerminalPane {
                 Some(if !focused {
                     d.w(cell_w).border_1().border_color(rgb(theme.cursor))
                 } else {
-                    match snapshot.cursor.style {
+                    match frame.cursor_style {
                         CursorStyle::Underline => {
                             d.w(cell_w).border_b_2().border_color(rgb(theme.cursor))
                         }
@@ -1775,7 +1795,7 @@ impl TerminalPane {
 mod tests {
     use super::{
         busy_dot, coalesce_runs, drag_scroll_lines, local_paint_frame, may_broadcast_locally,
-        wire_paint_frame, CellLook, Run, COMPANION_BUSY_WINDOW,
+        parse_wire_hex, wire_paint_frame, CellLook, Run, COMPANION_BUSY_WINDOW,
     };
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
@@ -2290,7 +2310,11 @@ mod tests {
     #[test]
     fn wire_frame_cursor_present_reports_its_position() {
         let mut wire = wire_snapshot(vec![], "#000000");
-        wire.cursor = Some(WireCursor { col: 5, row: 1 });
+        wire.cursor = Some(WireCursor {
+            col: 5,
+            row: 1,
+            shape: "bar".into(),
+        });
         assert_eq!(wire_paint_frame(&wire).cursor, Some((5, 1)));
     }
 
@@ -2305,11 +2329,62 @@ mod tests {
         // The broadcaster already folded the spacer into the run's width
         // (wire.rs's row_runs) — the adapter must not try to re-derive
         // per-glyph advance from it, only copy col/width/text through.
-        let wire = wire_snapshot(vec![vec![wire_run(0, 2, "個", "#ffffff", None)]], "#000000");
+        //
+        // The run MIXES widths on purpose: "a個b" is 3 chars spanning 4
+        // cells, so char count and cell count disagree and no per-glyph
+        // rule can recover which glyph took the extra one. A single wide
+        // glyph would not prove this — an implementation that split runs
+        // per character would still produce one run for "個" and pass.
+        let wire = wire_snapshot(
+            vec![vec![wire_run(0, 4, "a個b", "#ffffff", None)]],
+            "#000000",
+        );
         let frame = wire_paint_frame(&wire);
-        assert_eq!(frame.rows[0].len(), 1);
-        assert_eq!(frame.rows[0][0].text, "個");
-        assert_eq!(frame.rows[0][0].cells, 2);
+        assert_eq!(frame.rows[0].len(), 1, "the run must not be split");
+        assert_eq!(frame.rows[0][0].text, "a個b");
+        assert_eq!(frame.rows[0][0].cells, 4);
+        assert_ne!(
+            frame.rows[0][0].cells,
+            frame.rows[0][0].text.chars().count(),
+            "the fixture must keep cells and chars different, or it proves nothing"
+        );
+    }
+
+    #[test]
+    fn parse_wire_hex_decodes_a_well_formed_color_and_refuses_everything_else() {
+        // Tested directly, not only through wire_paint_frame: this is the
+        // one function that reads an arbitrary string off the network, so
+        // its contract deserves its own assertions.
+        assert_eq!(parse_wire_hex("#a1b2c3"), 0x00a1_b2c3);
+        assert_eq!(parse_wire_hex("a1b2c3"), 0x00a1_b2c3, "the # is optional");
+        assert_eq!(parse_wire_hex("#FFFFFF"), 0x00ff_ffff, "uppercase decodes");
+        for bad in [
+            "",
+            "#",
+            "#abc",
+            "#abcdefff",
+            "#gggggg",
+            "#+abcde",
+            "#-abcde",
+            "#  abcd",
+            "#日本語",
+        ] {
+            assert_eq!(parse_wire_hex(bad), 0, "{bad:?} must fall back to black");
+        }
+    }
+
+    #[test]
+    fn parse_wire_hex_never_panics_on_hostile_input() {
+        // These bytes arrive from ANOTHER MACHINE. A panic here would take
+        // down the render loop, so the contract is "always returns", not
+        // "returns something sensible".
+        for hostile in [
+            "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}",
+            "🙂🙂🙂",
+            &"f".repeat(10_000),
+        ] {
+            let _ = parse_wire_hex(hostile);
+        }
     }
 
     #[test]

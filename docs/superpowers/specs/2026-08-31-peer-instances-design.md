@@ -294,6 +294,15 @@ otherwise:
   guessing — a wrong guess would misplace every character after it on the
   row.
 
+- An attached pane is NOT translucent, even when the viewer has a background
+  image and translucency enabled. A local pane leaves default-background cells
+  unpainted so the image shows through; an attached pane must paint the
+  BROADCASTER's background instead, because the foreground colours it received
+  were chosen to contrast with that background and not with the viewer's image.
+  Showing the image through would restore exactly the unreadability that putting
+  `background` on the wire was meant to remove. Translucency is a local-pane
+  affordance; on an attached pane, readability wins.
+
 These are acceptable for a first cut ONLY because they are named. Each is a
 candidate for later work; none should surprise anyone.
 
