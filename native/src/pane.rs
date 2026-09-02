@@ -17,6 +17,7 @@ use gpui::{
 use crate::companion::wire::{WireRun, WireSnapshot};
 use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
+use crate::peer_client::attach::Attachment;
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use superterminal_core::activity::Activity;
 
@@ -74,8 +75,10 @@ pub struct TerminalPane {
     /// Latest frame received from an attached peer. `None` for every local
     /// pane, always — `render()` takes the exact pre-Task-3
     /// `local_paint_frame` path whenever this is `None`, so a local pane's
-    /// output is untouched. Nothing sets this to `Some` yet: a later task
-    /// populates it from the attachment's own `.latest()` snapshot.
+    /// output is untouched. Filled by the pump tick from
+    /// [`Attachment::latest`]; also `None` on a remote pane that has attached
+    /// but whose first frame has not landed yet, which is why nothing that
+    /// decides where INPUT goes may read it. See [`TerminalPane::views_remote`].
     attached_frame: Option<std::sync::Arc<WireSnapshot>>,
     /// Rows scrolled back from an attached peer's live bottom, LOCAL to
     /// this viewer only. Never sent to the broadcaster: D2 makes geometry
@@ -88,6 +91,20 @@ pub struct TerminalPane {
     /// gesture accumulates into a line instead of rounding to nothing on
     /// every event. See [`scroll_lines_from_delta`].
     scroll_accum: f32,
+    /// The live attachment this pane is a view of. `None` for every local
+    /// pane, and for a restored `Target::Remote` pane nothing has attached
+    /// yet. Read on the pump tick for newly arrived frames — `latest()` is
+    /// a mutex read, never a network call, so it is safe there; every
+    /// BLOCKING call this type offers happens on a thread of its own.
+    ///
+    /// Held (rather than only downgraded into the drain thread) because
+    /// dropping the pane must drop the attachment: its `Drop` shuts the
+    /// stream socket down, which is what wakes its background thread.
+    attachment: Option<std::sync::Arc<Attachment>>,
+    /// The outbound half of the same attachment: keystrokes leave the UI
+    /// thread through here and are sent on a thread of their own. See
+    /// [`PeerInput`].
+    peer_input: Option<PeerInput>,
     focus_handle: FocusHandle,
     theme: &'static Theme,
     font_family: SharedString,
@@ -369,6 +386,18 @@ impl TerminalPane {
                         pane.blink_on = !pane.blink_on;
                         cx.notify();
                     }
+                    // An attached pane's refresh is PUSHED by the frame that
+                    // arrived, not polled off a local grid — `take_dirty()`
+                    // answers "never dirty" forever with no session, and must
+                    // keep doing so (see `set_attached_frame`). This is the
+                    // hop from the attachment's own thread onto the UI one:
+                    // `latest()` takes a mutex and clones an `Arc`, and every
+                    // blocking call `Attachment` makes happens elsewhere.
+                    if let Some(frame) = pane.attachment.as_ref().and_then(|a| a.latest()) {
+                        if frame_is_new(pane.attached_frame.as_ref(), &frame) {
+                            pane.set_attached_frame(frame, cx);
+                        }
+                    }
                     let dirty = pane.session.as_ref().is_some_and(|s| s.take_dirty());
                     if dirty {
                         pane.last_activity = std::time::Instant::now();
@@ -449,6 +478,8 @@ impl TerminalPane {
             attached_frame: None,
             attached_scroll_offset: 0,
             scroll_accum: 0.0,
+            attachment: None,
+            peer_input: None,
             focus_handle: cx.focus_handle(),
             theme,
             font_family: font_family.into(),
@@ -627,15 +658,43 @@ impl TerminalPane {
         // it does still hold the last frame it received. Dropping it stops a
         // torn-down pane painting a terminal on another machine, and resets
         // the viewer's scroll window so a rebuilt pane starts at the live
-        // bottom. Closing the attachment's own stream lands with the
-        // `Attachment` field in Task 5.
+        // bottom.
         self.attached_frame = None;
         self.attached_scroll_offset = 0;
+        // Both peer threads are ENDED here, and neither is joined. Dropping
+        // the queue closes the channel, so the drain thread's `recv` fails
+        // and it stops; dropping the attachment runs its `Drop`, which shuts
+        // the stream socket down so its own thread's blocked read returns.
+        // Joining either would put a five-second `Attachment::send` on the UI
+        // thread, which is the exact stall this pane's queue exists to
+        // prevent — unlike `TermSession::shutdown`, whose handle the caller
+        // joins off-thread, there is nothing here worth waiting for.
+        self.peer_input = None;
+        self.attachment = None;
         self.session.take().map(TermSession::shutdown)
     }
 
-    /// Hand this pane the newest frame from its attachment. Task 5 calls
-    /// this from the attachment's own thread hop; nothing calls it yet.
+    /// Point this pane at a terminal on another machine: frames start
+    /// arriving on the pump tick, and input starts leaving through
+    /// [`PeerInput`]. Task 7 calls this on a freshly constructed
+    /// `Target::Remote` pane.
+    ///
+    /// The pane's own input route does NOT depend on this having been
+    /// called — see [`Self::views_remote`]. A remote pane with no attachment
+    /// drops its input rather than typing it into a local shell.
+    #[allow(dead_code)] // the workspace that attaches a pane arrives in Task 7
+    pub fn set_attachment(&mut self, attachment: std::sync::Arc<Attachment>) {
+        // The drain thread holds a WEAK reference, matching the lifecycle
+        // rule `attach.rs` already documents for its own thread: a strong one
+        // would keep the attachment — and its socket — alive for up to a
+        // full send deadline after the pane that owns it is gone.
+        self.peer_input = Some(PeerInput::spawn(std::sync::Arc::downgrade(&attachment)));
+        self.attachment = Some(attachment);
+    }
+
+    /// Hand this pane the newest frame from its attachment. Called from the
+    /// pump tick, which is where the attachment's background thread hands
+    /// off to the UI one.
     ///
     /// This is where an attached pane's FRESHNESS comes from. The pump's
     /// `take_dirty()` cannot supply it — there is no local grid to go dirty,
@@ -643,7 +702,6 @@ impl TerminalPane {
     /// because `dirty` also drives `process_events` and the companion
     /// publish. Refresh for an attached pane is therefore pushed by the
     /// arriving frame, not polled off a local session.
-    #[allow(dead_code)] // the attachment that calls this arrives in Task 5
     pub fn set_attached_frame(
         &mut self,
         frame: std::sync::Arc<WireSnapshot>,
@@ -709,21 +767,58 @@ impl TerminalPane {
     /// escapes). See [`input_route`] for why the destination is decided
     /// rather than inferred from "there happens to be a session".
     fn write_self(&self, bytes: Vec<u8>) {
-        match input_route(self.attached_frame.is_some(), self.session.is_some()) {
+        match input_route(self.views_remote(), self.session.is_some()) {
             InputRoute::LocalPty => {
                 if let Some(session) = &self.session {
                     session.write(bytes);
                 }
             }
-            // Dropped DELIBERATELY, not incidentally: there is no route to
-            // the remote PTY yet, and writing these into the local shell
-            // would type into the wrong machine. Task 5 replaces this arm
-            // with `Attachment::send`, hopped off the gpui path (`send()`
-            // blocks up to 5s).
-            InputRoute::Peer => {}
+            InputRoute::Peer => {
+                // ENQUEUE ONLY. `Attachment::send` is a blocking round trip
+                // with a five-second deadline and every caller of this
+                // function is on the gpui UI thread — key down, paste, IME
+                // commit, the auto-run timer, the workspace's `send_text`.
+                // See [`PeerInput`].
+                if let Some(peer_input) = &self.peer_input {
+                    peer_input.push(bytes);
+                }
+                // No queue means nothing has attached this pane yet (a
+                // restored `Target::Remote` pane). Dropping is the same
+                // deliberate answer this arm gave before there was any route
+                // at all: there is no terminal to type into, and the local
+                // shell — if this pane somehow had one — is the wrong
+                // machine.
+            }
             // No shell at all: the spawn failed, or the process has exited.
             InputRoute::Nowhere => {}
         }
+    }
+
+    /// Whether this pane is a view of a terminal on ANOTHER machine.
+    ///
+    /// NOT `attached_frame.is_some()`. That asks "has a frame arrived", and
+    /// a remote pane between attaching and its first frame answers NO —
+    /// which would route its keystrokes down the LOCAL branch, into a shell
+    /// on this Mac. A wrong-machine keystroke is not a dropped one.
+    ///
+    /// The same question, asked the same way, gates click-to-move
+    /// (`click_gesture`) and the encoder's mode booleans
+    /// ([`Self::input_modes`]); all three must agree, so they read one
+    /// method rather than three spellings.
+    fn views_remote(&self) -> bool {
+        !self.target.is_local()
+    }
+
+    /// The mode booleans to encode this pane's input with. See
+    /// [`input_modes`] for why they cannot come from `self.snapshot` on a
+    /// pane that views another machine.
+    fn input_modes(&self) -> InputModes {
+        input_modes(
+            self.views_remote(),
+            self.attached_frame.as_deref(),
+            self.snapshot.app_cursor_mode,
+            self.snapshot.bracketed_paste,
+        )
     }
 
     pub fn set_search(&mut self, needle: Option<&str>, cx: &mut Context<Self>) {
@@ -1026,14 +1121,20 @@ impl TerminalPane {
             if m.platform && ks.key == "v" {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     // Same framing as phone Send: paste-aware TUIs must see
-                    // a paste, not a timing-dependent burst of keystrokes.
-                    let bytes =
-                        crate::companion::input::text_bytes(&text, self.snapshot.bracketed_paste);
-                    self.write(bytes);
+                    // a paste, not a timing-dependent burst of keystrokes —
+                    // and for a pane viewing another machine, the mode that
+                    // decides that is the BROADCASTER's, off the wire. `None`
+                    // means it is not knowable yet, and an unframed
+                    // multi-line paste runs every line of itself, so there is
+                    // no paste at all rather than a guessed one.
+                    if let Some(bracketed_paste) = self.input_modes().bracketed_paste {
+                        let bytes = crate::companion::input::text_bytes(&text, bracketed_paste);
+                        self.write(bytes);
+                    }
                 }
                 return;
             }
-            if let Some(bytes) = keys::key_to_bytes(&input, self.snapshot.app_cursor_mode, true) {
+            if let Some(bytes) = keys::key_to_bytes(&input, self.input_modes().app_cursor, true) {
                 self.write(bytes);
                 self.scroll_to_bottom_on_input(cx);
                 return;
@@ -1045,7 +1146,7 @@ impl TerminalPane {
 
         // Alt+printable with option-as-meta.
         if m.alt {
-            if let Some(bytes) = keys::key_to_bytes(&input, self.snapshot.app_cursor_mode, true) {
+            if let Some(bytes) = keys::key_to_bytes(&input, self.input_modes().app_cursor, true) {
                 self.write(bytes);
                 self.scroll_to_bottom_on_input(cx);
                 return;
@@ -1159,6 +1260,183 @@ fn input_route(attached: bool, has_local_session: bool) -> InputRoute {
         InputRoute::LocalPty
     } else {
         InputRoute::Nowhere
+    }
+}
+
+/// The two terminal modes the input encoders read.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct InputModes {
+    /// DECCKM, for [`keys::key_to_bytes`].
+    app_cursor: bool,
+    /// DECSET 2004, for [`crate::companion::input::text_bytes`]. `None`
+    /// means the mode is not knowable, so there must be no paste at all.
+    bracketed_paste: Option<bool>,
+}
+
+/// Resolve those two modes for the terminal that will actually RECEIVE the
+/// bytes.
+///
+/// D1: an attached pane runs the same encoders as a local one — that is why
+/// the peer endpoint takes raw bytes instead of a symbolic vocabulary, and
+/// it is the reason only these two inputs move. Both describe the
+/// BROADCASTER's terminal, and on a pane with no local session
+/// `self.snapshot` is the empty placeholder `from_parts` built, whose
+/// answers are plausible and wrong:
+///
+/// * `app_cursor` wrong sends CSI arrows where the remote application
+///   expects SS3 — wrong in exactly the applications where arrows matter.
+/// * `bracketed_paste` wrong is worse than wrong. An unframed multi-line
+///   paste is submitted as though typed, so every newline in it RUNS a line
+///   on someone else's machine.
+///
+/// Keyed on `views_remote` (the pane's target), NOT on "a frame has
+/// arrived": between attaching and the first frame the broadcaster's modes
+/// are UNKNOWN, and the placeholder's `false`/`false` is exactly the
+/// plausible wrong answer this function exists to refuse. `app_cursor` has a
+/// defensible answer there — `false` IS a terminal's reset state, and a
+/// mis-encoded arrow is recoverable — so it is given one. Bracketed paste
+/// has none, so it is offered as `None` and the paste is refused rather than
+/// run.
+fn input_modes(
+    views_remote: bool,
+    frame: Option<&WireSnapshot>,
+    local_app_cursor: bool,
+    local_bracketed_paste: bool,
+) -> InputModes {
+    if !views_remote {
+        return InputModes {
+            app_cursor: local_app_cursor,
+            bracketed_paste: Some(local_bracketed_paste),
+        };
+    }
+    match frame {
+        Some(frame) => InputModes {
+            app_cursor: frame.app_cursor,
+            bracketed_paste: Some(frame.bracketed_paste),
+        },
+        None => InputModes {
+            app_cursor: false,
+            bracketed_paste: None,
+        },
+    }
+}
+
+/// Whether a frame read off the attachment is a DIFFERENT one from the frame
+/// the pane is already painting.
+///
+/// Identity, not equality. `Attachment::record_frame` mints a fresh `Arc`
+/// for every frame parsed off the wire, so pointer identity answers exactly
+/// the question the pump is asking sixty times a second: has another frame
+/// landed since the last tick. Value equality answers a different question
+/// and gets it wrong twice — it would deep-compare a whole grid on every
+/// tick, and it would report a broadcaster that republished an identical
+/// screen as NO arrival, leaving `last_activity` (and, in Task 6, the
+/// attachment's freshness) aging as though the peer had gone quiet.
+fn frame_is_new(
+    painted: Option<&std::sync::Arc<WireSnapshot>>,
+    arrived: &std::sync::Arc<WireSnapshot>,
+) -> bool {
+    match painted {
+        Some(painted) => !std::sync::Arc::ptr_eq(painted, arrived),
+        None => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typing into a terminal on another machine.
+//
+// `Attachment::send` is a BLOCKING one-shot round trip with a five-second
+// deadline (`attach.rs`'s `SEND_DEADLINE`). Every path that puts bytes into
+// a pane runs on the gpui UI thread — `on_key_down`, the Cmd+V paste, the
+// IME's `replace_text_in_range`, `handle_click`'s click-to-move, the pump's
+// auto-run timer, and the workspace's `send_text` — so not one of them may
+// call it. A single peer that accepts a connection and then stalls would
+// otherwise freeze the whole app, every LOCAL pane included, for five
+// seconds per keystroke.
+//
+// So the UI thread only ever enqueues, and one thread per attached pane
+// drains the queue and makes the blocking call.
+// ---------------------------------------------------------------------------
+
+/// Where an attached pane's outbound bytes go. In production this is a
+/// `Weak<Attachment>`; the indirection exists so the drain loop below can be
+/// driven end to end by a test with no peer to talk to.
+trait PeerSink: Send + 'static {
+    /// Deliver one batch of PTY bytes. Returns whether the DESTINATION is
+    /// still there; `false` ends the drain loop for good. One failed round
+    /// trip is not that — a peer that is merely unreachable right now must
+    /// keep being tried, or a single dropped packet would silence the pane
+    /// for the rest of its life.
+    fn deliver(&self, bytes: &[u8]) -> bool;
+}
+
+impl PeerSink for std::sync::Weak<Attachment> {
+    fn deliver(&self, bytes: &[u8]) -> bool {
+        match self.upgrade() {
+            Some(attachment) => {
+                // Whether the peer ACCEPTED the bytes is deliberately not
+                // acted on here: `send` succeeding or failing says nothing
+                // about the attachment's health (`attach.rs` says so at the
+                // method itself), and health is Task 6's, reported from
+                // frames arriving rather than from one request's fate.
+                let _ = attachment.send(bytes);
+                true
+            }
+            // The pane was torn down while this batch was queued: there is
+            // no terminal left to type into.
+            None => false,
+        }
+    }
+}
+
+/// A pane's outbound keystroke queue. Dropping it ends the drain thread —
+/// once the last sender is gone the receiver's `recv` fails.
+struct PeerInput {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl PeerInput {
+    fn spawn(sink: impl PeerSink) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // A failed spawn leaves `tx` with no receiver, which `push` already
+        // handles: the bytes are dropped rather than typed anywhere wrong.
+        let _ = std::thread::Builder::new()
+            .name("peer-input".into())
+            .spawn(move || drain_peer_input(rx, sink));
+        Self { tx }
+    }
+
+    /// Enqueue and return. Returning immediately is the entire point: this
+    /// runs on the UI thread and the send it feeds does not.
+    fn push(&self, bytes: Vec<u8>) {
+        let _ = self.tx.send(bytes);
+    }
+}
+
+/// Drain the queue, making the blocking call on THIS thread.
+///
+/// Everything already queued rides one request. That is not only an
+/// optimisation: `deliver` can block for a full send deadline against a
+/// stalled peer, and without coalescing a user typing through that stall
+/// builds a backlog that then drains one five-second round trip at a time,
+/// arriving minutes later. Concatenating is safe because a PTY takes a byte
+/// STREAM — n sequential writes and one concatenated write deliver identical
+/// bytes in identical order.
+///
+/// One consequence, stated rather than left to be discovered: bytes typed
+/// during a stall arrive in a single chunk, which an application that
+/// guesses "paste" from read-chunk size may read as one. It is reachable
+/// only while a peer is stalling, and the alternative — a backlog draining
+/// at one keystroke per round trip — is worse.
+fn drain_peer_input(rx: std::sync::mpsc::Receiver<Vec<u8>>, sink: impl PeerSink) {
+    while let Ok(first) = rx.recv() {
+        let mut batch = first;
+        while let Ok(more) = rx.try_recv() {
+            batch.extend_from_slice(&more);
+        }
+        if !sink.deliver(&batch) {
+            return;
+        }
     }
 }
 
@@ -2259,25 +2537,21 @@ impl TerminalPane {
         // LOCAL grid, so an attached pane refuses both — see
         // [`click_gesture`] for why click-to-move is the dangerous half.
         let gesture = click_gesture(
-            // NOT `attached_frame.is_some()`. That asks "has a frame
-            // arrived", and a remote pane between attaching and its first
-            // frame answers NO — taking the local branch and re-encoding
-            // arrows from the placeholder cursor at (0,0), which is the very
-            // bug this guard exists to stop. The placeholder passes every
-            // other guard by construction (`from_parts`: cursor (0,0), no
-            // selection, no mouse tracking, no alt screen, zero offset), so
-            // that window is reachable rather than theoretical.
-            //
-            // `!is_local()` asks the question that actually matters. It is
-            // strictly stronger than the old spelling today, since only
-            // `TerminalPane::dead` builds a remote pane and those carry no
-            // session.
+            // NOT `attached_frame.is_some()`: a remote pane between
+            // attaching and its first frame would answer NO and take the
+            // local branch, re-encoding arrows from the placeholder cursor
+            // at (0,0) — the very bug this guard exists to stop, and since
+            // Task 5 those arrows have somewhere to go. The placeholder
+            // passes every other guard by construction (`from_parts`: cursor
+            // (0,0), no selection, no mouse tracking, no alt screen, zero
+            // offset), so that window is reachable rather than theoretical.
+            // See [`Self::views_remote`].
             //
             // NOTE: which expression is passed here is wiring, not logic —
             // `click_gesture` itself is covered by tests, but this argument
             // is verified by reading. There is no gpui harness to reach
             // inside `render`.
-            !self.target.is_local(),
+            self.views_remote(),
             snapshot.mouse_tracking,
             snapshot.alt_screen,
             snapshot.display_offset,
@@ -2288,13 +2562,18 @@ impl TerminalPane {
         }
         if gesture == ClickGesture::MoveCursor {
             if let Some(cursor_row) = snapshot.cursor.row {
+                // The mode goes through [`Self::input_modes`] like every
+                // other encoder call, even though this arm is reachable only
+                // on a local pane (where it is the same value): the day
+                // click-to-move learns to read the wire's cursor, the mode
+                // beside it must not still be the placeholder's.
                 if let Some(bytes) = keys::click_to_move_bytes(
                     col,
                     row,
                     snapshot.cursor.col,
                     cursor_row,
                     snapshot.cols.max(1),
-                    snapshot.app_cursor_mode,
+                    self.input_modes().app_cursor,
                 ) {
                     self.write(bytes);
                     cx.notify();
@@ -3652,5 +3931,301 @@ mod attached_honesty_tests {
             offset, 0,
             "regrown history must not silently restore the old scroll position"
         );
+    }
+}
+
+#[cfg(test)]
+mod attached_input_tests {
+    use super::{drain_peer_input, frame_is_new, input_modes, InputModes, PeerSink};
+    use crate::companion::input::text_bytes;
+    use crate::companion::wire::{WireRun, WireSnapshot};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A received frame carrying the broadcaster's two mode booleans. Every
+    /// other field is filler: this module is about which SIDE's modes the
+    /// encoder reads, not about painting.
+    fn frame(app_cursor: bool, bracketed_paste: bool) -> WireSnapshot {
+        WireSnapshot {
+            cols: 4,
+            lines: 1,
+            cursor: None,
+            app_cursor,
+            rows: vec![vec![WireRun {
+                col: 0,
+                width: 4,
+                text: "rows".to_string(),
+                fg: "#c0caf5".to_string(),
+                bg: None,
+                b: false,
+                i: false,
+                u: false,
+            }]],
+            history: Vec::new(),
+            bracketed_paste,
+            mouse_tracking: false,
+            background: "#1a1b26".to_string(),
+        }
+    }
+
+    // --- which side's modes the encoder reads ------------------------------
+
+    #[test]
+    fn a_local_pane_encodes_from_its_own_two_mode_booleans() {
+        assert_eq!(
+            input_modes(false, None, true, false),
+            InputModes {
+                app_cursor: true,
+                bracketed_paste: Some(false)
+            }
+        );
+        assert_eq!(
+            input_modes(false, None, false, true),
+            InputModes {
+                app_cursor: false,
+                bracketed_paste: Some(true)
+            }
+        );
+    }
+
+    #[test]
+    fn an_attached_pane_encodes_from_the_broadcasters_modes_not_its_own() {
+        // Both fixtures set the WIRE's two booleans to the opposite of the
+        // LOCAL pair, and to the opposite of each other. An implementation
+        // that read the local placeholder fails; so does one that swapped
+        // `app_cursor` for `bracketed_paste` while reading the wire; so does
+        // one that hard-codes either answer.
+        assert_eq!(
+            input_modes(true, Some(&frame(true, false)), false, true),
+            InputModes {
+                app_cursor: true,
+                bracketed_paste: Some(false)
+            }
+        );
+        assert_eq!(
+            input_modes(true, Some(&frame(false, true)), true, false),
+            InputModes {
+                app_cursor: false,
+                bracketed_paste: Some(true)
+            }
+        );
+    }
+
+    #[test]
+    fn a_remote_pane_with_no_frame_yet_refuses_to_paste_rather_than_guess() {
+        // The window between attaching and the first frame. The local
+        // placeholder (`from_parts`) says `false`/`false`, and both are
+        // plausible wrong answers. A wrong `app_cursor` sends CSI arrows
+        // where SS3 was wanted — recoverable, and `false` IS the terminal's
+        // reset state. A wrong `bracketed_paste` is not recoverable: an
+        // unframed multi-line paste RUNS every line on someone else's
+        // machine.
+        let modes = input_modes(true, None, false, true);
+        assert_eq!(
+            modes.bracketed_paste, None,
+            "an unknown paste mode must refuse the paste, never borrow the local one"
+        );
+        assert!(!modes.app_cursor);
+    }
+
+    #[test]
+    fn a_multi_line_paste_into_a_bracketed_broadcaster_is_framed_not_run_line_by_line() {
+        // Composes the two production functions exactly as the paste handler
+        // does. The handler itself is gpui-bound and is not under test here;
+        // what is under test is that the mode the framing reads comes off the
+        // wire, since the local placeholder's `false` produces the OTHER
+        // branch of `text_bytes` on the very same input.
+        let text = "echo one\necho two\n";
+        let wire = frame(false, true);
+
+        let modes = input_modes(true, Some(&wire), false, false);
+        let framed = modes
+            .bracketed_paste
+            .map(|bracketed| text_bytes(text, bracketed))
+            .expect("a broadcaster that reported its paste mode must be pastable into");
+        assert_eq!(
+            framed,
+            b"\x1b[200~echo one\necho two\n\x1b[201~".to_vec(),
+            "the broadcaster had bracketed paste on, so the paste must arrive framed"
+        );
+
+        let from_the_placeholder = text_bytes(text, false);
+        assert_eq!(
+            from_the_placeholder,
+            text.as_bytes().to_vec(),
+            "fixture guard: unframed, this paste is two RUN commands, which is the hazard"
+        );
+        assert_ne!(framed, from_the_placeholder);
+    }
+
+    // --- recognising an arriving frame -------------------------------------
+
+    #[test]
+    fn a_republished_identical_screen_still_counts_as_a_frame_arriving() {
+        // `Attachment::record_frame` mints a fresh `Arc` per frame parsed off
+        // the wire, so identity is the question. Value equality would answer
+        // "no new frame" for a broadcaster that republished an identical
+        // screen, leaving the pane's `last_activity` aging as though the peer
+        // had gone quiet — and would deep-compare a whole grid on every 16ms
+        // pump tick to get there.
+        let painted = Arc::new(frame(false, false));
+        let arrived = Arc::new(frame(false, false));
+        assert_eq!(
+            *painted, *arrived,
+            "fixture guard: the two frames must be EQUAL for this test to say anything"
+        );
+        assert!(
+            !Arc::ptr_eq(&painted, &arrived),
+            "fixture guard: distinct Arcs"
+        );
+
+        assert!(
+            frame_is_new(Some(&painted), &arrived),
+            "an identical screen re-sent is still a new frame"
+        );
+        assert!(
+            !frame_is_new(Some(&painted), &painted.clone()),
+            "the frame already being painted is not a new arrival"
+        );
+        assert!(
+            frame_is_new(None, &arrived),
+            "the first frame of an attachment is always new"
+        );
+    }
+
+    // --- the queue that keeps the blocking send off the UI thread ----------
+
+    /// Records what the drain loop hands it, and can be held INSIDE
+    /// `deliver` — which is where a real `Attachment::send` spends up to
+    /// five seconds — while the test types more.
+    struct FakeSink {
+        batches: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Consumed by the FIRST `deliver`: announces that it has been
+        /// entered, then blocks until the test releases it.
+        gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        /// What `deliver` reports about the destination still being there.
+        destination_alive: bool,
+    }
+
+    impl PeerSink for FakeSink {
+        fn deliver(&self, bytes: &[u8]) -> bool {
+            self.batches.lock().unwrap().push(bytes.to_vec());
+            if let Some((entered, release)) = self.gate.lock().unwrap().take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.destination_alive
+        }
+    }
+
+    fn wait_for_exit(handle: &std::thread::JoinHandle<()>) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle.is_finished()
+    }
+
+    #[test]
+    fn keystrokes_reach_the_peer_in_the_order_they_were_typed() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = FakeSink {
+            batches: Arc::clone(&batches),
+            gate: Mutex::new(None),
+            destination_alive: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
+
+        for byte in [b"l", b"s", b"\r"] {
+            tx.send(byte.to_vec()).unwrap();
+        }
+        drop(tx);
+
+        assert!(
+            wait_for_exit(&drain),
+            "dropping the pane's end of the queue must end the drain thread"
+        );
+        drain.join().unwrap();
+        assert_eq!(
+            batches.lock().unwrap().concat(),
+            b"ls\r".to_vec(),
+            "every byte, in the order it was typed"
+        );
+    }
+
+    #[test]
+    fn bytes_typed_during_a_stalled_send_ride_the_next_request_together() {
+        // The failure this prevents: `deliver` blocks for a full five-second
+        // deadline against a stalled peer. Without coalescing, a backlog
+        // built during that stall drains one five-second round trip per
+        // keystroke, so what was typed in one second arrives over minutes.
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = FakeSink {
+            batches: Arc::clone(&batches),
+            gate: Mutex::new(Some((entered_tx, release_rx))),
+            destination_alive: true,
+        };
+        let (tx, rx) = mpsc::channel();
+        let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
+
+        tx.send(b"a".to_vec()).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drain thread must have entered the stalled send");
+        // The drain thread is now parked inside `deliver`. These two pushes
+        // are what the UI thread does during that stall; both complete here,
+        // before the release below, so the drain thread observes both the
+        // moment it comes back.
+        tx.send(b"b".to_vec()).unwrap();
+        tx.send(b"c".to_vec()).unwrap();
+        release_tx.send(()).unwrap();
+        drop(tx);
+
+        assert!(wait_for_exit(&drain), "the drain thread must finish");
+        drain.join().unwrap();
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![b"a".to_vec(), b"bc".to_vec()],
+            "one request for the stalled byte, ONE for everything typed behind it"
+        );
+    }
+
+    #[test]
+    fn a_torn_down_destination_stops_the_drain_loop_instead_of_retrying_forever() {
+        // `deliver` reporting `false` means the pane (and with it the
+        // attachment) is gone -- not that one round trip failed. The loop
+        // must stop even though the queue's sending end is still open.
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = FakeSink {
+            batches: Arc::clone(&batches),
+            gate: Mutex::new(Some((entered_tx, release_rx))),
+            destination_alive: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        let drain = std::thread::spawn(move || drain_peer_input(rx, sink));
+
+        tx.send(b"a".to_vec()).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drain thread must have entered the send");
+        tx.send(b"b".to_vec()).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(
+            wait_for_exit(&drain),
+            "a gone destination must end the loop, with the queue still open"
+        );
+        assert_eq!(
+            *batches.lock().unwrap(),
+            vec![b"a".to_vec()],
+            "nothing typed after the destination went away may be delivered"
+        );
+        drop(tx);
     }
 }
