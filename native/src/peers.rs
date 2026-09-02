@@ -348,13 +348,40 @@ pub fn offerable_candidates(candidates: &[Candidate], paired: &[PeerRecord]) -> 
 /// running companion still needs an explicit restart before this record is
 /// actually recognized — pairing alone only produces the record; see
 /// `peer_mutation_requires_restart`.
+impl Grants {
+    /// What a peer gets the moment you pair it, which is deliberately NOT
+    /// [`Grants::default`].
+    ///
+    /// `default` must stay deny-all because it is what `#[serde(default)]`
+    /// hands a record whose grants are missing or malformed on disk — there,
+    /// silence must never mean "allow". Pairing is the opposite situation:
+    /// it is an explicit act, with a secret exchanged by hand, and a peer
+    /// that can do nothing afterwards just reads as broken.
+    ///
+    /// `view` and `type_` are on because broadcasting is ALREADY opt-in per
+    /// terminal — nothing is exposed until you share it, so these two only
+    /// govern what happens to something you already chose to share. Making
+    /// them a second closed gate means two switches for the ordinary case.
+    ///
+    /// `spawn` stays off, because it is a different kind of permission: it
+    /// lets a peer start new processes on this machine without you having
+    /// shared anything at all.
+    pub fn on_pair() -> Self {
+        Grants {
+            view: true,
+            type_: true,
+            spawn: false,
+        }
+    }
+}
+
 pub fn pair(host: &str) -> PeerRecord {
     PeerRecord {
         id: PeerId(new_peer_id()),
         host: host.to_string(),
         label: host.to_string(),
         secret: new_peer_secret(),
-        grants: Grants::default(),
+        grants: Grants::on_pair(),
     }
 }
 
@@ -873,12 +900,12 @@ mod tests {
     }
 
     #[test]
-    fn pairing_starts_with_every_grant_off() {
+    fn pairing_mints_a_labelled_record_with_a_valid_secret() {
+        // Grants are asserted separately in
+        // `pairing_grants_view_and_type_but_never_spawn` — this one covers
+        // the identity half of `pair()`.
         let record = pair("work-mbp");
         assert_eq!(record.label, "work-mbp");
-        assert!(!record.grants.view);
-        assert!(!record.grants.type_);
-        assert!(!record.grants.spawn);
         assert!(secret_ok(&record.secret), "pair() must mint a valid secret");
         assert!(!record.id.0.is_empty());
     }
@@ -1030,6 +1057,42 @@ mod tests {
     fn an_unchanged_snapshot_needs_no_restart() {
         let peers = vec![pair("work-mbp")];
         assert!(!peer_mutation_requires_restart(&peers, &peers));
+    }
+
+    #[test]
+    fn pairing_grants_view_and_type_but_never_spawn() {
+        let p = pair("work-mbp");
+        assert!(
+            p.grants.view,
+            "a paired peer that cannot see reads as broken"
+        );
+        assert!(
+            p.grants.type_,
+            "sharing a terminal you cannot type into is half a feature"
+        );
+        assert!(
+            !p.grants.spawn,
+            "spawn starts processes on this machine without anything being shared - it must stay opt-in"
+        );
+    }
+
+    #[test]
+    fn the_serde_default_stays_deny_all_even_though_pairing_does_not() {
+        // These two must not be allowed to drift into each other. `default`
+        // is what a record with missing or malformed grants deserializes
+        // to, so if it ever inherited `on_pair`'s values, a corrupted line
+        // in the peers file would silently GRANT access instead of
+        // withholding it.
+        let d = Grants::default();
+        assert!(
+            !d.view && !d.type_ && !d.spawn,
+            "serde default must deny everything"
+        );
+        assert_ne!(
+            d,
+            Grants::on_pair(),
+            "if these ever become equal, the deny-by-default guarantee is gone"
+        );
     }
 
     #[test]

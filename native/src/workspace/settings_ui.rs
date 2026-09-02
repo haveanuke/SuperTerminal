@@ -23,9 +23,9 @@ pub(super) mod hints {
     pub const CUES: &str = "Glass when a terminal finishes, Ping when one is waiting on you.";
     pub const AWAKE: &str = "Holds the Mac awake while a terminal is still working.";
     pub const PEER_CANDIDATES: &str =
-        "Other online Macs on the tailnet. Pairing is manual -- nothing here is automatic.";
+        "Macs online on your tailnet right now. Pair one to share terminals with it.";
     pub const PAIRED_PEERS: &str =
-        "Each grant starts off. Delete revokes a peer immediately, even mid-session.";
+        "Pairing turns on view and type. Delete revokes instantly, even mid-session.";
 
     #[cfg(test)]
     pub const ALL: [&str; 9] = [
@@ -258,9 +258,15 @@ impl Workspace {
     /// four formerly separate sections; without these it reads as one
     /// undifferentiated pile of chips.
     pub(super) fn group_label(&self, text: &'static str) -> impl IntoElement {
+        // 11px, not 9: at 9 these read as stray words rather than as the
+        // headings that divide the pane, so the sections below them look
+        // like one undifferentiated list. The extra top margin does the
+        // other half of that job — separation is what makes a heading a
+        // heading, more than its size does.
         div()
-            .text_size(px(9.0))
-            .text_color(rgb(self.theme.ui_text_muted))
+            .mt(px(6.0))
+            .text_size(px(11.0))
+            .text_color(rgb(self.theme.ui_text))
             .child(SharedString::from(text))
     }
 
@@ -1302,11 +1308,11 @@ impl Workspace {
             )
             .child(self.hint(hints::PEER_CANDIDATES))
             .children(
-                candidates_empty.then(|| self.hint("No other Macs found on the tailnet yet.")),
+                candidates_empty.then(|| self.hint("Nothing yet. Both Macs need Tailscale running and SuperTerminal open.")),
             )
             .children(candidate_rows)
             .child(self.group_label("paired"))
-            .children(peers_empty.then(|| self.hint("No peers paired yet.")))
+            .children(peers_empty.then(|| self.hint("None yet. Pair a Mac above to start sharing terminals with it.")))
             .children(peer_rows)
             .child(self.hint(hints::PAIRED_PEERS))
             .children(pairing_panel)
