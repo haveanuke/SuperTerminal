@@ -1146,19 +1146,47 @@ impl Workspace {
                 let type_id = peer.id.clone();
                 let spawn_id = peer.id.clone();
                 let delete_id = peer.id.clone();
+                // The chip carries the permission's NAME; being on or off is
+                // carried by fill. Spelling it "view: on" made every chip say
+                // its state twice — once in a word, once in colour — and three
+                // of those per row buried the peer's own name in noise.
+                //
+                // Filled vs outline, not two shades of the same outline: a
+                // weight difference survives a colourblind viewer and a
+                // low-contrast theme, where a border tint alone does not.
                 let grant_chip = |tag: &'static str, on: bool| {
                     div()
                         .px(px(7.0))
                         .py(px(1.0))
                         .rounded(px(4.0))
+                        .cursor_pointer()
                         .border_1()
                         .border_color(rgb(if on { theme.ui_accent } else { theme.ui_border }))
-                        .bg(rgb(theme.ui_surface))
-                        .text_color(rgb(if on { theme.ui_accent } else { theme.ui_text }))
-                        .child(SharedString::from(format!(
-                            "{tag}: {}",
-                            if on { "on" } else { "off" }
-                        )))
+                        .bg(rgb(if on {
+                            theme.ui_accent
+                        } else {
+                            theme.ui_surface
+                        }))
+                        .text_color(rgb(if on {
+                            theme.ui_background
+                        } else {
+                            theme.ui_text_muted
+                        }))
+                        // Hover has to know the state. A single hover style
+                        // that repaints the background would make an ON chip
+                        // look like it had just turned OFF while the pointer
+                        // sat on it — the control lying about itself at the
+                        // exact moment the user is deciding whether to click.
+                        .hover(move |style| {
+                            if on {
+                                style.border_color(rgb(theme.ui_text))
+                            } else {
+                                style
+                                    .border_color(rgb(theme.ui_accent))
+                                    .text_color(rgb(theme.ui_text))
+                            }
+                        })
+                        .child(SharedString::from(tag))
                 };
                 div()
                     .id(SharedString::from(format!("peer-{}", peer.id.0)))
@@ -1177,12 +1205,6 @@ impl Workspace {
                     .child(
                         grant_chip("view", grants.view)
                             .id(SharedString::from(format!("peer-grant-view-{}", peer.id.0)))
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style
-                                    .border_color(rgb(theme.ui_accent))
-                                    .bg(rgb(theme.ui_border))
-                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, _, cx| {
@@ -1193,12 +1215,6 @@ impl Workspace {
                     .child(
                         grant_chip("type", grants.type_)
                             .id(SharedString::from(format!("peer-grant-type-{}", peer.id.0)))
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style
-                                    .border_color(rgb(theme.ui_accent))
-                                    .bg(rgb(theme.ui_border))
-                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, _, cx| {
@@ -1212,12 +1228,6 @@ impl Workspace {
                                 "peer-grant-spawn-{}",
                                 peer.id.0
                             )))
-                            .cursor_pointer()
-                            .hover(|style| {
-                                style
-                                    .border_color(rgb(theme.ui_accent))
-                                    .bg(rgb(theme.ui_border))
-                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, _, cx| {
