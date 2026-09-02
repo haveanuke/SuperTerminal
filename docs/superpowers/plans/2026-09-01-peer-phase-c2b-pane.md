@@ -101,13 +101,13 @@ without the gate, a wire-shape mismatch collapses into
 `BadResponse("frame was not a valid snapshot")` (`stream.rs:120`), repeated per
 frame, which tells the user nothing they can act on.
 
-Tests: a peer whose
-protocol matches is accepted; one that predates the field is refused BEFORE any
-stream is opened, with a distinguishable reason; the refusal is surfaced as a
-status, not a parse error.
-
-Tests: the field is present and always serialized; it round-trips; it carries the
-theme's actual background rather than a hardcoded value.
+Tests, both halves:
+- Background: the field is present and always serialized; it round-trips; it
+  carries the theme's ACTUAL background rather than a hardcoded value.
+- Protocol gate: a peer advertising protocol 2 with `snapshot-background` is
+  accepted; one advertising protocol 1 is refused BEFORE any stream is opened,
+  with a reason distinguishable from a parse failure; the refusal surfaces as a
+  status the UI can show.
 
 - [ ] **Step 1: failing tests** — [ ] **2: observe failure** — [ ] **3: implement** — [ ] **4: `cargo test`, phone untouched** — [ ] **5: commit** `feat(companion): the wire snapshot carries its background`
 
