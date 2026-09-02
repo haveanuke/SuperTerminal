@@ -2664,6 +2664,39 @@ mod tests {
     }
 
     #[test]
+    fn a_viewport_taller_than_the_history_straddles_the_boundary_correctly() {
+        // Every other fixture here has MORE history (5) than live rows (3),
+        // so the scrolled window never has to span the boundary with
+        // history left over on one side only. This one inverts that: one
+        // history row against three live rows, scrolled back by one, so the
+        // window must take the single history row and then STOP taking
+        // history and start taking live rows mid-window.
+        //
+        // An implementation that indexed live rows by the raw window
+        // position rather than by the post-history offset returns h0,r1,r2
+        // here (verified by sabotage). The 5-history/3-live fixtures catch
+        // that particular slip too, so this test's value is not "the only
+        // one that fails" — it is covering the INVERTED ratio, where the
+        // window runs out of history mid-span, which no other fixture
+        // reaches.
+        let wire = wire_snapshot_with_history(
+            vec![labeled_row("h0")],
+            vec![labeled_row("r0"), labeled_row("r1"), labeled_row("r2")],
+            "#123456",
+        );
+        assert_eq!(
+            row_labels(&attached_paint_frame(&wire, 1).rows),
+            vec!["h0", "r0", "r1"]
+        );
+        // And the clamp still lands on the same window, since one row of
+        // history is all there is to scroll into.
+        assert_eq!(
+            row_labels(&attached_paint_frame(&wire, 99).rows),
+            vec!["h0", "r0", "r1"]
+        );
+    }
+
+    #[test]
     fn attached_frame_with_no_history_ignores_a_requested_offset() {
         let (_, rows) = five_history_three_live();
         let wire = wire_snapshot(rows, "#123456");
