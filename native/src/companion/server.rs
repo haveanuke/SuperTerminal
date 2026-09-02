@@ -13,7 +13,7 @@
 
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -92,7 +92,7 @@ pub struct ServerHandle {
     /// so a lock-free slot is enough — no mutex on the serialize path — and
     /// `set_theme` lets a caller update it in place without restarting the
     /// server (a restart would drop every connected client).
-    theme: Arc<AtomicPtr<Theme>>,
+    theme: Arc<Mutex<&'static Theme>>,
 }
 
 impl ServerHandle {
@@ -182,20 +182,28 @@ impl ServerHandle {
     }
 
     /// Swap the theme the running server resolves colours against, without
-    /// restarting it (a restart would drop every connected client). Callers
-    /// racing a `set_theme` against an in-flight serialize may see the
-    /// previous theme for that one read — `Ordering::Relaxed` is enough
-    /// because a snapshot resolved with the theme that was live a moment
-    /// ago is not a correctness problem, unlike serving it forever.
+    /// restarting it (a restart would drop every connected client). A
+    /// serialize already in flight may finish against the previous theme;
+    /// that one stale frame is fine, unlike serving it forever.
+    ///
+    /// A mutex rather than an `AtomicPtr`: the slot is read once per
+    /// emitted SSE frame, immediately before serializing a whole grid to
+    /// JSON, so an uncontended lock is a rounding error on the work it
+    /// precedes. In exchange it publishes the write properly — a custom
+    /// theme is `Box::leak`ed on the UI thread (`themes.rs`), and a relaxed
+    /// store of that pointer gives an SSE worker no happens-before edge to
+    /// the fields it then reads — and it keeps the compiler checking
+    /// `Theme: Sync`, which `AtomicPtr` would have discharged silently.
     pub fn set_theme(&self, theme: &'static Theme) {
-        self.theme
-            .store(theme as *const Theme as *mut Theme, Ordering::Relaxed);
+        // Poisoning cannot leave this inconsistent: the guarded value is a
+        // shared reference, replaced wholesale and never partially updated.
+        *self.theme.lock().unwrap_or_else(|e| e.into_inner()) = theme;
     }
 }
 
 struct Shared<S: Clone> {
     hub: Arc<CompanionHub<S>>,
-    theme: Arc<AtomicPtr<Theme>>,
+    theme: Arc<Mutex<&'static Theme>>,
     token: String,
     host: String,
     page: &'static str,
@@ -212,18 +220,13 @@ struct Shared<S: Clone> {
 }
 
 impl<S: Clone> Shared<S> {
-    /// The theme currently live for this server, reborrowed as `&'static`.
-    ///
-    /// Safety: every pointer ever stored in `self.theme` originates from a
-    /// `&'static Theme` — either `start`'s initial `theme` argument or one
-    /// handed to `ServerHandle::set_theme` — so reborrowing it for `'static`
-    /// here is sound. `Ordering::Relaxed` is enough: a serialize that reads
-    /// the theme from a moment before a concurrent `set_theme` lands is not
-    /// a correctness problem — the cost of getting it wrong forever (the
-    /// original bug) is what this exists to fix, not the cost of one stale
-    /// frame around a switch.
+    /// The theme currently live for this server. A serialize that reads
+    /// the theme a moment before a concurrent `set_theme` lands is not a
+    /// correctness problem — serving the old one FOREVER was the bug, not
+    /// one frame around a switch. See `ServerHandle::set_theme` for why
+    /// this is a mutex rather than an atomic.
     fn theme(&self) -> &'static Theme {
-        unsafe { &*self.theme.load(Ordering::Relaxed) }
+        *self.theme.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -237,7 +240,7 @@ pub fn start<S: InputSink>(
     let cancel = Arc::new(AtomicBool::new(false));
     let workers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let (port_released_tx, port_released_rx) = mpsc::channel();
-    let theme_slot = Arc::new(AtomicPtr::new(theme as *const Theme as *mut Theme));
+    let theme_slot = Arc::new(Mutex::new(theme));
     let shared = Arc::new(Shared {
         hub,
         theme: Arc::clone(&theme_slot),
@@ -1941,6 +1944,11 @@ mod tests {
         let first = next_data_line(&mut reader1);
         assert!(first.contains(&background_field(theme())), "{first}");
         let dracula = crate::themes::by_name("Dracula").expect("Dracula is a built-in preset");
+        assert_ne!(
+            theme().background,
+            dracula.background,
+            "the two themes must actually differ for this test to prove anything"
+        );
         handle.set_theme(dracula);
         hub.publish_snapshot("t1", Arc::new(seeded_snapshot(false)));
         let second = next_data_line(&mut reader1);
@@ -2188,7 +2196,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let shared = Shared {
             hub: Arc::clone(&hub),
-            theme: Arc::new(AtomicPtr::new(theme() as *const Theme as *mut Theme)),
+            theme: Arc::new(Mutex::new(theme())),
             token: TOKEN.into(),
             host: host.clone(),
             page: PAGE,
