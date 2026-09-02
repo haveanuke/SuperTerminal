@@ -14,6 +14,7 @@ use gpui::{
     SharedString, Window,
 };
 
+use crate::companion::wire::WireSnapshot;
 use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
@@ -935,21 +936,21 @@ impl TerminalPane {
         }
         cx.notify();
     }
+}
 
-    fn resolve_fg(&self, color: CellColor) -> u32 {
-        match color {
-            CellColor::Default => self.theme.foreground,
-            CellColor::Indexed(i) => ansi_256(i, self.theme),
-            CellColor::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
-        }
+fn resolve_fg(color: CellColor, theme: &Theme) -> u32 {
+    match color {
+        CellColor::Default => theme.foreground,
+        CellColor::Indexed(i) => ansi_256(i, theme),
+        CellColor::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
     }
+}
 
-    fn resolve_bg(&self, color: CellColor) -> Option<u32> {
-        match color {
-            CellColor::Default => None, // pane background shows through
-            CellColor::Indexed(i) => Some(ansi_256(i, self.theme)),
-            CellColor::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
-        }
+fn resolve_bg(color: CellColor, theme: &Theme) -> Option<u32> {
+    match color {
+        CellColor::Default => None, // pane background shows through
+        CellColor::Indexed(i) => Some(ansi_256(i, theme)),
+        CellColor::Rgb(r, g, b) => Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32),
     }
 }
 
@@ -986,6 +987,7 @@ fn dim(color: u32) -> u32 {
 /// `cells` is the grid span (wide chars count 2), painted as the explicit
 /// element width so backgrounds cover exactly their cells. `safe` records
 /// whether every glyph's advance was verified to match its grid span.
+#[derive(Debug, PartialEq)]
 struct Run {
     col: usize,
     cells: usize,
@@ -1073,6 +1075,166 @@ fn coalesce_runs(
         });
     }
     runs
+}
+
+/// Everything the render loop needs for one frame, fully resolved: colors
+/// already concrete `0xRRGGBB`, runs already merged, and the cursor already
+/// reduced to "where, if anywhere". A local snapshot reaches this shape by
+/// resolving `CellColor` through the viewer's theme and running
+/// [`coalesce_runs`] ([`local_paint_frame`]); a wire snapshot is already in
+/// this shape and is decoded directly ([`wire_paint_frame`]). Once built,
+/// painting no longer needs to know which kind of snapshot produced it.
+#[derive(Debug, PartialEq)]
+struct PaintFrame {
+    /// What to paint behind a run that leaves its own `bg` unset: the
+    /// viewer's theme background for a local frame, or
+    /// `WireSnapshot::background` (Task 1) for a wire frame.
+    background: u32,
+    rows: Vec<Vec<Run>>,
+    /// (col, row) in viewport coordinates, if the cursor should be drawn at
+    /// all. Already collapses "hidden style" (local) or "omitted from the
+    /// wire" (wire) into one `None` — the caller layers blink/focus on top.
+    cursor: Option<(usize, usize)>,
+}
+
+/// Resolve a LOCAL snapshot into a [`PaintFrame`]: theme-resolved colors
+/// with selection/search/inverse/dim/hidden applied, then coalesced. This is
+/// the exact per-row and per-cursor logic `render()` used to run inline —
+/// extracting it changes where the decision lives, not what gets painted,
+/// which is also how it becomes testable without a gpui harness.
+fn local_paint_frame(
+    snapshot: &RenderableSnapshot,
+    theme: &Theme,
+    advance_safe: &dyn Fn(char, usize, &CellLook) -> bool,
+) -> PaintFrame {
+    let selection: std::collections::HashSet<(usize, usize)> =
+        snapshot.selection.iter().copied().collect();
+    let search_hits: std::collections::HashSet<(usize, usize)> =
+        snapshot.search_matches.iter().copied().collect();
+    let rows = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
+            let looks = row
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.wide_spacer)
+                .map(|(col_idx, cell)| {
+                    let selected = selection.contains(&(col_idx, row_idx));
+                    let style = &cell.style;
+                    let (mut fg, mut bg) = if style.inverse {
+                        let fg_resolved = resolve_fg(style.fg, theme);
+                        let bg_resolved = resolve_bg(style.bg, theme).unwrap_or(theme.background);
+                        (bg_resolved, Some(fg_resolved))
+                    } else {
+                        (resolve_fg(style.fg, theme), resolve_bg(style.bg, theme))
+                    };
+                    if style.dim {
+                        fg = dim(fg);
+                    }
+                    if style.hidden {
+                        fg = bg.unwrap_or(theme.background);
+                    }
+                    if search_hits.contains(&(col_idx, row_idx)) {
+                        bg = Some(theme.yellow);
+                        fg = theme.background;
+                    }
+                    if selected {
+                        bg = Some(theme.selection);
+                    }
+                    let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+                    let span = if row.get(col_idx + 1).is_some_and(|next| next.wide_spacer) {
+                        2
+                    } else {
+                        1
+                    };
+                    (
+                        col_idx,
+                        ch,
+                        span,
+                        CellLook {
+                            fg,
+                            bg,
+                            bold: style.bold,
+                            italic: style.italic,
+                            underline: style.underline,
+                        },
+                    )
+                });
+            coalesce_runs(looks, advance_safe, theme.foreground)
+        })
+        .collect();
+    let cursor = match (snapshot.cursor.style, snapshot.cursor.row) {
+        (CursorStyle::Hidden, _) | (_, None) => None,
+        (_, Some(row)) => Some((snapshot.cursor.col, row)),
+    };
+    PaintFrame {
+        background: theme.background,
+        rows,
+        cursor,
+    }
+}
+
+/// Resolve a WIRE snapshot into a [`PaintFrame`]. The broadcaster already
+/// coalesced and resolved every run (`wire.rs`'s `row_runs`), so this is a
+/// straight decode — hex strings become `0xRRGGBB` — with one substitution:
+/// `WireRun.bg: None` ("page background shows through", `wire.rs`) becomes
+/// the snapshot's own background (Task 1), so a run is never left with an
+/// ambiguous background to inherit from whatever it happens to be painted
+/// over.
+///
+/// Runs are copied through AS GIVEN, never re-coalesced: the wire already
+/// merged cells into `WireRun { col, width, text }`, so a receiver cannot
+/// tell which glyph inside a multi-char run consumed an extra column (a
+/// wide character's spacer, for instance). Per-glyph pinning is therefore a
+/// LOCAL-ONLY refinement (see D5 in the peer-instances design doc) —
+/// reconstructing it here by guessing glyph widths would misplace every
+/// character after a wrong guess.
+fn wire_paint_frame(wire: &WireSnapshot) -> PaintFrame {
+    let background = parse_wire_hex(&wire.background);
+    let rows = wire
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|run| Run {
+                    col: run.col as usize,
+                    cells: run.width as usize,
+                    safe: true, // no per-glyph pinning check applies to wire runs
+                    text: run.text.clone(),
+                    fg: parse_wire_hex(&run.fg),
+                    bg: Some(run.bg.as_deref().map(parse_wire_hex).unwrap_or(background)),
+                    bold: run.b,
+                    italic: run.i,
+                    underline: run.u,
+                })
+                .collect()
+        })
+        .collect();
+    let cursor = wire
+        .cursor
+        .as_ref()
+        .map(|c| (c.col as usize, c.row as usize));
+    PaintFrame {
+        background,
+        rows,
+        cursor,
+    }
+}
+
+/// Decode a wire "#rrggbb" string into `0xRRGGBB` — the inverse of
+/// `wire::hex`. The wire always emits this exact shape (enforced by the
+/// `/version` capability check before a peer ever attaches), so a malformed
+/// string here means a build mismatch slipped past that gate; fall back to
+/// black rather than let a bad color panic the render loop.
+fn parse_wire_hex(s: &str) -> u32 {
+    let s = s.trim_start_matches('#');
+    if s.len() == 6 {
+        u32::from_str_radix(s, 16).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 /// IME-correct text input: composed text goes straight to the PTY; marked
@@ -1277,61 +1439,13 @@ impl Render for TerminalPane {
                 .is_some_and(|adv| (adv - expected).abs() <= expected * 0.02)
         };
 
-        // Build styled runs per row.
-        let selection: std::collections::HashSet<(usize, usize)> =
-            snapshot.selection.iter().copied().collect();
-        let search_hits: std::collections::HashSet<(usize, usize)> =
-            snapshot.search_matches.iter().copied().collect();
-        let mut row_divs = Vec::with_capacity(snapshot.lines);
-        for (row_idx, row) in snapshot.rows.iter().enumerate() {
-            let looks = row
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| !cell.wide_spacer)
-                .map(|(col_idx, cell)| {
-                    let selected = selection.contains(&(col_idx, row_idx));
-                    let style = &cell.style;
-                    let (mut fg, mut bg) = if style.inverse {
-                        let fg_resolved = self.resolve_fg(style.fg);
-                        let bg_resolved = self.resolve_bg(style.bg).unwrap_or(theme.background);
-                        (bg_resolved, Some(fg_resolved))
-                    } else {
-                        (self.resolve_fg(style.fg), self.resolve_bg(style.bg))
-                    };
-                    if style.dim {
-                        fg = dim(fg);
-                    }
-                    if style.hidden {
-                        fg = bg.unwrap_or(theme.background);
-                    }
-                    if search_hits.contains(&(col_idx, row_idx)) {
-                        bg = Some(theme.yellow);
-                        fg = theme.background;
-                    }
-                    if selected {
-                        bg = Some(theme.selection);
-                    }
-                    let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-                    let span = if row.get(col_idx + 1).is_some_and(|next| next.wide_spacer) {
-                        2
-                    } else {
-                        1
-                    };
-                    (
-                        col_idx,
-                        ch,
-                        span,
-                        CellLook {
-                            fg,
-                            bg,
-                            bold: style.bold,
-                            italic: style.italic,
-                            underline: style.underline,
-                        },
-                    )
-                });
-            let runs = coalesce_runs(looks, &advance_safe, theme.foreground);
-
+        // One resolved paint frame, fed by the local snapshot: theme
+        // resolution, selection/search/inverse/dim/hidden, and coalescing
+        // all happen inside `local_paint_frame` now (`PaintFrame` doc). A
+        // wire-fed pane reaches the same shape through `wire_paint_frame`.
+        let frame = local_paint_frame(snapshot, theme, &advance_safe);
+        let mut row_divs = Vec::with_capacity(frame.rows.len());
+        for runs in frame.rows {
             // Runs are pinned at col * cell_width instead of flowed: flowed
             // widths drift off-grid (gpui ceils each text element to whole
             // pixels, and fallback glyphs advance wider than a cell), which
@@ -1373,17 +1487,17 @@ impl Render for TerminalPane {
         // Cursor overlay (2px bar focused, hollow block unfocused; hidden when
         // the app hides it or it scrolled out of view).
         let blink_visible = !focused || self.blink_on;
-        let cursor_div = match (snapshot.cursor.style, snapshot.cursor.row) {
-            (CursorStyle::Hidden, _) | (_, None) => None,
-            _ if !blink_visible => None,
-            (style, Some(row)) => {
-                let left = px(PADDING + snapshot.cursor.col as f32 * f32::from(cell_w));
+        let cursor_div = match frame.cursor {
+            None => None,
+            Some(_) if !blink_visible => None,
+            Some((col, row)) => {
+                let left = px(PADDING + col as f32 * f32::from(cell_w));
                 let top = px(PADDING + row as f32 * f32::from(line_h));
                 let d = div().absolute().left(left).top(top).h(line_h);
                 Some(if !focused {
                     d.w(cell_w).border_1().border_color(rgb(theme.cursor))
                 } else {
-                    match style {
+                    match snapshot.cursor.style {
                         CursorStyle::Underline => {
                             d.w(cell_w).border_b_2().border_color(rgb(theme.cursor))
                         }
@@ -1411,7 +1525,7 @@ impl Render for TerminalPane {
                 // would dim it a second time.
                 gpui::rgba(0x0000_0000)
             } else {
-                gpui::rgba((theme.background << 8) | 0xFF)
+                gpui::rgba((frame.background << 8) | 0xFF)
             })
             .p(px(PADDING))
             .overflow_hidden()
@@ -1658,11 +1772,16 @@ impl TerminalPane {
 #[cfg(test)]
 mod tests {
     use super::{
-        busy_dot, coalesce_runs, drag_scroll_lines, may_broadcast_locally, CellLook,
-        COMPANION_BUSY_WINDOW,
+        busy_dot, coalesce_runs, drag_scroll_lines, local_paint_frame, may_broadcast_locally,
+        wire_paint_frame, CellLook, Run, COMPANION_BUSY_WINDOW,
     };
+    use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
-    use crate::term_session::AgentState;
+    use crate::term_session::{
+        AgentState, CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell,
+        SnapshotCursor,
+    };
+    use crate::themes::{default_theme, Theme};
 
     #[test]
     fn a_local_target_may_join_the_local_fan_out() {
@@ -1877,5 +1996,334 @@ mod tests {
     fn speed_caps_at_five_lines() {
         assert_eq!(drag_scroll_lines(-1000.0, 50.0, 500.0), 5);
         assert_eq!(drag_scroll_lines(5000.0, 50.0, 500.0), -5);
+    }
+
+    // -- local_paint_frame / wire_paint_frame -------------------------------
+    //
+    // One adapter, fed by both sources: a LOCAL snapshot resolves through
+    // the viewer's theme and runs the existing coalescer; a WIRE snapshot
+    // arrives already resolved and coalesced and is decoded directly. Both
+    // must land on the same `PaintFrame` shape so the render loop stops
+    // needing to know which kind of snapshot it started with.
+
+    fn cell_style() -> CellStyle {
+        CellStyle {
+            fg: CellColor::Default,
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            dim: false,
+            underline: false,
+            inverse: false,
+            hidden: false,
+        }
+    }
+
+    fn plain_cell(ch: char, style: CellStyle) -> SnapshotCell {
+        SnapshotCell {
+            ch,
+            style,
+            wide_spacer: false,
+        }
+    }
+
+    fn wide_spacer_cell() -> SnapshotCell {
+        SnapshotCell {
+            ch: '\0',
+            style: cell_style(),
+            wide_spacer: true,
+        }
+    }
+
+    fn local_snapshot(rows: Vec<Vec<SnapshotCell>>) -> RenderableSnapshot {
+        let cols = rows.first().map(|r| r.len()).unwrap_or(0);
+        RenderableSnapshot {
+            cols,
+            lines: rows.len(),
+            rows,
+            cursor: SnapshotCursor {
+                col: 0,
+                row: None,
+                style: CursorStyle::Hidden,
+            },
+            display_offset: 0,
+            selection: Vec::new(),
+            app_cursor_mode: false,
+            bracketed_paste: false,
+            mouse_tracking: false,
+            alt_screen: false,
+            focused_title: None,
+            exited: None,
+            selection_text: None,
+            search_matches: Vec::new(),
+            history_rows: Vec::new(),
+        }
+    }
+
+    fn theme() -> &'static Theme {
+        default_theme()
+    }
+
+    // Stand-in for the render-time advance measurement: every glyph is
+    // vouched for, matching the ASCII-only content these tests use.
+    fn always_safe(_: char, _: usize, _: &CellLook) -> bool {
+        true
+    }
+
+    #[test]
+    fn local_frame_of_an_empty_grid_has_no_rows() {
+        let snap = local_snapshot(vec![]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.rows, Vec::<Vec<Run>>::new());
+    }
+
+    #[test]
+    fn local_frame_resolves_plain_cells_to_the_theme_default() {
+        let snap = local_snapshot(vec![vec![
+            plain_cell('h', cell_style()),
+            plain_cell('i', cell_style()),
+        ]]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.rows.len(), 1);
+        assert_eq!(frame.rows[0].len(), 1);
+        assert_eq!(frame.rows[0][0].text, "hi");
+        assert_eq!(frame.rows[0][0].fg, theme().foreground);
+        assert_eq!(frame.rows[0][0].bg, None);
+    }
+
+    #[test]
+    fn local_frame_carries_bold_italic_underline_into_the_run() {
+        let styled = CellStyle {
+            bold: true,
+            italic: true,
+            underline: true,
+            ..cell_style()
+        };
+        let snap = local_snapshot(vec![vec![plain_cell('x', styled)]]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        let run = &frame.rows[0][0];
+        assert!(run.bold);
+        assert!(run.italic);
+        assert!(run.underline);
+    }
+
+    #[test]
+    fn local_frame_selection_overrides_background_with_the_theme_selection_color() {
+        let mut snap = local_snapshot(vec![vec![plain_cell('a', cell_style())]]);
+        snap.selection = vec![(0, 0)];
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.rows[0][0].bg, Some(theme().selection));
+    }
+
+    #[test]
+    fn local_frame_search_hit_paints_yellow_on_the_theme_background() {
+        let mut snap = local_snapshot(vec![vec![plain_cell('a', cell_style())]]);
+        snap.search_matches = vec![(0, 0)];
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        let run = &frame.rows[0][0];
+        assert_eq!(run.bg, Some(theme().yellow));
+        assert_eq!(run.fg, theme().background);
+    }
+
+    #[test]
+    fn local_frame_inverse_swaps_fg_and_bg() {
+        let style = CellStyle {
+            fg: CellColor::Rgb(0x11, 0x22, 0x33),
+            bg: CellColor::Rgb(0x44, 0x55, 0x66),
+            inverse: true,
+            ..cell_style()
+        };
+        let snap = local_snapshot(vec![vec![plain_cell('a', style)]]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        let run = &frame.rows[0][0];
+        assert_eq!(run.fg, 0x445566);
+        assert_eq!(run.bg, Some(0x112233));
+    }
+
+    #[test]
+    fn local_frame_hidden_cell_paints_its_own_background_as_foreground() {
+        let style = CellStyle {
+            fg: CellColor::Rgb(0xaa, 0xbb, 0xcc),
+            bg: CellColor::Rgb(0x10, 0x20, 0x30),
+            hidden: true,
+            ..cell_style()
+        };
+        let snap = local_snapshot(vec![vec![plain_cell('a', style)]]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        let run = &frame.rows[0][0];
+        assert_eq!(run.fg, 0x102030);
+        assert_eq!(run.bg, Some(0x102030));
+    }
+
+    #[test]
+    fn local_frame_wide_character_spans_two_cells_and_skips_its_spacer() {
+        let snap = local_snapshot(vec![vec![
+            plain_cell('個', cell_style()),
+            wide_spacer_cell(),
+        ]]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.rows[0].len(), 1);
+        assert_eq!(frame.rows[0][0].text, "個");
+        assert_eq!(frame.rows[0][0].cells, 2);
+    }
+
+    #[test]
+    fn local_frame_cursor_present_reports_its_viewport_position() {
+        let mut snap = local_snapshot(vec![vec![plain_cell(' ', cell_style())]]);
+        snap.cursor = SnapshotCursor {
+            col: 3,
+            row: Some(2),
+            style: CursorStyle::Block,
+        };
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.cursor, Some((3, 2)));
+    }
+
+    #[test]
+    fn local_frame_cursor_hidden_or_scrolled_out_reports_absent() {
+        let mut snap = local_snapshot(vec![vec![plain_cell(' ', cell_style())]]);
+        snap.cursor = SnapshotCursor {
+            col: 3,
+            row: Some(2),
+            style: CursorStyle::Hidden,
+        };
+        assert_eq!(local_paint_frame(&snap, theme(), &always_safe).cursor, None);
+
+        snap.cursor = SnapshotCursor {
+            col: 3,
+            row: None,
+            style: CursorStyle::Block,
+        };
+        assert_eq!(local_paint_frame(&snap, theme(), &always_safe).cursor, None);
+    }
+
+    #[test]
+    fn local_frame_background_is_the_viewer_theme_background() {
+        let snap = local_snapshot(vec![]);
+        let frame = local_paint_frame(&snap, theme(), &always_safe);
+        assert_eq!(frame.background, theme().background);
+    }
+
+    fn wire_run(col: u16, width: u16, text: &str, fg: &str, bg: Option<&str>) -> WireRun {
+        WireRun {
+            col,
+            width,
+            text: text.to_string(),
+            fg: fg.to_string(),
+            bg: bg.map(str::to_string),
+            b: false,
+            i: false,
+            u: false,
+        }
+    }
+
+    fn wire_snapshot(rows: Vec<Vec<WireRun>>, background: &str) -> WireSnapshot {
+        WireSnapshot {
+            cols: rows.first().map(|r| r.len() as u16).unwrap_or(0),
+            lines: rows.len() as u16,
+            cursor: None,
+            app_cursor: false,
+            rows,
+            history: Vec::new(),
+            bracketed_paste: false,
+            mouse_tracking: false,
+            background: background.to_string(),
+        }
+    }
+
+    #[test]
+    fn wire_frame_of_an_empty_grid_has_no_rows() {
+        let wire = wire_snapshot(vec![], "#000000");
+        let frame = wire_paint_frame(&wire);
+        assert_eq!(frame.rows, Vec::<Vec<Run>>::new());
+    }
+
+    #[test]
+    fn wire_frame_decodes_hex_colors_and_width_directly() {
+        let wire = wire_snapshot(
+            vec![vec![wire_run(0, 2, "hi", "#ff8800", Some("#001122"))]],
+            "#000000",
+        );
+        let frame = wire_paint_frame(&wire);
+        let run = &frame.rows[0][0];
+        assert_eq!(run.col, 0);
+        assert_eq!(run.text, "hi");
+        assert_eq!(run.cells, 2);
+        assert_eq!(run.fg, 0xff8800);
+        assert_eq!(run.bg, Some(0x001122));
+    }
+
+    #[test]
+    fn wire_frame_carries_bold_italic_underline() {
+        let mut run = wire_run(0, 1, "x", "#ffffff", None);
+        run.b = true;
+        run.i = true;
+        run.u = true;
+        let wire = wire_snapshot(vec![vec![run]], "#000000");
+        let frame = wire_paint_frame(&wire);
+        let out = &frame.rows[0][0];
+        assert!(out.bold);
+        assert!(out.italic);
+        assert!(out.underline);
+    }
+
+    #[test]
+    fn wire_frame_none_background_picks_up_the_snapshot_background() {
+        let wire = wire_snapshot(vec![vec![wire_run(0, 1, "x", "#ffffff", None)]], "#123456");
+        let frame = wire_paint_frame(&wire);
+        assert_eq!(frame.rows[0][0].bg, Some(0x123456));
+        assert_eq!(frame.background, 0x123456);
+    }
+
+    #[test]
+    fn wire_frame_explicit_background_is_kept_over_the_snapshot_background() {
+        let wire = wire_snapshot(
+            vec![vec![wire_run(0, 1, "x", "#ffffff", Some("#abcdef"))]],
+            "#123456",
+        );
+        let frame = wire_paint_frame(&wire);
+        assert_eq!(frame.rows[0][0].bg, Some(0xabcdef));
+    }
+
+    #[test]
+    fn wire_frame_cursor_present_reports_its_position() {
+        let mut wire = wire_snapshot(vec![], "#000000");
+        wire.cursor = Some(WireCursor { col: 5, row: 1 });
+        assert_eq!(wire_paint_frame(&wire).cursor, Some((5, 1)));
+    }
+
+    #[test]
+    fn wire_frame_cursor_absent_reports_none() {
+        let wire = wire_snapshot(vec![], "#000000");
+        assert_eq!(wire_paint_frame(&wire).cursor, None);
+    }
+
+    #[test]
+    fn wire_frame_a_wide_character_and_its_spacer_arrive_pre_merged_as_one_run() {
+        // The broadcaster already folded the spacer into the run's width
+        // (wire.rs's row_runs) — the adapter must not try to re-derive
+        // per-glyph advance from it, only copy col/width/text through.
+        let wire = wire_snapshot(vec![vec![wire_run(0, 2, "個", "#ffffff", None)]], "#000000");
+        let frame = wire_paint_frame(&wire);
+        assert_eq!(frame.rows[0].len(), 1);
+        assert_eq!(frame.rows[0][0].text, "個");
+        assert_eq!(frame.rows[0][0].cells, 2);
+    }
+
+    #[test]
+    fn wire_frame_never_recoalesces_adjacent_same_style_runs() {
+        // Proves the wire path is a straight copy, not a re-run of
+        // coalesce_runs: two separately emitted runs with identical style
+        // stay two runs, because the wire is authoritative about run
+        // boundaries and per-glyph pinning is local-only (D5).
+        let wire = wire_snapshot(
+            vec![vec![
+                wire_run(0, 1, "a", "#ffffff", None),
+                wire_run(1, 1, "b", "#ffffff", None),
+            ]],
+            "#000000",
+        );
+        let frame = wire_paint_frame(&wire);
+        assert_eq!(frame.rows[0].len(), 2);
     }
 }

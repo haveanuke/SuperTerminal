@@ -283,6 +283,16 @@ otherwise:
 - Selection and search do not cross the wire (`wire.rs` omits them by design).
 - Frames arrive on the SSE cadence with a 200ms floor and a 1MB serialized cap;
   a very large grid degrades rather than streaming perfectly.
+- Wide-character alignment on an attached pane may differ subtly from the
+  same terminal viewed locally. The local renderer verifies each glyph's
+  shaped advance against its grid span and pins a mismeasured glyph to its
+  own column (`pane.rs`'s `coalesce_runs`); the wire has already merged
+  cells into `WireRun { col, width, text }` (`wire.rs:116`) before that
+  check could run, so once a wide character and its spacer become one
+  string plus a total width, the receiver cannot tell which glyph consumed
+  the extra cell. Attached panes draw wire runs as given rather than
+  guessing — a wrong guess would misplace every character after it on the
+  row.
 
 These are acceptable for a first cut ONLY because they are named. Each is a
 candidate for later work; none should surprise anyone.
