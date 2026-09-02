@@ -75,8 +75,16 @@ pub enum Status {
     /// Spawned; no successful stream yet (including while waiting out a
     /// reconnect delay after a prior successful stream dropped).
     Connecting,
-    /// A stream is open and has produced at least one frame within
-    /// `stream::IDLE_GAP`.
+    /// A stream is open and has produced at least one frame on the CURRENT
+    /// connection.
+    ///
+    /// Not downgraded as frames age. A broadcaster only emits a frame when
+    /// its grid changes, so a remote terminal sitting at a prompt sends
+    /// heartbeats and nothing else — and heartbeats reset the socket read
+    /// timeout without waking `next_frame`. `Live` therefore means "the peer
+    /// is reachable and this stream is real", which is what a caller asking
+    /// about liveness wants; [`Attachment::freshness`] is the separate,
+    /// honest answer to "how old is what I am painting".
     Live,
     /// The peer answered 404: the session is not shared with us, or does
     /// not exist -- the server deliberately does not distinguish those, so

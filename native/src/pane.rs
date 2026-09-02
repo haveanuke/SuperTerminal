@@ -892,11 +892,10 @@ impl TerminalPane {
 
     /// Whether frames are still arriving. `Stale` with no attachment at all,
     /// which is the honest answer: nothing is arriving.
-    fn attachment_freshness(&self) -> Freshness {
-        match self.attachment.as_ref() {
-            Some(attachment) => attachment.freshness(std::time::Instant::now()),
-            None => Freshness::Stale,
-        }
+    /// The attachment's stream status, or `None` when this pane has no
+    /// attachment at all — which reads the same way: nothing is arriving.
+    fn attachment_status(&self) -> Option<Status> {
+        self.attachment.as_ref().map(|a| a.status())
     }
 
     /// The activity this pane's PEER answers with, already combined under
@@ -908,7 +907,7 @@ impl TerminalPane {
     /// answer (`Unknown`, since nothing is fresh yet), never this Mac's.
     fn peer_activity(&self) -> Option<Activity> {
         self.views_remote()
-            .then(|| attached_activity(self.attachment_freshness(), self.peer_report()))
+            .then(|| attached_activity(self.attachment_status(), self.peer_report()))
     }
 
     /// Whether the terminal on the other end is gone for good. See
@@ -1632,8 +1631,8 @@ fn shell_is_live(attached: bool, remote_ended: bool, local_shell_live: bool) -> 
 /// **The stale-wins rule**, which is this phase's whole reason for having
 /// two signals instead of one.
 ///
-/// `freshness` says whether frames are still arriving
-/// (`attach::Attachment::freshness`); `report` says what the peer's last
+/// `status` says whether the STREAM is still alive
+/// (`attach::Attachment::status`); `report` says what the peer's last
 /// `/sessions` poll claimed about this session
 /// (`sessions::SessionPoller::report_for`). Neither alone is the pane's
 /// activity:
@@ -1641,21 +1640,35 @@ fn shell_is_live(attached: bool, remote_ended: bool, local_shell_live: bool) -> 
 /// * The attachment cannot report activity at all — a `WireSnapshot` carries
 ///   geometry, rows, cursor and two mode flags, never activity.
 /// * The poll can, but a poll answers about a session, not about the stream
-///   this pane is painting. If frames have stopped, a cached "busy" from
-///   thirty seconds ago is exactly the stale signal `Unknown` exists to
-///   represent, and letting the fresher poll override the stale stream would
-///   have this pane assert something about a terminal it is no longer
+///   this pane is painting. If the stream has died, letting the poll speak
+///   would have this pane assert something about a terminal it is no longer
 ///   receiving.
 ///
-/// So: STALE WINS, unconditionally. And within a fresh attachment, only a
+/// **This gate was `Freshness` and that was wrong** — wrong in the brief this
+/// task was written from, so it is recorded here rather than quietly fixed.
+/// `freshness` compares against `last_frame_at`, and a broadcaster only emits
+/// a frame when its grid changes. A remote terminal sitting at a prompt —
+/// the commonest state a terminal is in — emits heartbeats and no frames, so
+/// it went `Stale` six seconds after its last output and stayed there. That
+/// made `Unknown` permanent and `Idle` reachable only in a six-second tail,
+/// and `Unknown` is hold-steady in `AwakeHold`, so one attached pane at a
+/// prompt would have stopped the Mac ever sleeping again.
+///
+/// `Status::Live` is the signal that actually means what the rule wanted: the
+/// heartbeats are arriving, so the peer is reachable and this stream is real.
+/// A genuinely broken stream leaves `Live` (`Connecting`/`Unavailable`/
+/// `Gone`), so stale-wins survives intact — it just now triggers on the
+/// stream dying rather than on the remote user stopping typing.
+///
+/// So: A DEAD STREAM WINS, unconditionally. And within a live one, only a
 /// current successful poll may speak — an unpolled or unreachable peer is
 /// `Unknown`, and a session the peer no longer lists is `Unknown` too, not
 /// `Idle`: "gone from the list" cannot distinguish a shell that exited from
 /// a share that was revoked (see [`SessionReport::Ended`]), and the second
 /// case may well still be busy. `Idle` is only ever the peer, reachable and
 /// current, saying `"idle"` about a session whose frames are still arriving.
-fn attached_activity(freshness: Freshness, report: SessionReport) -> Activity {
-    if freshness == Freshness::Stale {
+fn attached_activity(status: Option<Status>, report: SessionReport) -> Activity {
+    if status != Some(Status::Live) {
         return Activity::Unknown;
     }
     match report {
@@ -4508,18 +4521,45 @@ mod attached_input_tests {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let handle = std::thread::spawn(move || drain_peer_input(rx, sink));
         tx.send(b"lost".to_vec()).unwrap();
-        // Wait for the first to be consumed before queueing the second, so
-        // they cannot coalesce into one batch.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while batches.lock().unwrap().is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
+
+        // Waiting on `batches` is NOT enough, and an earlier version of this
+        // test was racy for exactly that reason: `deliver` records the batch
+        // BEFORE returning `Failed`, so the wait can release while the drain
+        // thread is still inside `deliver` and has not yet reached the
+        // discard loop. A second send landing in that window is swallowed by
+        // the discard — correct behaviour, failing test.
+        //
+        // So: keep offering the second line until it is actually taken. The
+        // discard drains whatever is queued, so a send that lands during it
+        // simply disappears and we try again; once the loop is back at
+        // `recv`, one gets through. That also removes the other half of the
+        // race, where a slow machine let both sends coalesce into one batch.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while batches.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            if tx.send(b"echo ok\r".to_vec()).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        tx.send(b"echo ok\r".to_vec()).unwrap();
         drop(tx);
         assert!(wait_for_exit(&handle), "the drain loop must finish");
         let seen = batches.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2, "the loop must keep running after a failure");
-        assert_eq!(seen[1], b"echo ok\r".to_vec());
+        assert!(
+            seen.len() >= 2,
+            "the loop must keep running after a failure, saw {seen:?}"
+        );
+        // Narrow on purpose: ONE failed request must not silence the pane
+        // for good. Anything stricter asserts about coalescing, which is
+        // timing-dependent BY DESIGN — under load the retry legitimately
+        // merges into the first batch, so neither the batch count nor the
+        // exact split is a contract. An earlier version pinned `seen[0]`
+        // and passed in isolation while failing in a full run, which is the
+        // worst shape a test can have.
+        assert_eq!(
+            seen.last().unwrap(),
+            b"echo ok\r",
+            "the last thing offered must have been delivered, saw {seen:?}"
+        );
     }
 
     #[test]
@@ -4672,60 +4712,92 @@ mod attached_activity_tests {
 
     // --- the stale-wins rule ------------------------------------------------
 
+    /// Every status a stream can be in EXCEPT `Live`. Enumerated rather
+    /// than sampled: each one means "this pane is not receiving", and a new
+    /// variant added later must be considered here rather than silently
+    /// defaulting to "go ahead and trust the poll".
+    const EVERY_DEAD_STATUS: [Option<Status>; 7] = [
+        None,
+        Some(Status::Connecting),
+        Some(Status::Refused),
+        Some(Status::Gone),
+        Some(Status::Unavailable),
+        Some(Status::Incompatible),
+        Some(Status::Connecting),
+    ];
+
     #[test]
-    fn stale_frames_beat_every_answer_a_poll_could_give() {
-        // The rule `attach.rs` wrote down for this phase to inherit. A poll
-        // is about a SESSION; this pane is showing a STREAM. Once the stream
-        // stops, what the peer said thirty seconds ago is exactly the stale
-        // signal `Unknown` exists to represent — including, especially, a
-        // cached "busy", which a fresher poll would otherwise keep asserting
-        // about a terminal this pane is no longer receiving.
-        for report in EVERY_REPORT {
+    fn a_stream_that_is_not_live_beats_every_answer_a_poll_could_give() {
+        // A poll is about a SESSION; this pane is showing a STREAM. Once the
+        // stream is gone, what the peer said is exactly the stale signal
+        // `Unknown` exists to represent — including, especially, a cached
+        // "busy", which would otherwise keep being asserted about a terminal
+        // this pane is no longer receiving.
+        for status in EVERY_DEAD_STATUS {
+            for report in EVERY_REPORT {
+                assert_eq!(
+                    attached_activity(status, report),
+                    Activity::Unknown,
+                    "{status:?} reported something other than Unknown for {report:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_stream_reports_exactly_what_a_current_poll_said() {
+        // With the stream alive, the poll is the only thing that knows what
+        // the terminal is DOING, so it passes through untouched — all three
+        // states, not just the two a boolean could carry.
+        for activity in [Activity::Busy, Activity::Idle, Activity::Unknown] {
             assert_eq!(
-                attached_activity(Freshness::Stale, report),
-                Activity::Unknown,
-                "a stale attachment reported something other than Unknown for {report:?}"
+                attached_activity(Some(Status::Live), SessionReport::Listed(activity)),
+                activity
             );
         }
     }
 
     #[test]
-    fn a_fresh_attachment_reports_exactly_what_a_current_poll_said() {
-        // The other half: with frames arriving, the poll is the only thing
-        // that knows what the terminal is DOING, so it passes through
-        // untouched — all three states, not just the two a boolean could
-        // carry.
+    fn a_quiet_but_connected_terminal_still_reports_idle() {
+        // The bug this gate was changed to fix, pinned so it cannot return.
+        // A remote terminal at a prompt emits heartbeats and NO frames, so
+        // the old freshness gate called it stale six seconds after its last
+        // output and reported `Unknown` from then on — permanently, for the
+        // commonest state a terminal is in. `Unknown` is hold-steady in
+        // `AwakeHold`, so that one pane would have stopped the Mac sleeping.
         assert_eq!(
-            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Busy)),
-            Activity::Busy
-        );
-        assert_eq!(
-            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Idle)),
-            Activity::Idle
-        );
-        assert_eq!(
-            attached_activity(Freshness::Fresh, SessionReport::Listed(Activity::Unknown)),
-            Activity::Unknown
+            attached_activity(Some(Status::Live), SessionReport::Listed(Activity::Idle)),
+            Activity::Idle,
+            "a live stream with an idle session must report Idle no matter how long ago the last frame was"
         );
     }
 
     #[test]
-    fn nothing_but_a_reachable_peer_naming_a_live_session_may_produce_idle() {
+    fn nothing_but_a_live_stream_and_a_reachable_peer_may_produce_idle() {
         // `Idle` authorises: it releases the caffeinate hold, permits cues,
         // and reads as "at a prompt". Enumerated over the whole input space
         // so no combination can quietly acquire it — in particular, neither
         // "no poll has succeeded" nor "the peer no longer lists it" may,
         // since a session gone from the list may equally be one whose SHARE
         // was revoked while it keeps right on working.
-        for freshness in [Freshness::Fresh, Freshness::Stale] {
+        let every_status = [
+            None,
+            Some(Status::Live),
+            Some(Status::Connecting),
+            Some(Status::Refused),
+            Some(Status::Gone),
+            Some(Status::Unavailable),
+            Some(Status::Incompatible),
+        ];
+        for status in every_status {
             for report in EVERY_REPORT {
-                let answer = attached_activity(freshness, report);
-                let earned = freshness == Freshness::Fresh
-                    && report == SessionReport::Listed(Activity::Idle);
+                let answer = attached_activity(status, report);
+                let earned =
+                    status == Some(Status::Live) && report == SessionReport::Listed(Activity::Idle);
                 assert_eq!(
                     answer == Activity::Idle,
                     earned,
-                    "{freshness:?} + {report:?} answered {answer:?}"
+                    "{status:?} + {report:?} answered {answer:?}"
                 );
             }
         }
@@ -4733,14 +4805,14 @@ mod attached_activity_tests {
 
     #[test]
     fn an_unpolled_or_ended_session_is_unknown_even_while_frames_still_arrive() {
-        // Freshness alone is not activity: a stream can be perfectly healthy
-        // while nothing has told us what the terminal is doing.
+        // A live stream is not activity: it can be perfectly healthy while
+        // nothing has told us what the terminal is doing.
         assert_eq!(
-            attached_activity(Freshness::Fresh, SessionReport::Unpolled),
+            attached_activity(Some(Status::Live), SessionReport::Unpolled),
             Activity::Unknown
         );
         assert_eq!(
-            attached_activity(Freshness::Fresh, SessionReport::Ended),
+            attached_activity(Some(Status::Live), SessionReport::Ended),
             Activity::Unknown
         );
     }
@@ -5058,31 +5130,42 @@ mod attached_activity_tests {
             poller.last_poll()
         );
 
-        // Frames arriving + the peer saying busy: the pane is busy.
+        // A live stream + the peer saying busy: the pane is busy.
         let now = Instant::now();
         let report = poller.report_for("t1");
-        assert_eq!(attachment.freshness(now), Freshness::Fresh);
+        assert_eq!(attachment.status(), Status::Live);
         assert_eq!(
-            attached_activity(attachment.freshness(now), report),
+            attached_activity(Some(attachment.status()), report),
             Activity::Busy
         );
         assert!(!remote_session_ended(report, Some(attachment.status())));
 
-        // Nothing changes on the wire — the server, hub, session and socket
-        // are all still running and the poll still says busy — but the
-        // clock moves past the frame gap. The cached "busy" must NOT
-        // survive it.
+        // Now the clock runs far past the frame gap with NOTHING else
+        // changing: server, hub, session and socket all still up, heartbeats
+        // still flowing, poll still saying busy. This is the ordinary state
+        // of a terminal nobody is typing into, and the pane must go on
+        // reporting what the peer says rather than deciding it has no idea.
+        //
+        // This assertion is the regression guard for the gate that used to
+        // read `freshness` here: `freshness` is genuinely `Stale` at this
+        // instant — that is the point — and reporting on it made every quiet
+        // remote terminal permanently `Unknown`.
         let much_later = now + Duration::from_secs(600);
-        assert_eq!(attachment.freshness(much_later), Freshness::Stale);
+        assert_eq!(
+            attachment.freshness(much_later),
+            Freshness::Stale,
+            "the frame gap really has elapsed, or this proves nothing"
+        );
+        assert_eq!(attachment.status(), Status::Live, "yet the stream is alive");
         assert_eq!(
             poller.report_for("t1"),
             SessionReport::Listed(Activity::Busy),
-            "the poll must still be saying busy, or this proves nothing"
+            "and the poll must still be saying busy, or this proves nothing"
         );
         assert_eq!(
-            attached_activity(attachment.freshness(much_later), poller.report_for("t1")),
-            Activity::Unknown,
-            "a fresher poll must never override a stale attachment"
+            attached_activity(Some(attachment.status()), poller.report_for("t1")),
+            Activity::Busy,
+            "a live stream must keep reporting the peer's answer however long ago the last frame was"
         );
 
         // The broadcaster's pane closes, exactly as its workspace sweep does
@@ -5114,7 +5197,7 @@ mod attached_activity_tests {
             poller.last_poll()
         );
         assert_eq!(
-            attached_activity(Freshness::Fresh, poller.report_for("t1")),
+            attached_activity(Some(Status::Live), poller.report_for("t1")),
             Activity::Unknown,
             "an ended session is Unknown, never Idle: it may equally have been un-shared"
         );
