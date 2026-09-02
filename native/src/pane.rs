@@ -84,6 +84,10 @@ pub struct TerminalPane {
     /// never the remote PTY. Meaningless (and unread) while `attached_frame`
     /// is `None`.
     attached_scroll_offset: usize,
+    /// Sub-line remainder carried between wheel events, so a slow trackpad
+    /// gesture accumulates into a line instead of rounding to nothing on
+    /// every event. See [`scroll_lines_from_delta`].
+    scroll_accum: f32,
     focus_handle: FocusHandle,
     theme: &'static Theme,
     font_family: SharedString,
@@ -444,6 +448,7 @@ impl TerminalPane {
             snapshot,
             attached_frame: None,
             attached_scroll_offset: 0,
+            scroll_accum: 0.0,
             focus_handle: cx.focus_handle(),
             theme,
             font_family: font_family.into(),
@@ -921,6 +926,33 @@ fn busy_dot(
         }
     }
     since_output < COMPANION_BUSY_WINDOW
+}
+
+/// Whole lines to scroll for one wheel event, plus the fraction to carry
+/// into the next one.
+///
+/// The carry is the entire point. macOS sends PRECISE pixel deltas for a
+/// trackpad gesture — often 1-8px per event — while a line is
+/// `font_size * 1.4`, i.e. 20px at the default size. Rounding each event on
+/// its own therefore produced 0 for every event of a gentle two-finger
+/// scroll, and discarding the remainder meant those events summed to
+/// nothing no matter how long the gesture ran. A mouse wheel was unaffected
+/// because macOS sends one large delta per notch, which is why this looked
+/// like a per-machine quirk rather than a bug.
+///
+/// `trunc` rather than `round`, so the retained fraction always points the
+/// same way as the motion that produced it; rounding would let a reversal
+/// strand a fraction pointing the wrong way and lose a line.
+fn scroll_lines_from_delta(accum: f32, delta_px: f32, line_height: f32) -> (i32, f32) {
+    // Before the first layout `line_height` is 0. Dividing by it yields inf
+    // or NaN, and a NaN carry would poison every later event — the pane
+    // would never scroll again for as long as it lived.
+    if !(line_height > 0.0) || !delta_px.is_finite() || !accum.is_finite() {
+        return (0, if accum.is_finite() { accum } else { 0.0 });
+    }
+    let total = accum + delta_px / line_height;
+    let lines = total.trunc();
+    (lines as i32, total - lines)
 }
 
 /// Lines to scroll per auto-scroll step while a selection drag sits past the
@@ -2072,7 +2104,12 @@ impl Render for TerminalPane {
                 cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
                     let _ = &pane_for_scroll;
                     let delta = event.delta.pixel_delta(this.line_height).y;
-                    let lines = (f32::from(delta) / f32::from(this.line_height)).round() as i32;
+                    let (lines, carry) = scroll_lines_from_delta(
+                        this.scroll_accum,
+                        f32::from(delta),
+                        f32::from(this.line_height),
+                    );
+                    this.scroll_accum = carry;
                     if lines != 0 {
                         // The one site that makes an attached pane's
                         // scrollback reachable at all: Task 3 built the
@@ -2266,7 +2303,8 @@ mod tests {
     use super::{
         attached_paint_frame, busy_dot, clamp_attached_offset, coalesce_runs, container_background,
         drag_scroll_lines, local_paint_frame, may_broadcast_locally, parse_wire_hex,
-        windowed_wire_rows, wire_paint_frame, CellLook, ContainerBg, Run, COMPANION_BUSY_WINDOW,
+        scroll_lines_from_delta, windowed_wire_rows, wire_paint_frame, CellLook, ContainerBg, Run,
+        COMPANION_BUSY_WINDOW,
     };
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
@@ -3007,6 +3045,96 @@ mod tests {
         let wire = wire_snapshot_with_history(history, rows, "#123456");
         let attached = attached_paint_frame(&wire, 2);
         assert_eq!(row_labels(&attached.rows), vec!["h3", "h4", "r0"]);
+    }
+
+    #[test]
+    fn a_slow_trackpad_gesture_accumulates_into_a_line_instead_of_vanishing() {
+        // The reported bug: at the default font size a line is 20px, and
+        // macOS sends 1-8px per event for a gentle two-finger scroll. Each
+        // event alone rounds to zero, so the OLD code scrolled nothing no
+        // matter how long the gesture ran.
+        let line = 20.0;
+        let mut accum = 0.0;
+        let mut scrolled = 0;
+        for _ in 0..5 {
+            let (lines, carry) = scroll_lines_from_delta(accum, 5.0, line);
+            accum = carry;
+            scrolled += lines;
+        }
+        assert_eq!(scrolled, 1, "five 5px events are exactly one 20px line");
+        // The old implementation, for contrast: every event independently
+        // rounded to zero and kept nothing.
+        assert_eq!((5.0f32 / line).round() as i32, 0);
+    }
+
+    #[test]
+    fn the_carry_is_retained_rather_than_zeroed_after_a_line_is_emitted() {
+        // If the remainder were dropped on emit, a continuous gesture would
+        // lose a fraction of a line every time it crossed one, and long
+        // scrolls would drift progressively short.
+        let (lines, carry) = scroll_lines_from_delta(0.0, 30.0, 20.0);
+        assert_eq!(lines, 1);
+        assert!(
+            (carry - 0.5).abs() < 1e-6,
+            "half a line must survive to the next event, got {carry}"
+        );
+    }
+
+    #[test]
+    fn one_exact_line_leaves_no_remainder() {
+        let (lines, carry) = scroll_lines_from_delta(0.0, 20.0, 20.0);
+        assert_eq!(lines, 1);
+        assert_eq!(carry, 0.0);
+    }
+
+    #[test]
+    fn a_flick_still_scrolls_its_full_distance_in_one_event() {
+        // Accumulating must not throttle a large delta: a mouse wheel notch
+        // or a fast swipe still moves everything it asked for at once.
+        let (lines, _) = scroll_lines_from_delta(0.0, 205.0, 20.0);
+        assert_eq!(lines, 10);
+    }
+
+    #[test]
+    fn reversing_direction_does_not_strand_the_previous_remainder() {
+        // Scroll most of a line one way, then the same distance back: the
+        // net movement is zero and no line may be emitted in either
+        // direction. `round` instead of `trunc` breaks exactly this.
+        let (a, carry) = scroll_lines_from_delta(0.0, 18.0, 20.0);
+        assert_eq!(a, 0);
+        let (b, carry) = scroll_lines_from_delta(carry, -18.0, 20.0);
+        assert_eq!(b, 0, "the reversal must cancel, not emit a line");
+        assert!(
+            carry.abs() < 1e-6,
+            "and must land back at zero, got {carry}"
+        );
+    }
+
+    #[test]
+    fn a_zero_line_height_is_ignored_and_never_poisons_the_carry() {
+        // `line_height` is 0 before the first layout. Dividing by it gives
+        // inf/NaN, and a NaN carry would make the pane unscrollable for the
+        // rest of its life.
+        let (lines, carry) = scroll_lines_from_delta(0.25, 12.0, 0.0);
+        assert_eq!(lines, 0);
+        assert!(carry.is_finite(), "carry must stay finite, got {carry}");
+        assert_eq!(carry, 0.25, "an ignored event must not disturb the carry");
+    }
+
+    #[test]
+    fn a_non_finite_input_cannot_wedge_scrolling_forever() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (lines, carry) = scroll_lines_from_delta(0.5, bad, 20.0);
+            assert_eq!(lines, 0);
+            assert!(carry.is_finite(), "{bad} left a non-finite carry");
+        }
+        // And a carry that somehow already went bad recovers rather than
+        // staying stuck.
+        let (_, carry) = scroll_lines_from_delta(f32::NAN, 20.0, 20.0);
+        assert!(
+            carry.is_finite(),
+            "a poisoned carry must reset, not persist"
+        );
     }
 
     #[test]
