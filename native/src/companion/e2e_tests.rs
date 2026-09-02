@@ -541,25 +541,20 @@ fn version_advertises_a_protocol_and_capabilities() {
         .unwrap();
     let mut body = String::new();
     let _ = std::io::Read::read_to_string(&mut stream, &mut body);
-    // NOTE: this expected value was deliberately changed by the peer-phase
-    // C2b Task 1 brief, not discovered as a conflict -- the brief names
-    // the exact old value ("protocol": 1) and the exact new one
-    // (`wire::PROTOCOL_VERSION` == 2) as the breaking change the task
-    // exists to make, since `WireSnapshot::background` is now a required
-    // field older peers cannot parse. See `wire::PROTOCOL_VERSION`'s doc.
-    assert!(
-        body.contains(&format!(
-            "\"protocol\":{}",
-            crate::companion::wire::PROTOCOL_VERSION
-        )),
-        "{body}"
-    );
+    // These are LITERALS on purpose, and must stay literals. This value
+    // went 1 -> 2 in peer-phase C2b Task 1 because `WireSnapshot`
+    // gained a required `background` field older peers cannot parse.
+    //
+    // Deriving the expectation from `wire::PROTOCOL_VERSION` would make
+    // this test a tautology: it would re-derive whatever the server just
+    // serialized and pass for ANY value, including an accidental bump.
+    // The wire protocol is a contract with OTHER MACHINES, some running
+    // older builds, so a bump SHOULD fail here and make a human confirm
+    // the break was deliberate. That is this assertion's whole job.
+    assert!(body.contains("\"protocol\":2"), "{body}");
     assert!(body.contains("\"capabilities\""), "{body}");
     assert!(body.contains("peer-input"), "{body}");
-    assert!(
-        body.contains(crate::companion::wire::CAP_SNAPSHOT_BACKGROUND),
-        "{body}"
-    );
+    assert!(body.contains("snapshot-background"), "{body}");
 
     handle.stop();
     session
