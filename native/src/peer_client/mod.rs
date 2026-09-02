@@ -16,6 +16,7 @@ use crate::companion::server::INPUT_CONTENT_TYPE;
 pub mod attach;
 mod sse;
 mod stream;
+mod version;
 
 /// A cap on the whole status-line-plus-headers section of a response. Our
 /// own server's responses are always small (a handful of security headers

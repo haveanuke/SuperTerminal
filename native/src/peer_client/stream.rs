@@ -274,7 +274,7 @@ mod tests {
         row.iter().map(|r| r.text.as_str()).collect()
     }
 
-    const MINIMAL_FRAME: &[u8] = b"data: {\"cols\":1,\"lines\":1,\"cursor\":null,\"appCursor\":false,\"rows\":[],\"bracketedPaste\":false,\"mouseTracking\":false}\n\n";
+    const MINIMAL_FRAME: &[u8] = b"data: {\"cols\":1,\"lines\":1,\"cursor\":null,\"appCursor\":false,\"rows\":[],\"bracketedPaste\":false,\"mouseTracking\":false,\"background\":\"#000000\"}\n\n";
 
     fn respond_sse_head(stream: &mut TcpStream) {
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");

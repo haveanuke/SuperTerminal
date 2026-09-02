@@ -28,6 +28,7 @@ use super::hub::CompanionHub;
 use super::input::{
     parse_body, parse_peer_bytes, parse_rename, symbolic_bytes, text_bytes, InputMsg,
 };
+use super::wire::{CAP_SNAPSHOT_BACKGROUND, PROTOCOL_VERSION};
 
 pub const MAX_CONNS: usize = 8;
 pub const MAX_SSE: usize = 4;
@@ -516,8 +517,8 @@ fn serve_connection<S: InputSink>(shared: &Shared<S>, stream: TcpStream) {
             let json = serde_json::json!({
                 "version": crate::settings::APP_VERSION,
                 "build": shared.build,
-                "protocol": 1,
-                "capabilities": ["principals", "origin", "peer-input"],
+                "protocol": PROTOCOL_VERSION,
+                "capabilities": ["principals", "origin", "peer-input", CAP_SNAPSHOT_BACKGROUND],
             })
             .to_string();
             let _ = respond(

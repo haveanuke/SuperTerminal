@@ -541,9 +541,25 @@ fn version_advertises_a_protocol_and_capabilities() {
         .unwrap();
     let mut body = String::new();
     let _ = std::io::Read::read_to_string(&mut stream, &mut body);
-    assert!(body.contains("\"protocol\":1"), "{body}");
+    // NOTE: this expected value was deliberately changed by the peer-phase
+    // C2b Task 1 brief, not discovered as a conflict -- the brief names
+    // the exact old value ("protocol": 1) and the exact new one
+    // (`wire::PROTOCOL_VERSION` == 2) as the breaking change the task
+    // exists to make, since `WireSnapshot::background` is now a required
+    // field older peers cannot parse. See `wire::PROTOCOL_VERSION`'s doc.
+    assert!(
+        body.contains(&format!(
+            "\"protocol\":{}",
+            crate::companion::wire::PROTOCOL_VERSION
+        )),
+        "{body}"
+    );
     assert!(body.contains("\"capabilities\""), "{body}");
     assert!(body.contains("peer-input"), "{body}");
+    assert!(
+        body.contains(crate::companion::wire::CAP_SNAPSHOT_BACKGROUND),
+        "{body}"
+    );
 
     handle.stop();
     session

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use crate::companion::wire::WireSnapshot;
 
 use super::stream;
+use super::version;
 use super::{Endpoint, PeerError};
 
 /// Wait between reconnect attempts on an unexpected drop. Fixed, not
@@ -46,6 +47,12 @@ pub const MAX_RECONNECTS: u32 = 5;
 /// -- matches [`stream::CONNECT_DEADLINE`]'s magnitude since both bound a
 /// single request/response, not a held-open stream.
 const SEND_DEADLINE: Duration = Duration::from_secs(5);
+/// TOTAL round-trip budget for the one-time `/version` compatibility check
+/// `run` performs before ever attempting `/stream/<id>` — see
+/// `check_peer_version`. Same magnitude as `SEND_DEADLINE` /
+/// `stream::CONNECT_DEADLINE`: a single one-shot request/response, not a
+/// held-open stream.
+const VERSION_CHECK_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Are frames still arriving. Pure function of wall-clock time since the
 /// last snapshot actually parsed off the wire -- NOT of whether the
@@ -87,6 +94,18 @@ pub enum Status {
     /// stopped trying) but not a statement about the peer's session --
     /// unlike `Refused`/`Gone`, this is about OUR ability to reach it.
     Unavailable,
+    /// The peer answered `/version`, but advertises a wire protocol (or is
+    /// missing a required capability) this build cannot speak -- checked
+    /// ONCE, before `run` ever attempts to open `/stream/<id>` (see
+    /// `check_peer_version`), so a wire-shape mismatch is reported as ONE
+    /// clear, up-front refusal instead of the generic, repeated-per-frame
+    /// `BadResponse("frame was not a valid snapshot")`
+    /// (`stream.rs::StreamConn::next_frame`) an unversioned client would
+    /// hit instead -- that failure never happens on real traffic because
+    /// this status is reached first. TERMINAL: never reconnected, matching
+    /// `Refused`/`Gone` -- a peer's protocol does not change mid-session,
+    /// so retrying cannot help.
+    Incompatible,
 }
 
 struct AttachState {
@@ -275,19 +294,128 @@ fn classify(err: &PeerError) -> Outcome {
     }
 }
 
+/// GETs `/version` and translates the result into either "compatible,
+/// proceed" or an [`Outcome`] for `run`'s existing retry/terminal
+/// handling. A wrong secret or an unreachable peer behaves identically
+/// whether it fails here or at `stream::open` (both go through
+/// [`classify`]); the ONE new terminal case this function adds is a peer
+/// that answers but speaks a protocol (or lacks a capability) this build
+/// does not -- see [`Status::Incompatible`].
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_peer_version(endpoint: &Endpoint) -> Result<(), Outcome> {
+    match super::get(endpoint, "/version", VERSION_CHECK_DEADLINE) {
+        Ok(body) => match version::check_version(&body) {
+            version::VersionCheck::Compatible => Ok(()),
+            version::VersionCheck::Incompatible | version::VersionCheck::Unparseable => {
+                Err(Outcome::Terminal(Status::Incompatible))
+            }
+        },
+        Err(err) => Err(classify(&err)),
+    }
+}
+
+/// Opens `/stream/<session_id>` and, on success, blocks consuming frames
+/// until something goes wrong -- one full connection attempt. Factored out
+/// of `run`'s loop so the version-check preamble (`check_peer_version`)
+/// can sit in front of it, on the first successful pass only, without a
+/// second copy of this block at that one extra call site.
+///
+/// Returns `None` when `weak` no longer upgrades (the `Attachment` was
+/// dropped mid-flight) -- the caller must `return` immediately in that
+/// case, exactly like every other `weak.upgrade()` check in this module.
+/// `reconnects` is a `&mut` into `run`'s own counter rather than owned
+/// here, because only THIS function's frame arrivals may reset it (C3):
+/// a peer that connects but never sends a valid frame must not defeat
+/// `MAX_RECONNECTS` by construction.
+#[cfg_attr(not(test), allow(dead_code))]
+fn try_open_stream(
+    endpoint: &Endpoint,
+    session_id: &str,
+    weak: &Weak<Attachment>,
+    reconnects: &mut u32,
+) -> Option<Outcome> {
+    match stream::open(endpoint, session_id, stream::CONNECT_DEADLINE) {
+        Ok(mut conn) => {
+            // Deliberately NOT `*reconnects = 0` here (C3): a peer that
+            // accepts and answers with valid SSE headers has not proven
+            // anything yet -- only a real parsed frame below does.
+            // Resetting on mere connection success would let a peer that
+            // always connects but never sends a valid frame defeat
+            // `MAX_RECONNECTS` by construction. Also deliberately NOT
+            // `Status::Live` here (I1): that variant means a frame has
+            // arrived, not merely that a socket is open -- see
+            // `record_frame`, the only place it is set.
+            let attachment = weak.upgrade()?;
+            // INVARIANT: a stream this loop proceeds to read from must
+            // ALWAYS have a registered interrupt handle -- unlike other
+            // secondary I/O errors in this module, a failed clone here is
+            // not merely tolerated. If `try_clone_socket` fails (fd
+            // exhaustion is the realistic cause) and we pressed on anyway,
+            // `live_socket` would still hold the PREVIOUS, already-dead
+            // connection's clone (or nothing at all): a reconnect later,
+            // `Drop` shuts down a corpse (or nothing), the new
+            // connection's blocked read has no interrupt path, and the
+            // thread hangs on a heartbeat-only stream forever -- C1
+            // again. Clearing `live_socket` instead would not fix this:
+            // `Drop` would just no-op. So a clone failure is treated as a
+            // connection failure and takes the retry path -- and since
+            // the failure mode under fd pressure is itself "leak a thread
+            // and a socket," refusing to proceed also avoids making that
+            // pressure worse.
+            let clone_outcome = match conn.try_clone_socket() {
+                Ok(sock) => {
+                    *attachment.live_socket.lock().unwrap() = Some(sock);
+                    None
+                }
+                Err(e) => Some(classify(&PeerError::Io(e))),
+            };
+            drop(attachment);
+
+            if let Some(outcome) = clone_outcome {
+                Some(outcome)
+            } else {
+                loop {
+                    match conn.next_frame(stream::IDLE_GAP) {
+                        Ok(snapshot) => {
+                            *reconnects = 0;
+                            let attachment = weak.upgrade()?;
+                            attachment.record_frame(snapshot);
+                            drop(attachment);
+                        }
+                        Err(err) => break Some(classify(&err)),
+                    }
+                }
+            }
+        }
+        Err(err) => Some(classify(&err)),
+    }
+}
+
 /// The background loop: connect, stream frames into `Attachment::state`
 /// until something goes wrong, then either stop for good (a terminal
 /// `Outcome`) or wait `RECONNECT_DELAY` and try again, up to
 /// `MAX_RECONNECTS` consecutive failures.
 ///
+/// Before the FIRST successful `stream::open`, every iteration also runs
+/// `check_peer_version` (the phase's protocol gate) -- `version_confirmed`
+/// latches to `true` the moment that check passes so it never repeats on
+/// later reconnects: a peer's advertised protocol cannot change mid-
+/// session, so re-checking it on every retry would only add a redundant
+/// round trip. A version-check failure feeds the SAME retry/terminal
+/// handling as a `stream::open` failure (the shared `outcome` match
+/// below): `Outcome::Terminal(Status::Incompatible)` for an answered-but-
+/// incompatible peer, `Outcome::Retry` (via `classify`) for a connectivity
+/// failure indistinguishable from any other blip.
+///
 /// Holds `weak` -- never a strong `Arc` -- across every blocking call
-/// (`stream::open`, `StreamConn::next_frame`, `thread::sleep`): each
-/// iteration upgrades just long enough to read the fixed endpoint/session,
-/// register the live socket, or publish a result, then drops it before
-/// blocking again -- the lifecycle pattern named in the brief
-/// (`blender.rs:30`). `stream::open` and the reconnect sleep are genuinely
-/// bounded (`CONNECT_DEADLINE`, `RECONNECT_DELAY`), so `weak.upgrade()`
-/// alone is enough to make the thread notice a drop within one of those.
+/// (`check_peer_version`, `stream::open`, `StreamConn::next_frame`,
+/// `thread::sleep`): each iteration upgrades just long enough to read the
+/// fixed endpoint/session, register the live socket, or publish a result,
+/// then drops it before blocking again -- the lifecycle pattern named in
+/// the brief (`blender.rs:30`). `check_peer_version`, `stream::open` and
+/// the reconnect sleep are genuinely bounded (`VERSION_CHECK_DEADLINE`,
+/// `CONNECT_DEADLINE`, `RECONNECT_DELAY`), so `weak.upgrade()` alone is
+/// enough to make the thread notice a drop within one of those.
 /// `StreamConn::next_frame` is NOT bounded the same way: its read timeout
 /// is per-syscall and a heartbeat resets it, so a quiet peer that only
 /// ever sends `:hb` never lets that call return on its own. Registering
@@ -298,6 +426,7 @@ fn classify(err: &PeerError) -> Outcome {
 #[cfg_attr(not(test), allow(dead_code))]
 fn run(weak: Weak<Attachment>) {
     let mut reconnects: u32 = 0;
+    let mut version_confirmed = false;
     loop {
         let Some(attachment) = weak.upgrade() else {
             return;
@@ -307,64 +436,22 @@ fn run(weak: Weak<Attachment>) {
         attachment.attempts.fetch_add(1, Ordering::AcqRel);
         drop(attachment);
 
-        let outcome = match stream::open(&endpoint, &session_id, stream::CONNECT_DEADLINE) {
-            Ok(mut conn) => {
-                // Deliberately NOT `reconnects = 0` here (C3): a peer that
-                // accepts and answers with valid SSE headers has not
-                // proven anything yet -- only a real parsed frame below
-                // does. Resetting on mere connection success would let a
-                // peer that always connects but never sends a valid frame
-                // defeat `MAX_RECONNECTS` by construction. Also
-                // deliberately NOT `Status::Live` here (I1): that variant
-                // means a frame has arrived, not merely that a socket is
-                // open -- see `record_frame`, the only place it is set.
-                let Some(attachment) = weak.upgrade() else {
-                    return;
-                };
-                // INVARIANT: a stream this loop proceeds to read from must
-                // ALWAYS have a registered interrupt handle -- unlike other
-                // secondary I/O errors in this module, a failed clone here
-                // is not merely tolerated. If `try_clone_socket` fails (fd
-                // exhaustion is the realistic cause) and we pressed on
-                // anyway, `live_socket` would still hold the PREVIOUS,
-                // already-dead connection's clone (or nothing at all): a
-                // reconnect later, `Drop` shuts down a corpse (or nothing),
-                // the new connection's blocked read has no interrupt path,
-                // and the thread hangs on a heartbeat-only stream forever
-                // -- C1 again. Clearing `live_socket` instead would not fix
-                // this: `Drop` would just no-op. So a clone failure is
-                // treated as a connection failure and takes the retry path
-                // -- and since the failure mode under fd pressure is
-                // itself "leak a thread and a socket," refusing to
-                // proceed also avoids making that pressure worse.
-                let clone_outcome = match conn.try_clone_socket() {
-                    Ok(sock) => {
-                        *attachment.live_socket.lock().unwrap() = Some(sock);
-                        None
-                    }
-                    Err(e) => Some(classify(&PeerError::Io(e))),
-                };
-                drop(attachment);
-
-                if let Some(outcome) = clone_outcome {
-                    outcome
-                } else {
-                    loop {
-                        match conn.next_frame(stream::IDLE_GAP) {
-                            Ok(snapshot) => {
-                                reconnects = 0;
-                                let Some(attachment) = weak.upgrade() else {
-                                    return;
-                                };
-                                attachment.record_frame(snapshot);
-                                drop(attachment);
-                            }
-                            Err(err) => break classify(&err),
-                        }
+        let outcome = if version_confirmed {
+            match try_open_stream(&endpoint, &session_id, &weak, &mut reconnects) {
+                Some(outcome) => outcome,
+                None => return,
+            }
+        } else {
+            match check_peer_version(&endpoint) {
+                Ok(()) => {
+                    version_confirmed = true;
+                    match try_open_stream(&endpoint, &session_id, &weak, &mut reconnects) {
+                        Some(outcome) => outcome,
+                        None => return,
                     }
                 }
+                Err(outcome) => outcome,
             }
-            Err(err) => classify(&err),
         };
 
         match outcome {
@@ -402,7 +489,7 @@ mod tests {
     use crate::companion::hub::tests::RegisterLocalPty;
     use crate::companion::hub::{CompanionHub, Hub};
     use crate::companion::server::{start, ServerConfig};
-    use crate::companion::wire::WireRun;
+    use crate::companion::wire::{WireRun, CAP_SNAPSHOT_BACKGROUND, PROTOCOL_VERSION};
     use crate::peers::{Grants, PeerRecord};
     use crate::term_session::{
         CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell, SnapshotCursor,
@@ -476,6 +563,27 @@ mod tests {
 
     fn row_text(row: &[WireRun]) -> String {
         row.iter().map(|r| r.text.as_str()).collect()
+    }
+
+    /// Writes a COMPATIBLE `/version` response over a raw socket -- the
+    /// exact shape `server.rs` serves after this task, matching real
+    /// traffic. The raw-socket tests below speak HTTP by hand rather than
+    /// through `start()`, so they must answer the version-check preamble
+    /// `run` now performs before it will ever open `/stream/<id>`.
+    fn respond_compatible_version(stream: &mut TcpStream) {
+        let body = serde_json::json!({
+            "version": "test",
+            "build": "test",
+            "protocol": PROTOCOL_VERSION,
+            "capabilities": ["principals", "origin", "peer-input", CAP_SNAPSHOT_BACKGROUND],
+        })
+        .to_string();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
     }
 
     /// Polls `cond` until it is true or `timeout` elapses, returning
@@ -845,6 +953,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // First connection: the version-check preamble `run` now
+            // performs before it will ever open `/stream/<id>` -- must
+            // answer compatibly or the client never gets far enough to
+            // exercise the heartbeat-only stream this test is about.
+            let Ok((mut version_stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = version_stream.read(&mut buf);
+            respond_compatible_version(&mut version_stream);
+            drop(version_stream);
+
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -970,6 +1090,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
+            // First connection: the version-check preamble, answered
+            // compatibly ONCE -- `run` never repeats it once confirmed, so
+            // every connection after this one is a `/stream/<id>` attempt.
+            let Ok((mut version_stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = version_stream.read(&mut buf);
+            respond_compatible_version(&mut version_stream);
+            drop(version_stream);
+
             for _ in 0..(MAX_RECONNECTS as usize + 4) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
@@ -1008,6 +1139,131 @@ mod tests {
             MAX_RECONNECTS + 1,
             "one initial attempt plus MAX_RECONNECTS retries, no more and no fewer, \
              even though every one of them connected"
+        );
+    }
+
+    #[test]
+    fn a_peer_advertising_the_current_protocol_and_capability_is_accepted() {
+        // `start()` serves a REAL `/version` -- after this task's
+        // `server.rs` change it already advertises `PROTOCOL_VERSION` and
+        // `CAP_SNAPSHOT_BACKGROUND`, so reaching `Live` here proves the
+        // gate let a compatible peer through rather than merely never
+        // having been wired in. Same setup as
+        // `attaching_to_a_shared_session_reaches_live_and_receives_a_snapshot`,
+        // named separately so the gate's PASS half is asserted explicitly
+        // rather than only incidentally.
+        let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
+        let hub = Arc::new(Hub::new());
+        hub.register("t1", "attach-version-ok", session.input_sender());
+        let peer_id = PeerId("peerVersionOk".into());
+        hub.set_visible_to("t1", &peer_id, true);
+        hub.publish_snapshot("t1", Arc::new(seeded_snapshot("hello")));
+
+        const SECRET: &str = "versionokversionokversionokverso";
+        let handle = start(
+            Arc::clone(&hub),
+            crate::themes::default_theme(),
+            ServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                token: "phonephonephonephonephonephoneph".into(),
+                page: "<title>attach-version-ok-test</title>",
+                previews: previews(),
+                thumbs: thumbs(),
+                peers: vec![PeerRecord {
+                    id: peer_id,
+                    host: "peer.local".into(),
+                    label: "peer".into(),
+                    secret: SECRET.into(),
+                    grants: full_grants(),
+                }],
+            },
+        )
+        .expect("server starts");
+        let endpoint = Endpoint {
+            addr: handle.addr(),
+            secret: SECRET.into(),
+        };
+
+        let attachment = spawn(endpoint, "t1");
+        assert!(
+            wait_until(
+                || attachment.status() == Status::Live && attachment.latest().is_some(),
+                Duration::from_secs(5)
+            ),
+            "status: {:?}, latest present: {}",
+            attachment.status(),
+            attachment.latest().is_some()
+        );
+
+        handle.stop();
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_peer_advertising_an_old_protocol_is_refused_before_any_stream_is_opened() {
+        // The mirror of the test above, and the actual novel behavior this
+        // task adds: a peer stuck on the OLD wire shape (`server.rs`'s
+        // literal pre-task response: `protocol: 1`, no
+        // `snapshot-background`) must be refused from the `/version`
+        // answer alone -- never getting as far as opening `/stream/<id>`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (conn_tx, conn_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // Answers EVERY connection it receives, so if the client
+            // opened a second connection (the `/stream/<id>` attempt this
+            // test must prove never happens), the mock is ready to accept
+            // it rather than the absence of a second `accept()` call being
+            // what silently avoided that connection.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = conn_tx.send(());
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "version": "old",
+                    "build": "old-build",
+                    "protocol": 1,
+                    "capabilities": ["principals", "origin", "peer-input"],
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+            }
+        });
+        let endpoint = Endpoint {
+            addr,
+            secret: "whatever-secret-32-chars-long!!".into(),
+        };
+
+        let attachment = spawn(endpoint, "t1");
+        assert!(
+            conn_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "mock peer never received the /version request"
+        );
+        assert!(
+            wait_until(
+                || attachment.status() == Status::Incompatible,
+                Duration::from_secs(3)
+            ),
+            "status: {:?} -- an old peer must be refused, not merely fail to connect",
+            attachment.status()
+        );
+        assert_eq!(
+            attachment.attempts(),
+            1,
+            "Incompatible is terminal on the FIRST attempt: no retry, unlike a transient \
+             failure or a generic per-frame parse error (which retries up to MAX_RECONNECTS)"
+        );
+        assert!(
+            conn_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a second connection means a stream was opened despite the version refusal"
         );
     }
 

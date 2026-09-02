@@ -38,6 +38,16 @@ pub struct WireSnapshot {
     // mis-handle paste/mouse mode rather than failing loudly.
     pub bracketed_paste: bool,
     pub mouse_tracking: bool,
+    /// "#rrggbb", the broadcaster's theme's ACTUAL background — required,
+    /// no `#[serde(default)]`, ALWAYS serialized, exactly like the two mode
+    /// booleans above: an absent background and a default one must not be
+    /// ambiguous to a client deciding what to paint behind the runs. This
+    /// is what `WireRun.bg: None` ("page background shows through")
+    /// resolves to — the phone gets away without it because `page.html`
+    /// supplies its own static `--bg`, but a native attached pane has no
+    /// such fallback and would otherwise paint the broadcaster's
+    /// foreground over the VIEWER's background.
+    pub background: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -119,6 +129,22 @@ fn hex(v: u32) -> String {
     format!("#{v:06x}")
 }
 
+/// Wire protocol version this build speaks — advertised at `/version`
+/// (`server.rs`) and checked by `peer_client::version` before a native peer
+/// ever attaches (`peer_client::attach`). Bump this whenever a wire-shape
+/// change here would otherwise break an older or newer peer silently
+/// instead of being refused up front. Named so both the serve site
+/// (`server.rs`) and the check site (`peer_client::attach`) read from one
+/// definition — a hardcoded `2` repeated in both files is how the next
+/// bump goes wrong.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// A capability name carried in `/version`'s `capabilities` array,
+/// asserting that `WireSnapshot::background` is sent by this build. Same
+/// reasoning as [`PROTOCOL_VERSION`]: named once, read at both the serve
+/// site and the check site.
+pub const CAP_SNAPSHOT_BACKGROUND: &str = "snapshot-background";
+
 fn row_runs(row: &[crate::term_session::SnapshotCell], theme: &Theme) -> Vec<WireRun> {
     let mut runs: Vec<WireRun> = Vec::new();
     let mut current: Option<(Resolved, u16, String, u16)> = None; // (style, col, text, width)
@@ -183,6 +209,7 @@ pub fn serialize_snapshot(snapshot: &RenderableSnapshot, theme: &Theme) -> WireS
         history,
         bracketed_paste: snapshot.bracketed_paste,
         mouse_tracking: snapshot.mouse_tracking,
+        background: hex(theme.background),
     }
 }
 
@@ -439,15 +466,67 @@ mod tests {
         assert_eq!(parsed.lines, 1);
         assert!(parsed.bracketed_paste);
         assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.background, wire.background);
     }
 
     #[test]
     fn an_absent_history_field_parses_as_empty() {
         // `history` is skipped when empty, so the client must tolerate it
-        // being absent rather than treating that as malformed.
-        let json = r#"{"cols":1,"lines":1,"cursor":null,"appCursor":false,"rows":[[]],"bracketedPaste":false,"mouseTracking":false}"#;
+        // being absent rather than treating that as malformed. `background`
+        // is required (unlike `history`), so this fixture — otherwise a
+        // pre-Task-1 wire shape — carries one to stay a valid CURRENT-
+        // protocol payload; that requiredness is exercised separately by
+        // `an_absent_background_field_fails_to_parse` below.
+        let json = r##"{"cols":1,"lines":1,"cursor":null,"appCursor":false,"rows":[[]],"bracketedPaste":false,"mouseTracking":false,"background":"#000000"}"##;
         let parsed: WireSnapshot = serde_json::from_str(json).expect("must parse");
         assert!(parsed.history.is_empty());
+    }
+
+    #[test]
+    fn an_absent_background_field_fails_to_parse() {
+        // The mirror of the test above: `background` is NOT optional like
+        // `history` is. A client build new enough to expect it must fail
+        // loudly on a payload that omits it (an older broadcaster) rather
+        // than silently defaulting — see `PROTOCOL_VERSION`'s doc for why
+        // that failure is exactly what the version gate exists to prevent
+        // from ever happening on live traffic.
+        let json = r#"{"cols":1,"lines":1,"cursor":null,"appCursor":false,"rows":[[]],"bracketedPaste":false,"mouseTracking":false}"#;
+        let result: Result<WireSnapshot, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "a payload missing `background` must not parse: {result:?}"
+        );
+    }
+
+    #[test]
+    fn background_is_always_serialized_and_reads_the_actual_theme_not_a_hardcoded_value() {
+        let s = snap(vec![vec![cell('a', style())]]);
+
+        // Two themes with DIFFERENT backgrounds: a hardcoded stand-in
+        // (matching one theme's background by coincidence, or any fixed
+        // value) would fail to track the second one.
+        let theme_a = theme().clone();
+        let mut theme_b = theme().clone();
+        theme_b.background = 0x123456;
+        assert_ne!(
+            theme_a.background, theme_b.background,
+            "the two themes must actually differ for this test to prove anything"
+        );
+
+        let wire_a = serialize_snapshot(&s, &theme_a);
+        let wire_b = serialize_snapshot(&s, &theme_b);
+        assert_eq!(wire_a.background, hex(theme_a.background));
+        assert_eq!(wire_b.background, hex(theme_b.background));
+        assert_eq!(wire_b.background, "#123456");
+        assert_ne!(
+            wire_a.background, wire_b.background,
+            "background must follow the theme passed in, not a fixed value"
+        );
+
+        // ALWAYS serialized, exactly like `bracketedPaste`/`mouseTracking`
+        // — never omitted, never behind `skip_serializing_if`.
+        let json = serde_json::to_string(&wire_b).unwrap();
+        assert!(json.contains("\"background\":\"#123456\""), "{json}");
     }
 
     #[test]
