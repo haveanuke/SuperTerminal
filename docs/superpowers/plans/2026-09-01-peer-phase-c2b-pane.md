@@ -214,7 +214,7 @@ without panicking or clamping to the wrong end.
 - Modify: `native/src/pane.rs`
 - Test: pure predicates, inline
 
-`pane.rs` references `self.session` at sixteen sites. An attached pane has NO session — no PTY, no local process. Each site must answer correctly rather than incidentally.
+`pane.rs` reaches for the session at **twenty-one** sites, not sixteen. An attached pane has NO session — no PTY, no local process. Each site must answer correctly rather than incidentally.
 
 Go through all sixteen and classify each in your report:
 - **correct as-is** because `Option` already yields the right answer for a remote pane;
@@ -222,11 +222,24 @@ Go through all sixteen and classify each in your report:
 - **should be unreachable** for a remote pane, and is structurally prevented from being called.
 
 A review has already classified them; verify each rather than trusting this list.
-**The list below has already been corrected once, and the correction is
-instructive:** it cited line 408 as a `self.session` site, but 408 contains no
-such reference — the real sites are the sixteen below. That phantom entry had
-displaced a REAL one, `has_live_shell()` (496), which went unclassified. Verify
-by grep, not by trust.
+**The list below has been corrected TWICE, and both corrections are
+instructive.**
+
+First: it cited line 408 as a `self.session` site, but 408 contains no such
+reference. That phantom had displaced a REAL one, `has_live_shell()`, which went
+unclassified.
+
+Second, and worse: the whole inventory was built by grepping `self.session`,
+which MISSES every site inside a closure. Five more exist —
+two spelled `this.session` (gpui event listeners) and three spelled
+`pane.session` (the pump). Those five are not an afterthought: they are the
+mouse, scroll, and output paths, i.e. exactly what a user's hands touch. An
+inventory that finds only the method bodies and none of the handlers is the
+same "named instance, missed sibling" failure this task exists to prevent,
+committed by the plan itself.
+
+**Grep all three spellings — `self.session`, `this.session`, `pane.session` —
+and reconcile to twenty-one before classifying anything.**
 
 The verified sixteen, with their enclosing functions: `cwd()` 481,
 `has_live_shell()` 496, `foreground_busy()` 501, `foreground_activity()` 513,
@@ -255,6 +268,27 @@ The verified sixteen, with their enclosing functions: `cwd()` 481,
   `EventLoopSender` type and its consumers (`companion_ui.rs:79`,
   `workspace/mod.rs:1166`) mean returning a fake or remote sender would be a bad
   seam. Remote input goes through the attachment queue instead (Task 5).
+**The five closure sites, classified:**
+- `pane.session` in the companion-publish path (`sync_and_snapshot_with_live`):
+  **correct as-is, and load-bearing.** `None` here is what stops an attached pane
+  re-publishing a terminal it does not own — it enforces D4 by accident today, so
+  do not "fix" it into working. Add a test pinning that an attached pane never
+  publishes.
+- `pane.session`'s `take_dirty()` in the pump: **plausible-but-wrong.** `None`
+  means never dirty, so an attached pane would never mark activity and never
+  refresh. Freshness must come from the attachment instead.
+- `this.session` in `on_scroll_wheel` (`queue_scroll`): **plausible-but-wrong,
+  and this is where the attached scrollback becomes reachable at all.** Task 3
+  built the windowing function and wired it into `render()`, but nothing drives
+  the offset; this site is the driver. Route it to `attached_scroll_offset` for
+  an attached pane. The sign convention is already fixed by the local path —
+  positive `lines` scrolls back into history, matching `drag_scroll_lines`
+  returning positive when the pointer is above the top edge.
+- `this.session` and `pane.session` in the selection paths
+  (`queue_selection_update`, drag-autoscroll): selection does not cross the wire
+  (D5), so these must be gated, not generalised. Task 7 owns the gating; name the
+  requirement here so it is not lost.
+
 - **Structurally unreachable ONLY IF the UI gates them:** `set_search()` (633),
   `search_next()` (643), and selection start (1648). Today the search overlay and
   click-drag can reach the focused pane without target gating (see
@@ -262,9 +296,17 @@ The verified sixteen, with their enclosing functions: `cwd()` 481,
   the user searches an attached pane and nothing happens, with no explanation.
   Gating them is Task 7's job; name the requirement here so it is not lost.
 
-**This is the phase's highest-risk task**, because a site that answers plausibly-but-wrongly will not fail a test — it will quietly mislead a consumer. Enumerate all sixteen; do not stop at the ones listed here.
+**Also in scope, found during Task 3:** `render()`'s "[process exited]" overlay
+reads `self.snapshot.exited` directly. For an attached pane that snapshot is
+empty or describes something else, so the overlay would never appear when the
+REMOTE process exits — a terminal that has died looking alive indefinitely. It
+is not spelled `session`, which is exactly why the grep missed it; treat "reads
+local state to answer a question about a remote terminal" as the real category,
+not the literal token.
 
-- [ ] **Step 1: Enumerate and classify all sixteen sites IN THE REPORT before changing any**
+**This is the phase's highest-risk task**, because a site that answers plausibly-but-wrongly will not fail a test — it will quietly mislead a consumer. Enumerate all twenty-one; do not stop at the ones listed here.
+
+- [ ] **Step 1: Enumerate and classify all twenty-one sites IN THE REPORT before changing any**
 - [ ] **Step 2: Write failing tests for the predicates you extract**
 - [ ] **Step 3: Implement**
 - [ ] **Step 4: `cargo test`; local behaviour unchanged**
