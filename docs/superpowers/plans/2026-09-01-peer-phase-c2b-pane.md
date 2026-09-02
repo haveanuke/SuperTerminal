@@ -200,16 +200,32 @@ Go through all sixteen and classify each in your report:
 - **needs a target-aware answer** because the `None` result would be wrong or misleading;
 - **should be unreachable** for a remote pane, and is structurally prevented from being called.
 
-A review has already classified them; verify each rather than trusting this list,
-but start here:
+A review has already classified them; verify each rather than trusting this list.
+**The list below has already been corrected once, and the correction is
+instructive:** it cited line 408 as a `self.session` site, but 408 contains no
+such reference — the real sites are the sixteen below. That phantom entry had
+displaced a REAL one, `has_live_shell()` (496), which went unclassified. Verify
+by grep, not by trust.
 
-- **Correct as-is:** `cwd()` (481), local broadcast registration (408, if it stays
-  session-gated), `process_events()` (582), the render-path local sync (1193), and
+The verified sixteen, with their enclosing functions: `cwd()` 481,
+`has_live_shell()` 496, `foreground_busy()` 501, `foreground_activity()` 513,
+`companion_busy()` 526, `status_activity()` 549, `input_sender()` 567,
+`shutdown()` 578, `process_events()` 582, `write_self()` 627, `set_search()` 633,
+`search_next()` 643, `scroll_to_bottom_on_input()` 932, `render()` 1193,
+`resize_to()` 1577, `handle_click()` 1648.
+
+- **Correct as-is:** `cwd()` (481), `process_events()` (582), the render-path
+  local sync (1193), and
   `resize_to()` (1577) — the last ONLY if the UI states that geometry is
   broadcaster-owned rather than letting a resize silently do nothing.
 - **Needs a target/attachment-aware answer:** `foreground_activity()` (513),
-  `status_activity()` (549), `shutdown()` (578), `write_self()` (627), and
-  probably `scroll_to_bottom_on_input()` (932).
+  `status_activity()` (549), `shutdown()` (578), `write_self()` (627),
+  probably `scroll_to_bottom_on_input()` (932), and **`has_live_shell()` (496)**.
+  That last one is the site the phantom hid, and it is not cosmetic: it gates the
+  folder picker's `cd` at `workspace/mod.rs:2270`. Left as `None -> false`, a user
+  picks a folder for an attached pane and NOTHING HAPPENS, with no explanation —
+  the same silent-no-op failure this task exists to prevent. A remote pane's shell
+  liveness is the ATTACHMENT's liveness, not the absence of a local session.
 - **Plausible-but-wrong if left to return `None -> false/idle`:**
   `foreground_busy()` (501) through `companion_busy()`/`companion_activity()`
   (526/541). A remote pane would look IDLE rather than unknown or peer-reported —
