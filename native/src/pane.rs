@@ -1634,9 +1634,18 @@ fn ime_anchor(
 /// proves the peer's arithmetic is self-consistent, never that it matches
 /// what was drawn.
 ///
-/// ASCII is the only claim this can verify without a shaper: one byte, one
-/// char, one column, no clusters, no combining. So a run is mappable only
-/// if it is entirely ASCII AND its length matches its declared width.
+/// Third round: `is_ascii()` was still too loose. It admits C0 controls and
+/// DEL, and a peer can pad a run with BEL bytes, set `width` to the byte
+/// count, and pass — while gpui renders those controls as zero-width, so
+/// the visible text after them shifts left under columns the scanner still
+/// reads as part of the earlier token. BEL, ESC and DEL are not whitespace,
+/// so they do not even break the token.
+///
+/// PRINTABLE ASCII (`0x20..=0x7e`) is the claim this can actually verify
+/// without a shaper: one byte, one char, one column, no clusters, no
+/// combining, no control whose rendering would have to be proven. Tab is
+/// excluded deliberately along with the rest — its width depends on tab
+/// stops this code does not model.
 ///
 /// The cost is real and accepted: a row mixing non-ASCII text with a URL is
 /// not clickable on an attached pane. URLs themselves are ASCII, so this
@@ -1645,9 +1654,11 @@ fn ime_anchor(
 fn wire_row_text(runs: &[WireRun], cols: usize) -> Option<String> {
     let mut cells = vec![' '; cols];
     for run in runs {
-        // `len()` is bytes, which equals chars and columns for ASCII only —
-        // which is exactly why the ASCII check has to come first.
-        if !run.text.is_ascii() || run.text.len() != run.width as usize {
+        // `len()` is bytes, which equals chars and columns for PRINTABLE
+        // ASCII only — which is why the byte-range check comes first.
+        if !run.text.bytes().all(|b| (0x20..=0x7e).contains(&b))
+            || run.text.len() != run.width as usize
+        {
             return None;
         }
         let start = run.col as usize;
@@ -5942,6 +5953,40 @@ mod attached_ui_tests {
             None,
             "self-consistent is not the same as column-mappable"
         );
+    }
+
+    #[test]
+    fn control_bytes_are_refused_even_though_they_are_ascii() {
+        // Third round of this bug. `is_ascii()` admits C0 and DEL, and a
+        // peer can pad with BEL, set width to the byte count, and pass —
+        // while those bytes render zero-width, sliding the visible safe url
+        // under columns the scanner reads as part of the earlier one. BEL,
+        // ESC and DEL are not whitespace, so they do not break the token
+        // either.
+        for control in ["\u{7}", "\u{1b}", "\u{7f}", "\t"] {
+            let text = format!("http://evil.example/{control} http://safe.example");
+            let run = WireRun {
+                col: 0,
+                // Consistent by byte count: this is what slips past a check
+                // that only compares lengths.
+                width: text.len() as u16,
+                text: text.clone(),
+                fg: "#c0caf5".to_string(),
+                bg: None,
+                b: false,
+                i: false,
+                u: false,
+            };
+            assert!(
+                run.text.is_ascii(),
+                "the fixture must be ASCII, or it proves nothing about the ASCII check"
+            );
+            assert_eq!(
+                wire_row_text(&[run], 80),
+                None,
+                "a run carrying {control:?} must be refused"
+            );
+        }
     }
 
     #[test]
