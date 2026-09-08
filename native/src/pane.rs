@@ -158,6 +158,8 @@ pub struct TerminalPane {
     measured_size: Option<(Pixels, Pixels)>,
     blink_on: bool,
     blink_tick: u32,
+    /// Slow counter for the cwd-cache refresh; see the pump.
+    cwd_tick: u32,
     /// Held marked text during IME composition (not yet sent to the PTY).
     marked_text: Option<String>,
     broadcast: std::sync::Arc<BroadcastHub>,
@@ -408,6 +410,19 @@ impl TerminalPane {
                         pane.blink_on = !pane.blink_on;
                         cx.notify();
                     }
+                    // Keep the cwd cache warm — roughly once a second, one
+                    // ioctl and one procfs read per LOCAL pane. The sidebar
+                    // already polls this while it is open; without a poll of
+                    // our own the cache would be cold whenever it is shut,
+                    // and a project closed with `exit` while it is shut is
+                    // exactly the case this exists to save.
+                    pane.cwd_tick += 1;
+                    if pane.cwd_tick >= 62 {
+                        pane.cwd_tick = 0;
+                        if let Some(session) = pane.session.as_ref() {
+                            session.refresh_cwd_cache();
+                        }
+                    }
                     // An attached pane's refresh is PUSHED by the frame that
                     // arrived, not polled off a local grid — `take_dirty()`
                     // answers "never dirty" forever with no session, and must
@@ -526,6 +541,7 @@ impl TerminalPane {
             measured_size: None,
             blink_on: true,
             blink_tick: 0,
+            cwd_tick: 0,
             marked_text: None,
             broadcast,
             auto_run: None,
@@ -573,6 +589,16 @@ impl TerminalPane {
 
     pub fn cwd(&self) -> Option<String> {
         self.session.as_ref()?.cwd()
+    }
+
+    /// Where this pane's shell is, or was before it exited.
+    ///
+    /// Only for remembering a project. `cwd()` stays the answer to "where
+    /// is this terminal now", which is `None` for a dead shell and which
+    /// panels and the folder picker rely on. A remote pane has no local
+    /// directory at all, here as everywhere.
+    pub fn last_known_cwd(&self) -> Option<String> {
+        self.session.as_ref()?.last_known_cwd()
     }
 
     /// Where this pane's shell runs. Local panes behave exactly as before.

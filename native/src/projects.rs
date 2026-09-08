@@ -127,6 +127,27 @@ pub fn now_secs() -> u64 {
 ///   projects. The order survives because reopening spawns one terminal
 ///   per directory, and that is the order the user gets their shells back
 ///   in.
+/// Whether a captured directory set is worth remembering as a project.
+///
+/// A bare `$HOME` is not. Every launch opens a starter tab there, so
+/// recording it would put "home" at the top of recents after any
+/// launch-then-quit — the list filling itself with the one entry that
+/// carries no intent. A project that ALSO contains other directories is
+/// kept whole, `$HOME` included: the exclusion is about a tab nobody did
+/// anything with, not about the folder being forbidden.
+pub fn worth_remembering(dirs: &[PathBuf]) -> bool {
+    if dirs.is_empty() {
+        return false;
+    }
+    if dirs.len() > 1 {
+        return true;
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => dir_key(&dirs[0]) != dir_key(Path::new(&home)),
+        None => true,
+    }
+}
+
 pub fn project_dirs(panes: &[(Target, Option<String>)]) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut dirs = Vec::new();
@@ -238,7 +259,7 @@ impl ProjectStore {
         // reopening spawn two shells in the same place.
         let mut seen = HashSet::new();
         project.dirs.retain(|d| seen.insert(dir_key(d)));
-        if project.dirs.is_empty() {
+        if !worth_remembering(&project.dirs) {
             return;
         }
         // A pinned or renamed record still MATCHES — it just is not
@@ -559,6 +580,32 @@ mod tests {
         assert_eq!(recent.len(), 1, "order must not defeat the match");
         assert_eq!(recent[0].id, "orig");
         assert_eq!(recent[0].last_opened, 500);
+    }
+
+    #[test]
+    fn a_bare_home_starter_tab_is_not_a_project() {
+        // Every launch opens a starter tab in $HOME. Recording it would put
+        // "home" at the top of recents after any launch-then-quit — the
+        // list filling itself with the one entry carrying no intent.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let mut store = ProjectStore::default();
+        store.record(project("starter", &[&home], 100));
+        assert!(
+            store.projects.is_empty(),
+            "a tab that only ever sat in $HOME is not a project"
+        );
+    }
+
+    #[test]
+    fn home_alongside_real_work_is_still_remembered() {
+        // The exclusion is about a tab nobody did anything with, not about
+        // $HOME being forbidden. A project spanning home AND a repo is a
+        // project, and dropping half of it would be worse than the noise.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let mut store = ProjectStore::default();
+        store.record(project("real", &[&home, "/work/repo"], 100));
+        assert_eq!(store.projects.len(), 1);
+        assert_eq!(store.projects[0].dirs.len(), 2, "both directories survive");
     }
 
     #[test]

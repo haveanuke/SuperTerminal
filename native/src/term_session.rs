@@ -417,6 +417,15 @@ pub struct TermSession {
     dirty: Arc<AtomicBool>,
     events: Arc<Mutex<Vec<SessionEvent>>>,
     deferred: Vec<TermOp>,
+    /// Last cwd this session successfully read.
+    ///
+    /// `status()` reports `None` the instant the shell exits, and the
+    /// process is gone by then, so its directory is unrecoverable — which
+    /// silently lost a project every time one was closed by typing `exit`,
+    /// the commonest way there is. Written through on every successful
+    /// probe; read only by [`Self::last_known_cwd`], so no existing caller
+    /// of `cwd()` changes meaning.
+    last_cwd: Mutex<Option<String>>,
     /// Spawned shell pid (for cwd lookup fallback) and PTY master fd (for
     /// foreground-process lookup via tcgetpgrp).
     shell_pid: i32,
@@ -566,6 +575,7 @@ impl TermSession {
             dirty,
             events,
             deferred: Vec::new(),
+            last_cwd: Mutex::new(None),
             shell_pid,
             master_fd,
             title: None,
@@ -704,7 +714,36 @@ impl TermSession {
         let pid = if fg > 0 { fg } else { self.shell_pid };
         let cwd = superterminal_core::proc_cwd::pid_cwd(pid)
             .or_else(|| superterminal_core::proc_cwd::pid_cwd(self.shell_pid));
+        if let Some(cwd) = &cwd {
+            if let Ok(mut last) = self.last_cwd.lock() {
+                *last = Some(cwd.clone());
+            }
+        }
         (cwd, busy)
+    }
+
+    /// The live cwd, or the last one seen if the shell has exited.
+    ///
+    /// Separate from [`Self::cwd`] on purpose. `cwd()` answers "where is
+    /// this terminal now", and `None` for a dead shell is the right answer
+    /// to that — panels and the folder picker depend on it. This answers
+    /// "where WAS it", which is what remembering a project needs, and is
+    /// the difference between a project closed with `exit` being saved and
+    /// being lost.
+    pub fn last_known_cwd(&self) -> Option<String> {
+        let live = self.cwd();
+        if live.is_some() {
+            return live;
+        }
+        self.last_cwd.lock().ok().and_then(|c| c.clone())
+    }
+
+    /// Refresh the cwd cache without caring about the answer. Called on a
+    /// slow tick so the cache is warm even when nothing else is asking —
+    /// the sidebar only polls `status_activity` while it is OPEN, and a
+    /// project must survive being closed with the sidebar shut.
+    pub fn refresh_cwd_cache(&self) {
+        let _ = self.status();
     }
 
     /// Tri-state form of [`Self::status`].
@@ -1520,6 +1559,60 @@ mod tests {
         let snapshot = session.sync_and_snapshot();
         assert_eq!(snapshot.cols, 100);
         assert_eq!(snapshot.lines, 30);
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_shell_that_exited_still_remembers_where_it_was() {
+        // The gap this closes: `status()` returns no cwd the moment the
+        // shell exits, and the process whose directory it would read is
+        // gone — so a project closed by typing `exit`, the commonest way
+        // there is, was captured with no directories and silently dropped.
+        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = test_session(80, 24, Some(PathBuf::from("/private/tmp")));
+        let _ = wait_for(
+            &mut session,
+            |s| grid_contains(s, "$") || grid_contains(s, "%"),
+            10,
+        );
+        // Warm the cache the way the pump's slow tick does.
+        session.refresh_cwd_cache();
+        let before = session.last_known_cwd();
+        assert!(
+            before
+                .as_deref()
+                .is_some_and(|c| c.starts_with("/private/tmp") || c.starts_with("/tmp")),
+            "the live reading must work first, or this proves nothing: {before:?}"
+        );
+
+        session.write(b"exit\r".to_vec());
+        // Drain events the way the existing exit test does: the Exited
+        // event is the contract, and `exited` is only set once it is seen.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_exit = false;
+        while !saw_exit && Instant::now() < deadline {
+            for event in session.drain_events() {
+                if let SessionEvent::Exited(_) = event {
+                    saw_exit = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(saw_exit, "the shell must actually have exited");
+        let _ = session.sync_and_snapshot();
+
+        assert_eq!(
+            session.cwd(),
+            None,
+            "`cwd` still answers 'where is it now', and the answer is nowhere"
+        );
+        assert_eq!(
+            session.last_known_cwd(),
+            before,
+            "but where it WAS is what remembering a project needs"
+        );
         session
             .shutdown()
             .join_with_deadline(Duration::from_secs(3));

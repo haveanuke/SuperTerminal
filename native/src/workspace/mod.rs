@@ -1830,12 +1830,15 @@ impl Workspace {
     /// Every directory `tab`'s LOCAL panes are sitting in right now, in
     /// pane order.
     ///
-    /// Must be called while those panes are still LIVE. `cwd()` asks the
-    /// shell's own process where it is (`proc_cwd::pid_cwd`), so a pane
-    /// already shut down, or already dropped from `self.panes`, has nothing
-    /// left to answer with. That is why every caller below captures BEFORE
-    /// tearing anything down rather than beside the `self.tabs.remove` that
-    /// finally drops the tab.
+    /// Uses `last_known_cwd`, not `cwd`. A shell that has already exited —
+    /// which is what typing `exit`, the commonest way to close a terminal,
+    /// leaves behind — reports no cwd at all, because the process whose
+    /// directory it would read is gone. Capturing on `cwd()` therefore
+    /// silently dropped exactly those projects. The session keeps its last
+    /// successful reading for this, refreshed on a slow tick.
+    ///
+    /// Callers still capture BEFORE tearing anything down: a pane already
+    /// dropped from `self.panes` cannot answer at all, cache or no cache.
     ///
     /// The decision itself — which panes count, dedupe, order — lives in
     /// `projects::project_dirs`, where it is testable without a gpui
@@ -1848,7 +1851,7 @@ impl Workspace {
                 let cwd = self
                     .panes
                     .get(&terminal_id)
-                    .and_then(|pane| pane.read(cx).cwd());
+                    .and_then(|pane| pane.read(cx).last_known_cwd());
                 (target, cwd)
             })
             .collect();

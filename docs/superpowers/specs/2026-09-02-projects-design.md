@@ -119,6 +119,17 @@ later without disturbing anything built here.
   so, rather than failing silently or refusing to open the project.
 - A project whose panes are all remote: `dirs` is empty. Do not persist it —
   there is nothing to reopen.
+- **A tab that only ever sat in `$HOME` is not a project.** Every launch opens a
+  starter tab there, so recording it would put "home" at the top of recents
+  after any launch-then-quit — the list filling itself with the one entry that
+  carries no intent. A project that also contains other directories is kept
+  whole, `$HOME` included: the exclusion is about a tab nobody did anything
+  with, not about the folder being forbidden.
+- **A shell that exited still remembers where it was.** Typing `exit` is the
+  commonest way to close a terminal, and it leaves no process whose directory
+  can be read — so capture reads a last-known cwd the session caches on a slow
+  tick, not the live one. `cwd()` keeps answering "where is it NOW", which is
+  `None` for a dead shell and which panels and the folder picker rely on.
 - The cap evicts the oldest UNPINNED project only, and never the capture that
   was just recorded: `last_opened` comes from the system clock, so a store
   carrying future timestamps (skew, a restored backup, a hand-edited file) would
