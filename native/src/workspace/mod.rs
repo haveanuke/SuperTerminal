@@ -735,6 +735,18 @@ impl Workspace {
             this.save_companion();
         }
         this.add_tab(None, cx);
+        // cmd-q does not close the window: it reaches AppKit's `terminate:`,
+        // which fires `applicationWillTerminate:` -> gpui's quit observers
+        // and only then clears the windows. `shutdown_all` hangs off
+        // `on_window_closed` instead, so without THIS hook a project still
+        // open at quit time would be the one case capture missed. The
+        // callback does its work synchronously and returns an already-ready
+        // future, so gpui's 100ms shutdown budget never bounds it.
+        cx.on_app_quit(|ws: &mut Workspace, cx: &mut Context<Workspace>| {
+            ws.record_open_projects(cx);
+            async {}
+        })
+        .detach();
         cx.spawn(async move |ws, cx| loop {
             cx.background_executor().timer(Duration::from_secs(4)).await;
             if ws
@@ -1589,6 +1601,9 @@ impl Workspace {
     /// Collect shutdown handles for every live pane plus any pending ones.
     /// The caller joins them OFF the UI thread with a bounded deadline.
     pub fn shutdown_all(&mut self, cx: &mut Context<Self>) -> Vec<ShutdownHandle> {
+        // Every open project is about to cease to exist. Remember them all
+        // before a single shell is killed below.
+        self.record_open_projects(cx);
         // Companion first: cancel streams before their sessions die.
         self.stop_companion(cx);
         // Flush a debounced pet-count save so quitting mid-pet loses nothing.
@@ -1810,7 +1825,89 @@ impl Workspace {
         }
     }
 
+    // --- projects: remembering a tab before it disappears ---
+
+    /// Every directory `tab`'s LOCAL panes are sitting in right now, in
+    /// pane order.
+    ///
+    /// Must be called while those panes are still LIVE. `cwd()` asks the
+    /// shell's own process where it is (`proc_cwd::pid_cwd`), so a pane
+    /// already shut down, or already dropped from `self.panes`, has nothing
+    /// left to answer with. That is why every caller below captures BEFORE
+    /// tearing anything down rather than beside the `self.tabs.remove` that
+    /// finally drops the tab.
+    ///
+    /// The decision itself — which panes count, dedupe, order — lives in
+    /// `projects::project_dirs`, where it is testable without a gpui
+    /// harness.
+    fn tab_dirs(&self, tab: &Tab, cx: &App) -> Vec<PathBuf> {
+        let panes: Vec<(crate::hosts::Target, Option<String>)> = tab
+            .all_terminal_targets()
+            .into_iter()
+            .map(|(terminal_id, target)| {
+                let cwd = self
+                    .panes
+                    .get(&terminal_id)
+                    .and_then(|pane| pane.read(cx).cwd());
+                (target, cwd)
+            })
+            .collect();
+        crate::projects::project_dirs(&panes)
+    }
+
+    /// Write `tabs` into the persistent project store, so closing them is
+    /// not the same as losing them.
+    ///
+    /// One load and one save for the whole batch: quitting with eight tabs
+    /// open must not rewrite `projects.json` eight times. What is worth
+    /// keeping, what merges with an existing record and what gets evicted
+    /// are all `ProjectStore::record`'s call, not this one's.
+    fn record_projects(&self, tabs: &[Tab], cx: &App) {
+        let now = crate::projects::now_secs();
+        let captured: Vec<crate::projects::Project> = tabs
+            .iter()
+            .filter_map(|tab| crate::projects::project_for_dirs(self.tab_dirs(tab, cx), now))
+            .collect();
+        if captured.is_empty() {
+            return;
+        }
+        let mut store = crate::projects::ProjectStore::load();
+        for project in captured {
+            store.record(project);
+        }
+        // A failed write is an inconvenience, never a reason to interrupt
+        // a close or a quit — the same discipline `settings.rs` uses.
+        let _ = store.save();
+    }
+
+    /// Remember the tab at `index`, if there is one.
+    fn record_project_at(&self, index: usize, cx: &App) {
+        if let Some(tab) = self.tabs.get(index) {
+            self.record_projects(std::slice::from_ref(tab), cx);
+        }
+    }
+
+    /// Remember every open project: the quit and load-session paths, where
+    /// the whole workspace goes at once.
+    fn record_open_projects(&self, cx: &App) {
+        self.record_projects(&self.tabs, cx);
+    }
+
     fn close_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
+        // A tab dies exactly when its LAST terminal goes, and every
+        // directory in it dies with it. Capture here, at the top, while the
+        // pane is still in `self.panes` and its shell still running — the
+        // `self.tabs.remove` below is far too late to ask a dead process
+        // where it was.
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.window_of(terminal_id).is_some())
+        {
+            if self.tabs[index].all_terminal_ids().len() == 1 {
+                self.record_project_at(index, cx);
+            }
+        }
         if let Some(pane) = self.panes.remove(terminal_id) {
             pane.update(cx, move |pane, _| {
                 if let Some(handle) = pane.shutdown() {
@@ -1898,6 +1995,11 @@ impl Workspace {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        // The sibling of the capture in `close_terminal`: here the whole
+        // project goes at once, so it is remembered unconditionally — and,
+        // for the same reason, before the shutdown loop below kills the
+        // shells that know where they are.
+        self.record_project_at(index, cx);
         let ids = tab.all_terminal_ids();
         let was_active = index == self.active_tab
             || self
@@ -3165,6 +3267,10 @@ impl Workspace {
         let Some(layout) = data.get("layout").and_then(Layout::from_session_json) else {
             return;
         };
+        // Loading a session replaces the whole workspace, so it drops every
+        // open project just as surely as closing each tab would. Same rule,
+        // same place in the order: remember them before the teardown.
+        self.record_open_projects(cx);
         // Tear down current panes, then rebuild: fresh terminal per leaf
         // (fresh ids so pane entities and session files never collide).
         let old_ids: Vec<String> = self.panes.keys().cloned().collect();

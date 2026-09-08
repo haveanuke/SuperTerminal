@@ -4,21 +4,18 @@
 //! A "project" is several directories opened together (see
 //! `docs/superpowers/specs/2026-09-02-projects-design.md`) — not a single
 //! path. This module is pure and file-backed only: no gpui, no `Workspace`,
-//! no `TerminalPane`. Later work wires capture (closing a tab records a
-//! project) and the sidebar UI (pinned/recent lists, reopening) on top of
-//! this store.
-
-// Wired by Task 2 (capture) and Task 3 (the sidebar). Until then the whole
-// module is built but uncalled, and the repo's convention for staged code is
-// this attribute rather than leaving warnings to accumulate — expected
-// warnings sharing space with real ones is how a real one gets missed.
-#![cfg_attr(not(test), allow(dead_code))]
+//! no `TerminalPane` — only `hosts::Target`, itself a plain enum.
+//! `Workspace` calls [`project_dirs`] and [`project_for_dirs`] to turn a
+//! tab that is about to disappear into a record; the sidebar UI
+//! (pinned/recent lists, reopening) is still to come.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::hosts::Target;
 
 /// Unpinned ("recent") projects retained. Pinned projects are exempt from
 /// this cap entirely — see `ProjectStore::recent` and `ProjectStore::record`.
@@ -95,6 +92,104 @@ fn same_dir_set(a: &[PathBuf], b: &[PathBuf]) -> bool {
     let a: HashSet<String> = a.iter().map(|p| dir_key(p)).collect();
     let b: HashSet<String> = b.iter().map(|p| dir_key(p)).collect();
     a == b
+}
+
+/// Unix seconds, now — the one place `last_opened` is minted, so a capture
+/// and the store agree on what the number means.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// The directories a project has, from every one of its panes given as
+/// `(where its shell runs, the directory it reports)`, in first-seen pane
+/// order.
+///
+/// This is the whole decision a capture makes, kept here — away from
+/// `Workspace` — because there is no gpui test harness to reach it through
+/// there. Three rules, each of which has a reason:
+///
+/// - **Local panes only.** A remote pane's directory exists on ANOTHER
+///   machine. Reopening the project here would spawn a local shell in a
+///   path that may not exist, or — worse — does exist and is something
+///   else entirely. The TARGET decides this, not the cwd: `cwd()` already
+///   returns `None` for a remote pane, but a rule that leans on that would
+///   silently stop holding the moment a pane learned to report a peer's
+///   directory.
+/// - **A pane with no directory contributes none.** A shell that never
+///   started or has gone reports `None`, and `pid_cwd` can hand back an
+///   empty path when the syscall succeeds with an empty buffer; reopening
+///   on that would land in the filesystem root.
+/// - **Deduped, in first-seen order.** Two panes in one folder are one
+///   folder, matched the same case-insensitive way `dir_key` matches
+///   projects. The order survives because reopening spawns one terminal
+///   per directory, and that is the order the user gets their shells back
+///   in.
+pub fn project_dirs(panes: &[(Target, Option<String>)]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut dirs = Vec::new();
+    for (target, cwd) in panes {
+        if !target.is_local() {
+            continue;
+        }
+        let Some(cwd) = cwd else { continue };
+        if cwd.trim().is_empty() {
+            continue;
+        }
+        let dir = PathBuf::from(cwd);
+        if seen.insert(dir_key(&dir)) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The record an auto-capture writes for `dirs`, or `None` when there is
+/// nothing to reopen — an all-remote project is not persisted at all.
+///
+/// The label is the first directory's basename: a fine default for one
+/// directory and useless for four, which is exactly why it is only a
+/// default. `renamed` stays false so the user's own name, once given,
+/// wins over every later capture (see `ProjectStore::record`).
+pub fn project_for_dirs(dirs: Vec<PathBuf>, now: u64) -> Option<Project> {
+    let first = dirs.first()?;
+    let label = first
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| first.to_string_lossy().to_string());
+    Some(Project {
+        id: project_id(&dirs),
+        label,
+        dirs,
+        pinned: false,
+        last_opened: now,
+        icon: ProjectIcon::default(),
+        renamed: false,
+    })
+}
+
+/// A capture's id: FNV-1a over the directory keys, sorted so pane order
+/// cannot change it.
+///
+/// `record` matches on the directory SET, so an id only has to be unique.
+/// Deriving it from that same set buys one more thing for nothing: a
+/// project whose `projects.json` was lost comes back under the id it
+/// always had, instead of a fresh one on every launch. Hand-rolled rather
+/// than `DefaultHasher`, whose output std does not promise to keep stable
+/// across releases — a persisted id must not change under the app.
+fn project_id(dirs: &[PathBuf]) -> String {
+    let mut keys: Vec<String> = dirs.iter().map(|dir| dir_key(dir)).collect();
+    keys.sort();
+    keys.dedup();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in keys.join("\u{0}").bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("proj-{hash:016x}")
 }
 
 impl ProjectStore {
@@ -198,13 +293,21 @@ impl ProjectStore {
     }
 
     /// Pinned projects, newest first. Never capped.
+    ///
+    /// Read by the sidebar (Task 3); nothing in the capture path lists
+    /// projects, so until that lands this is staged code. Marked here, on
+    /// the two items it actually covers, rather than module-wide — a
+    /// blanket allow would hide a genuinely dead item written later.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pinned(&self) -> Vec<&Project> {
         let mut v: Vec<&Project> = self.projects.iter().filter(|p| p.pinned).collect();
         v.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
         v
     }
 
-    /// Unpinned projects, newest first, capped at `RECENT_CAP`.
+    /// Unpinned projects, newest first, capped at `RECENT_CAP`. Staged for
+    /// the sidebar, exactly as [`ProjectStore::pinned`] is.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn recent(&self) -> Vec<&Project> {
         let mut v: Vec<&Project> = self.projects.iter().filter(|p| !p.pinned).collect();
         v.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
@@ -216,6 +319,7 @@ impl ProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosts::{ProfileId, Target};
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -609,5 +713,170 @@ mod tests {
             2,
             "overlapping but unequal sets are different projects"
         );
+    }
+
+    // --- project_dirs(): what a closing tab contributes ---
+    //
+    // These cover the whole DECISION a capture makes. The wiring that
+    // feeds them — reading each live pane's `cwd()` before its shell is
+    // torn down — has no test harness (there is no gpui one, and none may
+    // be introduced); it is verified by reading, and the report says so.
+
+    fn remote() -> Target {
+        Target::Remote(ProfileId("work-mac".to_string()))
+    }
+
+    fn dirs_of(panes: &[(Target, Option<&str>)]) -> Vec<PathBuf> {
+        let panes: Vec<(Target, Option<String>)> = panes
+            .iter()
+            .map(|(t, c)| (t.clone(), c.map(String::from)))
+            .collect();
+        project_dirs(&panes)
+    }
+
+    #[test]
+    fn a_tab_of_only_remote_panes_has_no_directories() {
+        // A peer pane's directory exists on ANOTHER machine. Reopening it
+        // here would spawn a local shell in a path that may not exist —
+        // or, worse, does exist and is something else entirely. The cwd is
+        // passed in as `Some` deliberately: the rule is the TARGET, not an
+        // incidental `None` from a pane that happens not to report one.
+        let dirs = dirs_of(&[
+            (remote(), Some("/home/tomas/work")),
+            (remote(), Some("/home/tomas/other")),
+        ]);
+        assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    fn a_remote_pane_beside_local_ones_contributes_nothing() {
+        let dirs = dirs_of(&[
+            (Target::Local, Some("/chat")),
+            (remote(), Some("/home/tomas/work")),
+            (Target::Local, Some("/penpot")),
+        ]);
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/chat"), PathBuf::from("/penpot")],
+            "only the local panes' directories"
+        );
+    }
+
+    #[test]
+    fn two_panes_in_one_folder_are_one_directory() {
+        // Storing it twice would make reopening spawn two shells in the
+        // same place. Case-insensitively, for the same reason `dir_key`
+        // is: a shell's `cd` keeps whatever spelling was typed.
+        let dirs = dirs_of(&[
+            (Target::Local, Some("/Users/me/Documents/chat")),
+            (Target::Local, Some("/Users/me/documents/chat")),
+            (Target::Local, Some("/Users/me/Documents/chat")),
+        ]);
+        assert_eq!(dirs, vec![PathBuf::from("/Users/me/Documents/chat")]);
+    }
+
+    #[test]
+    fn directories_keep_the_order_their_panes_appear_in() {
+        // Reopening spawns one terminal per directory, so the order is
+        // the order the user gets their shells back in. A HashSet-shaped
+        // implementation would scramble it differently on every run.
+        let dirs = dirs_of(&[
+            (Target::Local, Some("/chat")),
+            (Target::Local, Some("/board-kid")),
+            (Target::Local, Some("/penpot")),
+            (Target::Local, Some("/forgejo")),
+        ]);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/chat"),
+                PathBuf::from("/board-kid"),
+                PathBuf::from("/penpot"),
+                PathBuf::from("/forgejo"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pane_that_reports_no_directory_contributes_nothing() {
+        // `pid_cwd` returns `None` for a shell that never started or has
+        // gone, and can hand back an EMPTY path when the syscall succeeds
+        // with an empty buffer. Neither is a directory to reopen, and an
+        // empty one would reopen as the filesystem root.
+        let dirs = dirs_of(&[
+            (Target::Local, None),
+            (Target::Local, Some("")),
+            (Target::Local, Some("   ")),
+            (Target::Local, Some("/chat")),
+        ]);
+        assert_eq!(dirs, vec![PathBuf::from("/chat")]);
+    }
+
+    // --- project_for_dirs(): the record a capture builds ---
+
+    #[test]
+    fn a_tab_with_no_local_directories_is_not_worth_recording() {
+        // The all-remote tab from above, carried through: there is
+        // nothing to reopen, so nothing is written down.
+        assert_eq!(project_for_dirs(Vec::new(), 1_000), None);
+    }
+
+    #[test]
+    fn the_default_label_is_the_first_directorys_basename() {
+        // A basename is a fine default for one directory and useless for
+        // four — "chat" is not derivable from those four paths — so the
+        // FIRST one names the project until the user renames it.
+        let captured = project_for_dirs(
+            vec![PathBuf::from("/a/chat"), PathBuf::from("/b/penpot")],
+            42,
+        )
+        .expect("dirs present");
+        assert_eq!(captured.label, "chat");
+        assert_eq!(captured.last_opened, 42);
+        assert!(!captured.pinned);
+        assert!(
+            !captured.renamed,
+            "an auto-capture is never the user's name"
+        );
+    }
+
+    #[test]
+    fn one_project_gets_one_id_however_its_panes_were_ordered() {
+        // The store matches on the directory SET, so a capture's id only
+        // has to be unique — but deriving it from that same set means a
+        // project whose store file was lost comes back under the id it
+        // always had, rather than a fresh one each launch.
+        let a = project_for_dirs(vec![PathBuf::from("/chat"), PathBuf::from("/penpot")], 1)
+            .expect("dirs present");
+        let b = project_for_dirs(vec![PathBuf::from("/Penpot"), PathBuf::from("/chat")], 2)
+            .expect("dirs present");
+        assert_eq!(a.id, b.id, "same directory set, same project");
+        let other = project_for_dirs(vec![PathBuf::from("/chat")], 3).expect("dirs present");
+        assert_ne!(a.id, other.id, "a different set is a different project");
+        assert!(!a.id.is_empty());
+    }
+
+    #[test]
+    fn a_captured_project_records_into_the_store_it_was_built_for() {
+        // The seam between the two halves of a capture: whatever
+        // `project_dirs` decides is exactly what `record` stores, in the
+        // same order, under the same label.
+        let dirs = dirs_of(&[
+            (Target::Local, Some("/chat")),
+            (remote(), Some("/home/tomas/work")),
+            (Target::Local, Some("/chat")),
+            (Target::Local, Some("/penpot")),
+        ]);
+        let captured = project_for_dirs(dirs, 77).expect("local dirs present");
+        let mut store = ProjectStore::default();
+        store.record(captured);
+        let recent = store.recent();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].dirs,
+            vec![PathBuf::from("/chat"), PathBuf::from("/penpot")]
+        );
+        assert_eq!(recent[0].label, "chat");
+        assert_eq!(recent[0].last_opened, 77);
     }
 }
