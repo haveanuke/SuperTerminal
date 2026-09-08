@@ -109,6 +109,8 @@ enum SidebarView {
     Projects,
     Git,
     Files,
+    /// Paired Macs and the terminals they are sharing with this one.
+    Peers,
 }
 
 /// Sessions live in the directory SHARED with the Tauri app (contract rev 2
@@ -251,6 +253,193 @@ fn local_context_available(target: &crate::hosts::Target, cwd: Option<String>) -
 /// exactly where they are expected to diverge.
 fn may_share_terminal(target: &crate::hosts::Target) -> bool {
     target.is_local()
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: opening a peer's terminal as a pane.
+//
+// Everything below decides something the UI then carries out. None of it
+// touches a socket, an entity or a `Context`, because there is no gpui test
+// harness and none may be introduced — the wiring that calls these is
+// verified by reading and says so where it happens.
+// ---------------------------------------------------------------------------
+
+/// Peers still worth asking `/sessions`.
+///
+/// Two reasons a poller must live: a PANE is attached to that peer, or the
+/// sidebar is showing that peer's session list so one can be opened. Both
+/// go in, because `prune_peer_pollers` runs on the ~900ms sweep and would
+/// otherwise kill a browsing poller between the click that started it and
+/// the click that uses it — the list would flicker empty and never fill.
+fn peer_pollers_needed(
+    attached: &[crate::companion::auth::PeerId],
+    browsing: Option<&crate::companion::auth::PeerId>,
+) -> Vec<crate::companion::auth::PeerId> {
+    let mut needed = attached.to_vec();
+    if let Some(peer) = browsing {
+        needed.push(peer.clone());
+    }
+    needed
+}
+
+/// What a non-local pane's target is CALLED.
+///
+/// A peer-attached pane and an ssh-profile pane both carry
+/// `Target::Remote(ProfileId)`, and the id namespaces are the same
+/// generator, so this asks both lists. Profiles first, keeping the previous
+/// answer for every target that existed before this phase; peers next, so
+/// an attached pane names the Mac it is watching; and only then the
+/// "missing" fallback, which must never read as local.
+fn remote_target_label(
+    id: &crate::hosts::ProfileId,
+    profiles: &[crate::hosts::RemoteProfile],
+    peers: &[crate::peers::PeerRecord],
+) -> String {
+    if let Some(profile) = profiles.iter().find(|profile| &profile.id == id) {
+        return profile.label.clone();
+    }
+    if let Some(peer) = peers.iter().find(|peer| peer.id.0 == id.0) {
+        return peer.label.clone();
+    }
+    format!("missing host ({})", id.0)
+}
+
+/// Whether the reviewer may observe this pane at all.
+///
+/// D4's reasoning, applied to the buddy. An attached pane is a VIEW of
+/// another machine's terminal, and handing its contents to an agent process
+/// running on THIS Mac exports that machine's screen as surely as
+/// re-publishing it to the phone would. Refused rather than left to produce
+/// an empty review: `TerminalPane::visible_text` reads the local
+/// placeholder grid, so without this the reviewer is handed an empty screen
+/// and comments confidently on nothing — plausible, wrong, and silent,
+/// which is the shape this phase exists to stop.
+///
+/// The repo PROBE was already gated (`local_context_available`); the
+/// utterance beside it was not.
+fn may_review_pane(target: &crate::hosts::Target) -> bool {
+    target.is_local()
+}
+
+/// The `Target` a pane attached to `peer` carries.
+///
+/// One function so the pane that is BUILT and the poller that is later
+/// looked up cannot disagree about which peer a pane belongs to. The
+/// mapping is deliberately the identity on the id string: `ProfileId` and
+/// `PeerId` are both `generate_token()` output, and inventing a prefix here
+/// would make the reverse lookup a parser rather than a comparison.
+fn peer_target(peer: &crate::companion::auth::PeerId) -> crate::hosts::Target {
+    crate::hosts::Target::Remote(crate::hosts::ProfileId(peer.0.clone()))
+}
+
+/// What the search sheet offers the focused pane.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchOffer {
+    /// A live field over a grid this Mac owns.
+    Field,
+    /// Disabled, with the reason shown in place of the field.
+    Refused(&'static str),
+}
+
+/// D5, at the point of refusal. Search reads the grid the SESSION owns, and
+/// an attached pane has none — so `set_search` was a no-op there. A box
+/// that quietly swallows what is typed into it is worse than one that is
+/// visibly disabled and says why, which is the whole reason this phase
+/// exists.
+fn search_offer(focused_pane_owns_grid: Option<bool>) -> SearchOffer {
+    match focused_pane_owns_grid {
+        Some(true) => SearchOffer::Field,
+        Some(false) => SearchOffer::Refused(
+            "search runs on the Mac that owns the terminal - not on an attached pane",
+        ),
+        None => SearchOffer::Refused("no terminal is focused"),
+    }
+}
+
+/// What the peers sidebar shows under one peer.
+#[derive(Debug, PartialEq)]
+enum PeerListing {
+    /// The endpoint probe has not finished.
+    Probing,
+    /// The probe failed, with `Reach`'s own reason.
+    Unreachable(&'static str),
+    /// Reachable; the first `/sessions` poll has not landed yet.
+    Waiting,
+    /// A poll completed and could not be read as a session list. NEVER
+    /// folded into "sharing nothing": the same distinction `parse_sessions`
+    /// exists to keep, one layer up. The likeliest cause is the `view`
+    /// grant, which is the one thing a user can act on.
+    Unreadable,
+    /// The peer answered, and is sharing nothing with this Mac.
+    Nothing,
+    /// The sessions on offer.
+    Sessions(Vec<crate::peer_client::sessions::PeerSession>),
+}
+
+/// Fold the endpoint probe and the last `/sessions` poll into one thing to
+/// draw. Every failure mode gets its own answer, because the alternative —
+/// an empty list — is what "pick a peer and see nothing happen" looks like.
+fn peer_listing(
+    reach: Option<&crate::peer_client::discover::Reach>,
+    poll: Option<crate::peer_client::sessions::LastPoll>,
+) -> PeerListing {
+    use crate::peer_client::sessions::LastPoll;
+    let Some(reach) = reach else {
+        return PeerListing::Probing;
+    };
+    if reach.endpoint().is_none() {
+        return PeerListing::Unreachable(reach.note());
+    }
+    match poll {
+        None | Some(LastPoll::Pending) => PeerListing::Waiting,
+        Some(LastPoll::Failed) => PeerListing::Unreadable,
+        Some(LastPoll::Listed(sessions)) => {
+            // A retired session (`alive: false`) is one the broadcaster is
+            // already tearing down. Offering it would open a pane straight
+            // onto an ended terminal.
+            let live: Vec<_> = sessions.into_iter().filter(|s| s.alive).collect();
+            if live.is_empty() {
+                PeerListing::Nothing
+            } else {
+                PeerListing::Sessions(live)
+            }
+        }
+    }
+}
+
+/// The status dot beside one of a peer's sessions.
+///
+/// Same vocabulary as the projects view's — green idle, yellow busy, hollow
+/// when there is no trustworthy signal — minus its "quiet" cyan state. That
+/// one is derived from LOCAL output timing, which nothing here observes;
+/// inventing it from a poll would be a colour claiming evidence it does not
+/// have. Hollow for `Unknown` for the same reason: a filled dot asserts a
+/// state, and `Unknown` is the absence of one.
+fn peer_activity_dot(activity: Activity, theme: &'static Theme) -> impl IntoElement {
+    let color = match activity {
+        Activity::Idle => theme.green,
+        Activity::Busy => theme.yellow,
+        Activity::Unknown => theme.ui_text_muted,
+    };
+    let hollow = matches!(activity, Activity::Unknown);
+    div()
+        .flex_none()
+        .w(px(6.0))
+        .h(px(6.0))
+        .rounded(px(3.0))
+        .when(hollow, |d| d.border_1().border_color(rgb(color)))
+        .when(!hollow, |d| d.bg(rgb(color)))
+}
+
+/// The tab label for a freshly opened peer terminal: the peer, then the
+/// session it named itself. A session with no label still names its
+/// machine, never a bare id the user has no way to recognise.
+fn attached_tab_label(peer_label: &str, session_label: &str) -> String {
+    if session_label.trim().is_empty() {
+        peer_label.to_string()
+    } else {
+        format!("{peer_label} \u{b7} {session_label}")
+    }
 }
 
 struct DragState {
@@ -425,6 +614,17 @@ pub struct Workspace {
     /// `prune_peer_pollers` on the next tick rather than lingering until
     /// something else happens to touch the map.
     peer_sessions: HashMap<crate::companion::auth::PeerId, Arc<PeerSessionPoller>>,
+    /// Which peer's shared terminals the peers sidebar is listing, if any.
+    /// Also keeps that peer's poller alive while nothing is attached yet —
+    /// see `peer_pollers_needed`.
+    peer_browse: Option<crate::companion::auth::PeerId>,
+    /// Where each peer's companion was found, or why it was not. Absent
+    /// means no probe has finished; the probe is one `/version` round trip
+    /// per candidate port and always runs on the background executor.
+    peer_reach: HashMap<crate::companion::auth::PeerId, crate::peer_client::discover::Reach>,
+    /// Probes in flight, so a re-render (or an impatient second click)
+    /// cannot stack a second scan on the same peer.
+    peer_probing: std::collections::HashSet<crate::companion::auth::PeerId>,
 }
 
 impl Workspace {
@@ -525,6 +725,9 @@ impl Workspace {
             peer_scanned_once: false,
             peer_pairing_secret: None,
             peer_sessions: HashMap::new(),
+            peer_browse: None,
+            peer_reach: HashMap::new(),
+            peer_probing: std::collections::HashSet::new(),
         };
         // First launch (or a healed save): persist the hatched identity so
         // the same pet comes back next session.
@@ -728,18 +931,182 @@ impl Workspace {
         poller
     }
 
-    /// Stop polling peers no open pane is attached to any more. Cheap and
-    /// unconditional: with no attached panes the map is empty and this
-    /// returns before touching a single pane.
+    /// Open the peers sidebar on `peer`, or close it if it is already the
+    /// one being shown. Kicks the endpoint probe the first time.
+    fn browse_peer(&mut self, peer: crate::companion::auth::PeerId, cx: &mut Context<Self>) {
+        if self.peer_browse.as_ref() == Some(&peer) {
+            self.peer_browse = None;
+        } else {
+            self.peer_browse = Some(peer.clone());
+            self.probe_peer(peer, cx);
+        }
+        cx.notify();
+    }
+
+    /// Forget what we know about how to reach `peer` and look again. The
+    /// one control that recovers from a peer that has moved address, been
+    /// restarted onto a different port, or simply was not running the first
+    /// time it was asked — `peer_session_poller` deliberately never
+    /// re-points an existing poller, so the workspace's clone goes too.
+    ///
+    /// An ALREADY-ATTACHED pane keeps the poller (and the endpoint) it was
+    /// attached with: its own `Arc` outlives this removal, and re-pointing
+    /// a live pane's stream at a newly discovered address is a reconnect,
+    /// not a refresh. So a re-probe while a pane is open leaves that peer
+    /// polled twice until the pane closes. Stated rather than prevented —
+    /// the alternative is silently changing where an open pane is reading
+    /// from.
+    fn reprobe_peer(&mut self, peer: crate::companion::auth::PeerId, cx: &mut Context<Self>) {
+        self.peer_reach.remove(&peer);
+        self.peer_sessions.remove(&peer);
+        self.probe_peer(peer, cx);
+        cx.notify();
+    }
+
+    /// Find `peer`'s companion, on the background executor.
+    ///
+    /// EVERY call in here blocks: `discover::find` is up to eleven one-shot
+    /// round trips, and `peers::scan_candidates` shells out to `tailscale`.
+    /// Neither may run on the gpui thread — a peer that accepts a
+    /// connection and then stalls would otherwise freeze every local pane
+    /// too. Re-entrant calls are dropped rather than queued.
+    fn probe_peer(&mut self, peer: crate::companion::auth::PeerId, cx: &mut Context<Self>) {
+        if self.peer_reach.contains_key(&peer) || self.peer_probing.contains(&peer) {
+            return;
+        }
+        let (peers, _problems) = self.settings.peers();
+        let Some(record) = peers.iter().find(|p| p.id == peer).cloned() else {
+            return;
+        };
+        // A peer record carries the tailnet HOST it was paired from; the
+        // ADDRESS comes from a scan. With no scan yet there is nothing to
+        // probe, so one is started and `scan_peer_candidates`' completion
+        // comes back through `probe_browsed_peer`.
+        let Some(candidate) = self
+            .peer_candidates
+            .iter()
+            .find(|c| c.host == record.host)
+            .cloned()
+        else {
+            self.scan_peer_candidates(cx);
+            return;
+        };
+        self.peer_probing.insert(peer.clone());
+        cx.spawn(async move |ws, cx| {
+            let reach = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::peer_client::discover::find(&candidate.addr, &record.secret)
+                })
+                .await;
+            let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                ws.peer_probing.remove(&peer);
+                ws.peer_reach.insert(peer.clone(), reach);
+                ws.ensure_peer_poller(&peer);
+                cx.notify();
+            });
+            Ok::<(), ()>(())
+        })
+        .detach();
+    }
+
+    /// After a tailnet scan lands, probe whichever peer the sidebar is
+    /// showing — the scan is what a first probe was waiting for.
+    pub(super) fn probe_browsed_peer(&mut self, cx: &mut Context<Self>) {
+        if let Some(peer) = self.peer_browse.clone() {
+            self.probe_peer(peer, cx);
+        }
+    }
+
+    /// Start (or reuse) the `/sessions` poller for a peer whose endpoint is
+    /// known. A no-op while the probe has not produced one.
+    fn ensure_peer_poller(&mut self, peer: &crate::companion::auth::PeerId) {
+        let Some(endpoint) = self
+            .peer_reach
+            .get(peer)
+            .and_then(|reach| reach.endpoint())
+            .cloned()
+        else {
+            return;
+        };
+        let _ = self.peer_session_poller(peer, endpoint);
+    }
+
+    /// Open one of a peer's shared terminals as a pane in a new tab.
+    ///
+    /// The ONLY production path that produces a non-local pane. It builds
+    /// the pane through `spawn_dead_pane` — which never touches a local
+    /// shell — and only then hands it an attachment, so there is no instant
+    /// at which a pane pointed at another Mac could have a shell on this
+    /// one. Both background threads (the stream and the peer's `/sessions`
+    /// poll) are started by the calls below and neither blocks here.
+    fn open_peer_session(
+        &mut self,
+        peer: crate::companion::auth::PeerId,
+        session_id: String,
+        session_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(endpoint) = self
+            .peer_reach
+            .get(&peer)
+            .and_then(|reach| reach.endpoint())
+            .cloned()
+        else {
+            return;
+        };
+        let peer_label = self.peer_label(&peer);
+        let target = peer_target(&peer);
+        let terminal_id = self.fresh_id();
+        self.spawn_dead_pane(terminal_id.clone(), target.clone(), cx);
+        // `attach::spawn` and `sessions::spawn` both return immediately,
+        // handing their blocking work to a thread of their own.
+        let attachment = crate::peer_client::attach::spawn(endpoint.clone(), session_id);
+        let poller = self.peer_session_poller(&peer, endpoint);
+        if let Some(pane) = self.panes.get(&terminal_id).cloned() {
+            // Frames and the session list together, never separately —
+            // `set_attachment` says why, and it refuses a local pane.
+            pane.update(cx, |pane, _| pane.set_attachment(attachment, poller));
+        }
+        let tab_id = format!("tab-{}", self.next_id);
+        self.next_id += 1;
+        self.tabs.push(Tab::single(
+            tab_id,
+            attached_tab_label(&peer_label, &session_label),
+            PaneNode::terminal_at(&terminal_id, target),
+        ));
+        self.active_tab = self.tabs.len() - 1;
+        self.set_focused_terminal(Some(terminal_id), cx);
+        cx.notify();
+    }
+
+    /// A paired peer's user-facing label, or its id when the record has
+    /// gone (deleted while a pane on it was open).
+    fn peer_label(&self, peer: &crate::companion::auth::PeerId) -> String {
+        let (peers, _problems) = self.settings.peers();
+        peers
+            .iter()
+            .find(|p| &p.id == peer)
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| peer.0.clone())
+    }
+
+    /// Stop polling peers nothing needs any more. Cheap and unconditional:
+    /// with no attached panes and no peer being browsed the map is empty
+    /// and this returns before touching a single pane.
     fn prune_peer_pollers(&mut self, cx: &App) {
         if self.peer_sessions.is_empty() {
             return;
         }
-        let needed: Vec<crate::companion::auth::PeerId> = self
+        let attached: Vec<crate::companion::auth::PeerId> = self
             .panes
             .values()
             .filter_map(|pane| pane.read(cx).attached_peer())
             .collect();
+        // The sidebar's open peer counts too: its session list IS this
+        // poller's output, so pruning on attachment alone would stop the
+        // list the user is reading. See `peer_pollers_needed`.
+        let needed = peer_pollers_needed(&attached, self.peer_browse.as_ref());
         let held: Vec<crate::companion::auth::PeerId> =
             self.peer_sessions.keys().cloned().collect();
         for peer in pollers_to_drop(&held, &needed) {
@@ -835,12 +1202,32 @@ impl Workspace {
                     // peer. No UI path produces a peer request yet, so this
                     // arm is unreachable in this phase — it must still do
                     // the right thing once one does.
-                    if let Some(new_id) = &self.companion_pending_focus {
-                        hub.set_visible_to(new_id, &peer_id, true);
+                    //
+                    // D3e, DISCHARGED HERE. `BroadcastMap::share` refuses
+                    // nothing (its doc says why), and this call site was
+                    // safe only because `spawn_pane` structurally could not
+                    // produce a non-local pane — an invariant nothing
+                    // encoded. This task produces a second shape of pane
+                    // (`open_peer_session` → `spawn_dead_pane` with a
+                    // `Target::Remote`), so the invariant is now checked
+                    // rather than assumed: sharing a pane that is itself a
+                    // VIEW of another Mac would offer a peer a remote view
+                    // of a remote view, attributed to this machine.
+                    //
+                    // `add_tab` above is still local-only, so this gate is
+                    // a backstop today, not a live filter. That is the
+                    // point — it stays correct when `add_tab` is not.
+                    let shareable_id = self.companion_pending_focus.clone().filter(|id| {
+                        self.panes
+                            .get(id)
+                            .is_some_and(|pane| may_share_terminal(pane.read(cx).target()))
+                    });
+                    if let Some(new_id) = shareable_id {
+                        hub.set_visible_to(&new_id, &peer_id, true);
                         // Mirrored so this survives a companion restart —
                         // the hub itself is rebuilt from scratch on every
                         // one (see `peers::BroadcastMap`'s doc comment).
-                        self.broadcasts.share(new_id, &peer_id);
+                        self.broadcasts.share(&new_id, &peer_id);
                     }
                 }
             }
@@ -982,6 +1369,12 @@ impl Workspace {
                 pane_ref.visible_text(),
             )
         };
+        // An attached pane is not this Mac's to review. See
+        // `may_review_pane` — the probe below was already gated on the
+        // target; the utterance was not.
+        if !may_review_pane(&target) {
+            return;
+        }
         // Observation never stops for an in-flight utterance; probes are
         // single-flight on their own (one can outlive several ticks on a
         // slow repo; the gate drops stale generations).
@@ -1659,6 +2052,7 @@ impl Workspace {
                 SidebarView::Projects => crate::icons::Icon::Projects,
                 SidebarView::Git => crate::icons::Icon::GitBranch,
                 SidebarView::Files => crate::icons::Icon::Files,
+                SidebarView::Peers => crate::icons::Icon::Peers,
             };
             let _ = label;
             div()
@@ -1693,6 +2087,7 @@ impl Workspace {
                     .files_panel
                     .clone()
                     .map(|panel| panel.into_any_element()),
+                SidebarView::Peers => Some(self.render_peers_view(cx)),
             }
         } else {
             None
@@ -1730,6 +2125,13 @@ impl Workspace {
                             "rail-files",
                             "files",
                             SidebarView::Files,
+                            cx,
+                        ))
+                        .child(rail_item(
+                            self,
+                            "rail-peers",
+                            "peers",
+                            SidebarView::Peers,
                             cx,
                         ))
                         .child(div().flex_grow())
@@ -1802,6 +2204,256 @@ impl Workspace {
                 )
                 .children(active_view),
         )
+    }
+
+    /// Paired Macs and what each is sharing with this one. Click a peer to
+    /// ask it; click one of its terminals to open it as a pane.
+    ///
+    /// The degraded contract (D5) is stated HERE, above the list, rather
+    /// than left to be discovered after a pane is open: what an attached
+    /// pane cannot do is a property of the choice being made on this
+    /// screen. It is repeated on the focused bar once a pane is open, for
+    /// the same reason.
+    fn render_peers_view(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The sidebar needs an ADDRESS per peer, which only a tailnet scan
+        // supplies. One automatic scan per session, exactly like the
+        // settings sheet's; after that it is the rescan button.
+        if !self.peer_scanned_once && !self.peer_scanning {
+            self.scan_peer_candidates(cx);
+        }
+        let theme = self.theme;
+        let (paired, _problems) = self.settings.peers();
+        let browsing = self.peer_browse.clone();
+        let scanning = self.peer_scanning;
+
+        let row = |label: SharedString, muted: bool| {
+            div()
+                .py(px(2.0))
+                .pl(px(10.0))
+                .text_size(px(10.0))
+                .text_color(rgb(if muted {
+                    theme.ui_text_muted
+                } else {
+                    theme.ui_text
+                }))
+                .child(label)
+        };
+
+        let mut peer_rows: Vec<gpui::AnyElement> = Vec::new();
+        for peer in &paired {
+            let open = browsing.as_ref() == Some(&peer.id);
+            let header_id = peer.id.clone();
+            peer_rows.push(
+                div()
+                    .id(SharedString::from(format!("peer-browse-{}", peer.id.0)))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(4.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .when(open, |d| d.bg(rgb(theme.ui_surface)))
+                    .hover(|style| style.bg(rgb(theme.ui_border)))
+                    .child(
+                        div()
+                            .w(px(8.0))
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(if open { "v" } else { ">" }),
+                    )
+                    .child(
+                        div()
+                            .flex_grow()
+                            .text_size(px(11.0))
+                            .text_color(rgb(theme.ui_text))
+                            .child(SharedString::from(peer.label.clone())),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, _, cx| ws.browse_peer(header_id.clone(), cx)),
+                    )
+                    .into_any_element(),
+            );
+            if !open {
+                continue;
+            }
+            let listing = peer_listing(
+                self.peer_reach.get(&peer.id),
+                self.peer_sessions.get(&peer.id).map(|p| p.last_poll()),
+            );
+            // Every non-list outcome says which one it is. An empty list
+            // under a peer name is what "I clicked and nothing happened"
+            // looks like, and it is indistinguishable from four different
+            // failures — see `peer_listing`.
+            match listing {
+                PeerListing::Probing => {
+                    peer_rows.push(row("looking for it...".into(), true).into_any_element())
+                }
+                PeerListing::Waiting => {
+                    peer_rows.push(row("asking what it shares...".into(), true).into_any_element())
+                }
+                PeerListing::Nothing => peer_rows
+                    .push(row("sharing nothing with this Mac yet".into(), true).into_any_element()),
+                PeerListing::Unreadable => peer_rows.push(
+                    row(
+                        "answered, but not with a list - grant this Mac view there".into(),
+                        true,
+                    )
+                    .into_any_element(),
+                ),
+                PeerListing::Unreachable(note) => {
+                    peer_rows.push(row(note.into(), true).into_any_element())
+                }
+                PeerListing::Sessions(sessions) => {
+                    for session in sessions {
+                        let peer_id = peer.id.clone();
+                        let session_id = session.id.clone();
+                        let session_label = session.label.clone();
+                        let shown = if session.label.trim().is_empty() {
+                            session.id.clone()
+                        } else {
+                            session.label.clone()
+                        };
+                        peer_rows.push(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "peer-session-{}-{}",
+                                    peer.id.0, session.id
+                                )))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .ml(px(10.0))
+                                .px(px(4.0))
+                                .py(px(2.0))
+                                .rounded(px(3.0))
+                                .hover(|style| style.bg(rgb(theme.ui_border)))
+                                .child(peer_activity_dot(session.activity, theme))
+                                .child(
+                                    div()
+                                        .flex_grow()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(theme.ui_text))
+                                        .child(SharedString::from(shown)),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |ws, _, window, cx| {
+                                        ws.open_peer_session(
+                                            peer_id.clone(),
+                                            session_id.clone(),
+                                            session_label.clone(),
+                                            cx,
+                                        );
+                                        ws.focus_active_pane(window, cx);
+                                    }),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+            let retry_peer = peer.id.clone();
+            peer_rows.push(
+                div()
+                    .id(SharedString::from(format!("peer-retry-{}", peer.id.0)))
+                    .cursor_pointer()
+                    .ml(px(10.0))
+                    .px(px(4.0))
+                    .py(px(1.0))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .hover(|style| style.text_color(rgb(theme.ui_accent)))
+                    .child("look again")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, _, cx| ws.reprobe_peer(retry_peer.clone(), cx)),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // Same shell as the projects view beside it: fixed width, its own
+        // scroll, a quiet header rule. A second sidebar that sized itself
+        // differently would read as a different kind of surface.
+        div()
+            .id("peers-view")
+            .w(px(240.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme.ui_background))
+            .border_r_1()
+            .border_color(rgb(theme.ui_border))
+            .text_size(px(11.0))
+            .text_color(rgb(theme.ui_text))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .border_b_1()
+                    .border_color(rgb(theme.ui_border))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("PEERS"),
+                    )
+                    .child(div().flex_grow())
+                    .child(
+                        div()
+                            .id("peers-rescan")
+                            .cursor_pointer()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .hover(|style| style.text_color(rgb(theme.ui_accent)))
+                            .child(if scanning { "scanning" } else { "rescan" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|ws, _, _, cx| ws.scan_peer_candidates(cx)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("peers-list")
+                    .flex_grow()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(8.0))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(settings_ui::hints::PEER_TERMINALS)),
+                    )
+                    // D5, stated before the choice rather than after it.
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(crate::pane::remote_limits_line())),
+                    )
+                    .children(paired.is_empty().then(|| {
+                        div()
+                            .mt(px(6.0))
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("None yet. Pair a Mac in settings to see its terminals here.")
+                    }))
+                    .children(peer_rows),
+            )
+            .into_any_element()
     }
 
     /// Orca-style projects view: every tab is a project, with quick status
@@ -2227,7 +2879,7 @@ impl Workspace {
         self.sidebar_open = true;
         self.sidebar_view = view;
         match view {
-            SidebarView::Projects => {}
+            SidebarView::Projects | SidebarView::Peers => {}
             SidebarView::Git => {
                 if self.git_panel.is_none() {
                     let theme = self.theme;
@@ -2384,18 +3036,21 @@ impl Workspace {
         .detach();
     }
 
-    /// Resolve a profile id to its display label. A missing profile still
-    /// yields a string that names the id — never anything that could read
-    /// as local (that's the safety property Task 7 established with
-    /// `ResolvedTarget::MissingProfile`) and never a bare opaque id that
-    /// looks fine at a glance when the host it names is actually gone.
+    /// Resolve a non-local target's id to its display label. A missing
+    /// profile still yields a string that names the id — never anything
+    /// that could read as local (that's the safety property established
+    /// with `ResolvedTarget::MissingProfile`) and never a bare opaque id
+    /// that looks fine at a glance when the host it names is actually gone.
+    ///
+    /// Asks the PEER list too, since this phase: a pane attached to another
+    /// Mac carries `Target::Remote` with that peer's id, and answering
+    /// "missing host (a1b2...)" for a machine that is right there and
+    /// working would be a confident lie. See `remote_target_label` for the
+    /// lookup order.
     fn profile_label(&self, id: &crate::hosts::ProfileId) -> String {
         let (profiles, _problems) = self.settings.profiles();
-        profiles
-            .iter()
-            .find(|profile| &profile.id == id)
-            .map(|profile| profile.label.clone())
-            .unwrap_or_else(|| format!("missing host ({})", id.0))
+        let (peers, _peer_problems) = self.settings.peers();
+        remote_target_label(id, &profiles, &peers)
     }
 
     /// The ONLY writer of `focused_terminal`. Focus and panel identity
@@ -2588,6 +3243,7 @@ impl Workspace {
                     .focused_terminal
                     .as_deref()
                     .is_some_and(|f| f == terminal_id);
+                let views_local = pane.read(cx).target().is_local();
                 let theme = self.theme;
 
                 div()
@@ -2611,6 +3267,13 @@ impl Workspace {
                         let bc_on = self.broadcast.is_enabled();
                         let bc_member = bc_on && self.broadcast.is_member(terminal_id);
                         let id_bc = terminal_id.clone();
+                        // Which machine this pane's terminal runs on, marked
+                        // on the pane itself. The focused bar carries the
+                        // full contract, but only for the FOCUSED pane —
+                        // with a split full of terminals, one of them being
+                        // somebody else's is not something to have to click
+                        // to find out.
+                        let views_remote = !views_local;
                         // Track the terminal font size a little (dampened, so
                         // the cluster grows with big fonts without ballooning).
                         let scale =
@@ -2642,6 +3305,16 @@ impl Workspace {
                             .bg(rgb(theme.ui_surface))
                             .opacity(0.75)
                             .hover(|style| style.opacity(1.0))
+                            .children(views_remote.then(|| {
+                                div()
+                                    .px(px(4.0 * scale))
+                                    .h(px(15.0 * scale))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(9.0 * scale))
+                                    .text_color(rgb(theme.ui_accent))
+                                    .child("remote")
+                            }))
                             .children(bc_on.then(|| {
                                 pane_btn(if bc_member { "bc:on" } else { "bc:off" }).on_mouse_down(
                                     MouseButton::Left,
@@ -2943,6 +3616,9 @@ impl Workspace {
         let target = pane.read(cx).target().clone();
         let cwd = pane.read(cx).cwd();
         let has_local_dir = local_context_available(&target, cwd.clone());
+        // `None` for every local pane, so the bar below is byte-identical
+        // for one. See `TerminalPane::remote_state`.
+        let remote_state = pane.read(cx).remote_state();
         Some(
             div()
                 .flex()
@@ -2993,6 +3669,25 @@ impl Workspace {
                         control.text_color(rgb(theme.ui_text_muted))
                     }
                 })
+                // D5, while the pane is open. The peers sidebar states the
+                // same contract before one is chosen; this is the copy that
+                // is still on screen when the user reaches for Cmd+F, drags
+                // a divider, or wonders why the scrollback stops. It also
+                // carries the connection word, which is the only signal a
+                // pane that never attached (`Refused`, `Incompatible`) has.
+                .children(remote_state.map(|state| {
+                    div()
+                        .flex_grow()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(10.0))
+                        .text_color(rgb(theme.ui_text_muted))
+                        .child(SharedString::from(format!(
+                            "attached \u{b7} {state} \u{b7} {}",
+                            crate::pane::remote_limits_line()
+                        )))
+                }))
                 .children(self.swap_source.is_some().then(|| {
                     div()
                         .text_size(px(10.0))
@@ -3642,6 +4337,28 @@ impl Workspace {
                 )
             }
             Overlay::Search => {
+                // D5 at the point of refusal. Search reads the grid the
+                // SESSION owns; an attached pane has none, so `set_search`
+                // was a silent no-op there — a box that swallows what is
+                // typed into it. Refused with the reason instead, and the
+                // field is never built, so there is nothing to type into.
+                if let SearchOffer::Refused(reason) = search_offer(
+                    self.focused_terminal
+                        .as_ref()
+                        .and_then(|id| self.panes.get(id))
+                        .map(|pane| pane.read(cx).owns_grid()),
+                ) {
+                    return Some(
+                        self.sheet("search", "esc closes", cx)
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(theme.ui_text_muted))
+                                    .child(SharedString::from(reason)),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 if self.search_field.is_none() {
                     let theme_ref = self.theme;
                     let field = cx
@@ -4450,6 +5167,236 @@ impl Render for Workspace {
             .children(self.render_pet(window, cx))
             .children(self.render_pet_bubble(window, cx))
             .children(self.render_overlay(window, cx))
+    }
+}
+
+#[cfg(test)]
+mod peer_attach_tests {
+    use super::{
+        attached_tab_label, may_review_pane, may_share_terminal, peer_listing, peer_pollers_needed,
+        peer_target, remote_target_label, search_offer, PeerListing, SearchOffer,
+    };
+    use crate::companion::auth::PeerId;
+    use crate::hosts::{HostOs, ProfileId, RemoteProfile, ShellKind, Target};
+    use crate::peer_client::discover::Reach;
+    use crate::peer_client::sessions::{LastPoll, PeerSession};
+    use crate::peers::{Grants, PeerRecord};
+    use superterminal_core::activity::Activity;
+
+    fn peer(id: &str, label: &str) -> PeerRecord {
+        PeerRecord {
+            id: PeerId(id.to_string()),
+            host: format!("{label}.tail"),
+            label: label.to_string(),
+            secret: "abcdef0123456789abcdef0123456789".to_string(),
+            grants: Grants::default(),
+        }
+    }
+
+    fn profile(id: &str, label: &str) -> RemoteProfile {
+        RemoteProfile {
+            id: ProfileId(id.to_string()),
+            label: label.to_string(),
+            destination: "example.com".to_string(),
+            user: None,
+            port: None,
+            os: HostOs::MacOs,
+            shell: ShellKind::Zsh,
+        }
+    }
+
+    fn session(id: &str, label: &str, alive: bool) -> PeerSession {
+        PeerSession {
+            id: id.to_string(),
+            label: label.to_string(),
+            alive,
+            activity: Activity::Idle,
+        }
+    }
+
+    fn ready() -> Reach {
+        Reach::Ready(crate::peer_client::Endpoint {
+            addr: "127.0.0.1:43110".parse().unwrap(),
+            secret: "abcdef0123456789abcdef0123456789".to_string(),
+        })
+    }
+
+    // --- D3e: a second shape of pane exists now ----------------------------
+
+    #[test]
+    fn only_a_pane_whose_terminal_runs_here_may_be_shared_with_a_peer() {
+        // D3e. `BroadcastMap::share` is ungated, and was safe ONLY because
+        // `spawn_pane` structurally could not produce a non-local pane.
+        // This task produces one, so the invariant is asserted at the
+        // writer instead of being true by coincidence.
+        assert!(may_share_terminal(&Target::Local));
+        assert!(!may_share_terminal(&peer_target(&PeerId("p1".into()))));
+    }
+
+    #[test]
+    fn a_panes_peer_is_recoverable_from_the_target_it_was_built_with() {
+        // The pane is built from the peer and the poller is later looked up
+        // by it; if these two disagreed, a pane would report activity for a
+        // terminal it is not showing.
+        let id = PeerId("abc123".into());
+        assert_eq!(
+            peer_target(&id).profile_id().map(|p| p.0.clone()),
+            Some("abc123".to_string())
+        );
+        assert!(!peer_target(&id).is_local(), "a peer pane is never local");
+    }
+
+    #[test]
+    fn the_reviewer_never_observes_a_terminal_on_another_mac() {
+        // The fourth site of the phase's recurring shape, and the only one
+        // that was not inert: `buddy_tick` gates its repo PROBE on the
+        // target but dispatched its utterance regardless, handing the agent
+        // `visible_text()` — the empty local placeholder — for an attached
+        // pane. The reviewer then comments on a screen that is not there.
+        assert!(may_review_pane(&Target::Local));
+        assert!(!may_review_pane(&peer_target(&PeerId("p1".into()))));
+    }
+
+    // --- one poller per peer, browsing included ----------------------------
+
+    #[test]
+    fn browsing_a_peer_keeps_its_poller_alive_before_any_pane_exists() {
+        // The session list IS the poller's output, so the sweep that prunes
+        // pollers no pane needs would otherwise kill the list being read.
+        let a = PeerId("peer-a".into());
+        let b = PeerId("peer-b".into());
+        assert_eq!(peer_pollers_needed(&[], Some(&a)), vec![a.clone()]);
+        assert_eq!(
+            peer_pollers_needed(std::slice::from_ref(&b), Some(&a)),
+            vec![b.clone(), a.clone()]
+        );
+        assert!(peer_pollers_needed(&[], None).is_empty());
+        assert_eq!(
+            peer_pollers_needed(std::slice::from_ref(&b), None),
+            vec![b],
+            "closing the sidebar must not disturb an attached pane's poller"
+        );
+    }
+
+    // --- naming a remote pane ----------------------------------------------
+
+    #[test]
+    fn an_attached_pane_is_named_after_the_mac_it_is_watching() {
+        let peers = vec![peer("abc", "mac studio")];
+        let id = ProfileId("abc".into());
+        assert_eq!(remote_target_label(&id, &[], &peers), "mac studio");
+    }
+
+    #[test]
+    fn an_ssh_profile_still_wins_and_an_unknown_id_never_reads_as_local() {
+        let profiles = vec![profile("abc", "build box")];
+        let peers = vec![peer("abc", "mac studio")];
+        let id = ProfileId("abc".into());
+        assert_eq!(
+            remote_target_label(&id, &profiles, &peers),
+            "build box",
+            "the pre-existing answer for every target that existed before this phase"
+        );
+        let orphan = ProfileId("zzz".into());
+        let label = remote_target_label(&orphan, &profiles, &peers);
+        assert!(label.contains("zzz"), "an unknown target must name its id");
+        assert!(label.contains("missing"));
+    }
+
+    #[test]
+    fn a_tab_for_an_opened_session_names_the_machine_first() {
+        assert_eq!(
+            attached_tab_label("mac studio", "work"),
+            "mac studio \u{b7} work"
+        );
+        assert_eq!(
+            attached_tab_label("mac studio", "  "),
+            "mac studio",
+            "a session with no label still names its machine"
+        );
+    }
+
+    // --- D5 at the point of refusal ----------------------------------------
+
+    #[test]
+    fn the_search_sheet_refuses_an_attached_pane_out_loud() {
+        assert_eq!(search_offer(Some(true)), SearchOffer::Field);
+        match search_offer(Some(false)) {
+            SearchOffer::Refused(reason) => {
+                assert!(reason.contains("attached"), "{reason}");
+                assert!(!reason.is_empty());
+            }
+            SearchOffer::Field => panic!("an attached pane must not be offered a search field"),
+        }
+        assert!(matches!(search_offer(None), SearchOffer::Refused(_)));
+    }
+
+    // --- what the sidebar shows under a peer -------------------------------
+
+    #[test]
+    fn a_peer_being_probed_says_so_rather_than_showing_an_empty_list() {
+        assert_eq!(peer_listing(None, None), PeerListing::Probing);
+        assert_eq!(
+            peer_listing(Some(&ready()), None),
+            PeerListing::Waiting,
+            "reachable but not yet polled is not the same as sharing nothing"
+        );
+        assert_eq!(
+            peer_listing(Some(&ready()), Some(LastPoll::Pending)),
+            PeerListing::Waiting
+        );
+    }
+
+    #[test]
+    fn a_peer_that_could_not_be_found_shows_the_probes_own_reason() {
+        for reach in [Reach::Unreachable, Reach::Refused, Reach::Incompatible] {
+            let note = reach.note();
+            assert_eq!(
+                peer_listing(Some(&reach), None),
+                PeerListing::Unreachable(note)
+            );
+            assert!(!note.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_poll_that_could_not_be_read_is_never_shown_as_sharing_nothing() {
+        // The hazard `parse_sessions` guards, one layer up. "Nothing
+        // shared" invites the user to go turn sharing on; "could not be
+        // read" is what a missing `view` grant actually looks like.
+        assert_eq!(
+            peer_listing(Some(&ready()), Some(LastPoll::Failed)),
+            PeerListing::Unreadable
+        );
+        assert_eq!(
+            peer_listing(Some(&ready()), Some(LastPoll::Listed(Vec::new()))),
+            PeerListing::Nothing
+        );
+    }
+
+    #[test]
+    fn a_retired_session_is_never_offered_to_open() {
+        // `alive: false` is the broadcaster already tearing that pane down.
+        // Opening it would attach to a terminal that is ending.
+        let poll = LastPoll::Listed(vec![
+            session("t1", "work", true),
+            session("t2", "closing", false),
+        ]);
+        match peer_listing(Some(&ready()), Some(poll)) {
+            PeerListing::Sessions(sessions) => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].id, "t1");
+            }
+            other => panic!("expected a session list, got {other:?}"),
+        }
+        // ...and a list of nothing BUT retired sessions is not a list.
+        assert_eq!(
+            peer_listing(
+                Some(&ready()),
+                Some(LastPoll::Listed(vec![session("t2", "closing", false)]))
+            ),
+            PeerListing::Nothing
+        );
     }
 }
 

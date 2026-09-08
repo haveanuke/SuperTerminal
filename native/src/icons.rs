@@ -19,6 +19,8 @@ pub enum Icon {
     /// Three linked nodes (share-to icon); filled nodes = shared with at
     /// least one peer right now, hollow = not shared.
     Share { active: bool },
+    /// Two overlapping screens — another Mac's terminals, seen from here.
+    Peers,
 }
 
 pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
@@ -91,6 +93,21 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                         // Home strip near the bottom edge.
                         line(window, 6.5, 12.0, 9.5, 12.0);
                     }
+                }
+                Icon::Peers => {
+                    // Back screen, offset up and right; front screen over
+                    // it. Outline only: unlike Coffee/Phone/Share this icon
+                    // has no on/off state to carry, so a filled variant
+                    // would read as one.
+                    line(window, 6.0, 2.0, 14.0, 2.0);
+                    line(window, 14.0, 2.0, 14.0, 8.0);
+                    line(window, 2.0, 6.0, 10.0, 6.0);
+                    line(window, 10.0, 6.0, 10.0, 13.0);
+                    line(window, 10.0, 13.0, 2.0, 13.0);
+                    line(window, 2.0, 13.0, 2.0, 6.0);
+                    // Prompt mark inside the front screen.
+                    line(window, 4.0, 8.5, 6.0, 9.75);
+                    line(window, 6.0, 9.75, 4.0, 11.0);
                 }
                 Icon::Share { active } => {
                     // Two edges from the left node out to the two right

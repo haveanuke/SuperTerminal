@@ -164,7 +164,12 @@ impl Workspace {
         // `apply_peer_mutation` in `settings_ui.rs` is where that lives.
         let (peers, _peer_problems) = self.settings.peers();
         let mut started = None;
-        for port in 43110..43121u16 {
+        // The SAME range `peer_client::discover` scans when looking for a
+        // peer's companion. One constant, two readers: a peer is found by
+        // looking exactly where this app would have put its own server, and
+        // widening the range here cannot silently make peers unfindable.
+        let ports = crate::peer_client::discover::COMPANION_PORTS;
+        for port in ports.clone() {
             match server::start(
                 Arc::clone(&hub),
                 self.theme,
@@ -194,7 +199,11 @@ impl Workspace {
                 for pane in self.panes.values() {
                     pane.update(cx, |pane, _| pane.set_companion(None));
                 }
-                self.companion_error = Some(format!("could not bind {ip} (ports 43110-43120)"));
+                self.companion_error = Some(format!(
+                    "could not bind {ip} (ports {}-{})",
+                    ports.start(),
+                    ports.end()
+                ));
             }
         }
         cx.notify();

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::companion::server::INPUT_CONTENT_TYPE;
 
 pub mod attach;
+pub mod discover;
 pub mod sessions;
 mod sse;
 mod stream;
@@ -46,6 +47,19 @@ const READ_CHUNK: usize = 4096;
 pub struct Endpoint {
     pub addr: SocketAddr,
     pub secret: String,
+}
+
+/// Hand-written rather than derived: a derived `Debug` would print the
+/// bearer secret into every log line, panic message and test failure that
+/// ever formats an `Endpoint` (or anything holding one, such as
+/// `discover::Reach`). The address is the part worth seeing.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("addr", &self.addr)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug)]

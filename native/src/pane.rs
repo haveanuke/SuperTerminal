@@ -17,7 +17,7 @@ use gpui::{
 use crate::companion::wire::{WireRun, WireSnapshot};
 use crate::hosts::Target;
 use crate::keys::{self, KeyInput};
-use crate::peer_client::attach::{Attachment, Freshness, Status};
+use crate::peer_client::attach::{Attachment, Status};
 use crate::peer_client::sessions::{SessionPoller, SessionReport};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use superterminal_core::activity::Activity;
@@ -438,8 +438,13 @@ impl TerminalPane {
                             // terminal it does not own — an accident that
                             // happens to enforce the rule. State the rule so
                             // a later change cannot quietly undo it.
+                            // NOT `attached_frame.is_some()`: that asks
+                            // "has a frame arrived", and a remote pane in
+                            // the attach window answers NO. The rule is
+                            // about which MACHINE owns this terminal, so it
+                            // reads the target — see [`views_remote`].
                             let publishable = may_publish_to_companion(
-                                pane.attached_frame.is_some(),
+                                pane.views_remote(),
                                 pane.session.is_some(),
                             );
                             if let Some(session) = pane.session.as_mut().filter(|_| publishable) {
@@ -724,12 +729,24 @@ impl TerminalPane {
     /// The pane's own input route does NOT depend on this having been
     /// called — see [`Self::views_remote`]. A remote pane with no attachment
     /// drops its input rather than typing it into a local shell.
-    #[allow(dead_code)] // the workspace that attaches a pane arrives in Task 7
     pub fn set_attachment(
         &mut self,
         attachment: std::sync::Arc<Attachment>,
         sessions: std::sync::Arc<SessionPoller>,
     ) {
+        // The mirror of every other guard in this file. `views_remote` stops
+        // a REMOTE pane typing into a local shell; this stops a LOCAL pane
+        // being handed a peer to type into. Refused rather than asserted:
+        // the workspace's attach path builds the pane itself and cannot
+        // reach here with a local one, so this is the backstop for a second
+        // caller that does not exist yet.
+        //
+        // Honest about coverage: `may_attach` has a test, but this CALL is
+        // entity-bound and no test reaches it — deleting the guard still
+        // compiles and still passes the suite. Verified by reading.
+        if !may_attach(&self.target) {
+            return;
+        }
         // Taken together, never separately: the poller answers questions
         // about the session this ATTACHMENT streams, so a pane holding one
         // peer's frames beside another peer's session list would read
@@ -943,7 +960,29 @@ impl TerminalPane {
         )
     }
 
+    /// Whether this pane's terminal runs on THIS Mac. The workspace asks
+    /// before offering search or a selection, so a refusal is a disabled
+    /// control with a reason rather than a box that swallows what is typed
+    /// into it. See [`owns_the_grid`] and [`remote_limits_line`].
+    pub fn owns_grid(&self) -> bool {
+        owns_the_grid(self.views_remote())
+    }
+
+    /// The connection word for an attached pane's chrome, or `None` for a
+    /// pane whose terminal is local. See [`remote_status_label`].
+    pub fn remote_state(&self) -> Option<&'static str> {
+        self.views_remote()
+            .then(|| remote_status_label(self.attachment_status()))
+    }
+
     pub fn set_search(&mut self, needle: Option<&str>, cx: &mut Context<Self>) {
+        // D5. Search reads the grid the SESSION owns; an attached pane has
+        // no session, so this was already a no-op — a silent one. Stated
+        // here, and refused in the UI (`workspace::search_availability`) so
+        // nobody types into a box that does nothing.
+        if !self.owns_grid() {
+            return;
+        }
         if let Some(session) = self.session.as_mut() {
             session.set_search(needle);
         }
@@ -954,6 +993,9 @@ impl TerminalPane {
     }
 
     pub fn search_next(&mut self, cx: &mut Context<Self>) {
+        if !self.owns_grid() {
+            return;
+        }
         if let Some(session) = self.session.as_mut() {
             session.search_jump_next();
         }
@@ -962,6 +1004,12 @@ impl TerminalPane {
     }
 
     /// Visible rows as plain text (buddy review context).
+    ///
+    /// Reads the LOCAL grid, deliberately and only. Its one caller refuses
+    /// a pane that views another machine before asking — see
+    /// `workspace::may_review_pane` — so this is never called on one; it
+    /// would otherwise return the empty placeholder and the reviewer would
+    /// comment on a screen that is not there.
     pub fn visible_text(&self) -> String {
         self.snapshot
             .rows
@@ -1303,16 +1351,23 @@ impl TerminalPane {
     }
 
     fn scroll_to_bottom_on_input(&mut self, cx: &mut Context<Self>) {
-        if self.attached_frame.is_some() {
-            // The local analogue of the `display_offset` reset below: typing
-            // lands at the broadcaster's live bottom, so the viewer's own
-            // scrollback window snaps there too. D2 — this changes only
-            // which slice THIS viewer paints, never the remote PTY.
-            self.attached_scroll_offset = 0;
-        } else if self.snapshot.display_offset > 0 {
-            if let Some(session) = self.session.as_mut() {
-                session.queue_scroll(-(self.snapshot.display_offset as i32));
+        // Decided by [`input_scroll`], keyed on the TARGET. This site used
+        // to ask `attached_frame.is_some()` and so took the local arm for a
+        // remote pane awaiting its first frame.
+        match input_scroll(self.views_remote(), self.snapshot.display_offset) {
+            InputScroll::AttachedToBottom => {
+                // Typing lands at the broadcaster's live bottom, so the
+                // viewer's own scrollback window snaps there too. D2 — this
+                // changes only which slice THIS viewer paints, never the
+                // remote PTY.
+                self.attached_scroll_offset = 0;
             }
+            InputScroll::LocalLines(lines) => {
+                if let Some(session) = self.session.as_mut() {
+                    session.queue_scroll(lines);
+                }
+            }
+            InputScroll::None => {}
         }
         cx.notify();
     }
@@ -1381,6 +1436,224 @@ fn broadcast_register(hub: &std::sync::Arc<BroadcastHub>, id: &str, sender: Even
 /// even if an attached pane ever acquires a session for some other purpose.
 fn may_publish_to_companion(attached: bool, has_local_session: bool) -> bool {
     has_local_session && !attached
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: the decisions that ARM everything above.
+//
+// Three bugs of ONE shape were found while this phase was built — an
+// auto-run timer that would have fired on the other Mac, a click guard
+// keyed on "a frame has arrived", and auto-run's immediate first run gated
+// at the timer but not at its setter. The shape is a decision about whether
+// a pane drives ANOTHER MACHINE, made correctly at one site and missed at
+// its sibling.
+//
+// Every predicate below is therefore keyed on `views_remote` — the pane's
+// TARGET — and never on `attached_frame.is_some()`, which asks a different
+// question whose answer differs for the whole attach window.
+// ---------------------------------------------------------------------------
+
+/// Whether this pane's terminal runs on THIS Mac, and so whether the
+/// features that read or write a local grid can be honestly offered.
+///
+/// D5's gate, in one place, so search, selection, mouse reporting and
+/// resize cannot drift apart from the sentence that tells the user about
+/// them ([`remote_limits_line`]). Each of those reaches `self.session`, and
+/// on an attached pane that is `None` — so every one of them ALREADY does
+/// nothing. Doing nothing is not the problem; doing nothing SILENTLY is.
+fn owns_the_grid(views_remote: bool) -> bool {
+    !views_remote
+}
+
+/// Rows of scrollback an attached pane can reach: exactly what the
+/// broadcaster puts on the wire, no more. Named here so the number the UI
+/// states and the number the wire carries are the same number.
+fn pane_scrollback_rows() -> usize {
+    crate::term_session::HISTORY_TAIL
+}
+
+/// D5, in one sentence, for the two places it must be READ rather than
+/// discovered: beside a peer's session list (before a pane is opened) and
+/// on the focused bar (while one is open).
+///
+/// Cmd+click URLs are deliberately absent from the list of refusals: they
+/// were a silent no-op until this task and now work off the wire runs, so
+/// naming them here would be a limit that no longer exists.
+pub fn remote_limits_line() -> String {
+    format!(
+        "view only \u{b7} no search, selection or mouse reporting \u{b7} \
+         {} rows of scrollback \u{b7} size follows the other Mac",
+        pane_scrollback_rows()
+    )
+}
+
+/// One word for a connection state, so a pane that never attached says why
+/// instead of sitting blank.
+///
+/// `Refused` reads "not shared" rather than "refused": the peer answers 404
+/// for a session that is not shared with us AND for one that does not
+/// exist, deliberately not distinguishing them, so the wording must not
+/// claim more than the status proves.
+fn remote_status_label(status: Option<Status>) -> &'static str {
+    match status {
+        None => "not connected",
+        Some(Status::Connecting) => "connecting",
+        Some(Status::Live) => "live",
+        Some(Status::Refused) => "not shared",
+        Some(Status::Gone) => "ended",
+        Some(Status::Unavailable) => "unreachable",
+        Some(Status::Incompatible) => "version mismatch",
+    }
+}
+
+/// Whether a pane may be handed an attachment at all.
+///
+/// `set_attachment` starts a queue that types into a PEER and clears the
+/// pane's frame state. Handing one to a LOCAL pane would route that pane's
+/// keystrokes off this Mac — the mirror image of the bug `views_remote`
+/// exists to stop, and the reason the workspace's attach path is not free
+/// to pick any pane it likes.
+fn may_attach(target: &Target) -> bool {
+    !target.is_local()
+}
+
+/// What typing does to the pane's scroll position.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum InputScroll {
+    /// Snap the viewer's own window over the RECEIVED history back to the
+    /// live bottom. D2: this changes only which slice this viewer paints.
+    AttachedToBottom,
+    /// Queue a scroll of this many lines on the local session's grid.
+    LocalLines(i32),
+    /// Already at the bottom, or nothing to scroll.
+    None,
+}
+
+/// Where a keystroke's "jump to the bottom" lands.
+///
+/// Keyed on the target, not on `attached_frame.is_some()`. The sibling of
+/// the click guard, and it had the same defect: a remote pane between
+/// attaching and its first frame took the LOCAL arm and asked a session on
+/// THIS Mac to scroll. That is inert today only because such a pane has no
+/// session — the same "safe by accident" this phase has already been bitten
+/// by three times.
+fn input_scroll(views_remote: bool, local_display_offset: usize) -> InputScroll {
+    if views_remote {
+        InputScroll::AttachedToBottom
+    } else if local_display_offset > 0 {
+        InputScroll::LocalLines(-(local_display_offset as i32))
+    } else {
+        InputScroll::None
+    }
+}
+
+/// Where a wheel gesture's lines go.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum WheelRoute {
+    /// Move the viewer's own window over `history_len` received rows.
+    AttachedHistory(usize),
+    /// Scroll the local session's grid.
+    LocalGrid,
+    /// A pane that views another machine and has no frame yet: there is
+    /// nothing received to scroll, and the local grid belongs to the wrong
+    /// machine.
+    Nowhere,
+}
+
+/// Same question as [`input_scroll`], asked by the wheel handler, and it
+/// had the same defect: `attached_frame.as_ref().map(..)` fell through to
+/// `session.queue_scroll` for a remote pane awaiting its first frame.
+fn wheel_route(views_remote: bool, history_len: Option<usize>) -> WheelRoute {
+    if !views_remote {
+        return WheelRoute::LocalGrid;
+    }
+    match history_len {
+        Some(len) => WheelRoute::AttachedHistory(len),
+        None => WheelRoute::Nowhere,
+    }
+}
+
+/// Where the IME candidate window anchors, in viewport cells.
+///
+/// A remote pane with no frame has only the placeholder `from_parts` built,
+/// whose cursor is a real-looking `(0, 0)`; anchoring a CJK composition
+/// there points at a cell that describes nothing. `None` is the honest
+/// answer, and it is the same one a scrolled-back attached frame gives
+/// (Task 3: no cursor is painted there, so there is no cell to anchor to).
+fn ime_anchor(
+    views_remote: bool,
+    frame: Option<&WireSnapshot>,
+    offset: usize,
+    local_cursor: (usize, Option<usize>),
+) -> Option<(usize, usize)> {
+    if views_remote {
+        return attached_cursor_cell(frame?, offset);
+    }
+    local_cursor.1.map(|row| (local_cursor.0, row))
+}
+
+/// Reassemble one already-coalesced wire row into column-indexed text.
+///
+/// Task 4 recorded that wire runs cannot be turned back into row text and
+/// left `url_at` a silent no-op on an attached pane. That reasoning was too
+/// strong: every run carries its own `col`, so runs are BLITTED at their
+/// column and the gaps padded with spaces — never concatenated. The
+/// difference is not cosmetic. Concatenating `["see", "https://x.dev"]`
+/// from columns 0 and 10 yields `seehttps://x.dev`, and a click would then
+/// "find" a URL that is not on the screen.
+///
+/// Hostile input is clipped, never trusted: a peer is free to send a `col`
+/// past `cols` or a run longer than the row, and neither may index out of
+/// bounds. Wide characters are the stated imprecision — `width` counts
+/// CELLS and `text` carries CHARS, and the wire does not say which chars
+/// were wide — so a run of CJK text leaves its tail padded. URLs are ASCII,
+/// and the drift cannot escape the run it happens in.
+fn wire_row_text(runs: &[WireRun], cols: usize) -> String {
+    let mut cells = vec![' '; cols];
+    for run in runs {
+        let start = run.col as usize;
+        for (offset, ch) in run.text.chars().enumerate() {
+            match cells.get_mut(start + offset) {
+                Some(cell) => *cell = ch,
+                None => break,
+            }
+        }
+    }
+    cells.into_iter().collect()
+}
+
+/// URL spanning `col` in a row of text, if any: whitespace/quote-delimited
+/// runs, trailing punctuation trimmed the way the old web-links matcher
+/// did. Split out of `url_at` unchanged so the SAME scanner reads a local
+/// grid row and an attached pane's reassembled wire row.
+fn url_in_row(text: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let is_break = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`');
+    let mut start = 0;
+    while start < chars.len() {
+        while start < chars.len() && is_break(chars[start]) {
+            start += 1;
+        }
+        let mut end = start;
+        while end < chars.len() && !is_break(chars[end]) {
+            end += 1;
+        }
+        if start < end && col >= start && col < end {
+            let mut token: String = chars[start..end].iter().collect();
+            while token.ends_with([')', ']', '.', ',', ';', ':', '!', '?']) {
+                token.pop();
+            }
+            if token.starts_with("http://") || token.starts_with("https://") {
+                return Some(token);
+            }
+            if token.starts_with("www.") {
+                return Some(format!("https://{token}"));
+            }
+            return None;
+        }
+        start = end;
+    }
+    None
 }
 
 /// Where a pane's input bytes go.
@@ -2057,6 +2330,26 @@ struct PaintFrame {
     cursor_style: CursorStyle,
 }
 
+/// The frame a pane that views ANOTHER machine paints before its first one
+/// arrives.
+///
+/// Not `local_paint_frame` over the placeholder snapshot, which is what this
+/// replaced: `from_parts` builds that placeholder with `cursor.row: Some(0)`,
+/// so the fallback painted a real-looking cursor at (0, 0) of a terminal
+/// this pane has not seen yet. That is the same phantom `input_modes` and
+/// the IME anchor already refuse to read, drawn on screen. Blank, with no
+/// cursor, is the honest picture of "nothing has arrived" — and it matches
+/// what `attached_paint_frame` already does when scrolled back, for the
+/// same reason.
+fn attached_placeholder_frame(background: u32) -> PaintFrame {
+    PaintFrame {
+        background,
+        rows: Vec::new(),
+        cursor: None,
+        cursor_style: CursorStyle::Hidden,
+    }
+}
+
 /// Resolve a LOCAL snapshot into a [`PaintFrame`]: theme-resolved colors
 /// with selection/search/inverse/dim/hidden applied, then coalesced. This is
 /// the exact per-row and per-cursor logic `render()` used to run inline —
@@ -2389,10 +2682,12 @@ impl gpui::EntityInputHandler for TerminalPane {
         // window at a phantom cursor; and a scrolled-back attached frame
         // paints no cursor at all (Task 3), so it offers no anchor rather
         // than a wrong one.
-        let (cursor_col, row) = match &self.attached_frame {
-            Some(wire) => attached_cursor_cell(wire, self.attached_scroll_offset)?,
-            None => (self.snapshot.cursor.col, self.snapshot.cursor.row?),
-        };
+        let (cursor_col, row) = ime_anchor(
+            self.views_remote(),
+            self.attached_frame.as_deref(),
+            self.attached_scroll_offset,
+            (self.snapshot.cursor.col, self.snapshot.cursor.row),
+        )?;
         let origin = gpui::point(
             element_bounds.origin.x + px(PADDING + cursor_col as f32 * f32::from(self.cell_width)),
             element_bounds.origin.y + px(PADDING + row as f32 * f32::from(self.line_height)),
@@ -2527,9 +2822,19 @@ impl Render for TerminalPane {
         // `attached_paint_frame`, which windows `history` + `rows` by the
         // viewer's own local scroll offset (D2: never scrolls the remote
         // PTY) and falls back to `wire_paint_frame` at offset 0.
-        let attached = self.attached_frame.is_some();
+        // NOT `attached_frame.is_some()`. This drives the cursor's
+        // contrast boost and the translucency refusal, and a remote pane
+        // between attaching and its first frame is still a remote pane: it
+        // must not flash the local background image and then swap to an
+        // opaque slab when the first frame lands.
+        let attached = self.views_remote();
         let frame = match &self.attached_frame {
             Some(wire) => attached_paint_frame(wire, self.attached_scroll_offset),
+            // Keyed on the target, like every other decision here: a pane
+            // that views another machine paints nothing until a frame
+            // arrives, rather than the local placeholder's phantom cursor.
+            // See [`attached_placeholder_frame`].
+            None if attached => attached_placeholder_frame(theme.background),
             None => local_paint_frame(snapshot, theme, &advance_safe),
         };
         let frame_background = frame.background;
@@ -2726,19 +3031,27 @@ impl Render for TerminalPane {
                         // nothing moved the offset. D2 keeps this local —
                         // it repicks the slice of the RECEIVED history this
                         // viewer paints and never touches the remote PTY.
-                        match this.attached_frame.as_ref().map(|w| w.history.len()) {
-                            Some(history_len) => {
+                        // Routed on the TARGET (see [`wheel_route`]): a
+                        // remote pane with no frame yet has nothing
+                        // received to scroll, and the local grid belongs to
+                        // the wrong machine.
+                        match wheel_route(
+                            this.views_remote(),
+                            this.attached_frame.as_ref().map(|w| w.history.len()),
+                        ) {
+                            WheelRoute::AttachedHistory(history_len) => {
                                 this.attached_scroll_offset = attached_scroll_after_wheel(
                                     this.attached_scroll_offset,
                                     lines,
                                     history_len,
                                 );
                             }
-                            None => {
+                            WheelRoute::LocalGrid => {
                                 if let Some(session) = this.session.as_mut() {
                                     session.queue_scroll(lines);
                                 }
                             }
+                            WheelRoute::Nowhere => {}
                         }
                         cx.notify();
                     }
@@ -2806,6 +3119,16 @@ impl TerminalPane {
     }
 
     pub fn resize_to(&mut self, width: Pixels, height: Pixels) {
+        // D2: geometry is BROADCASTER-owned. An attached pane fits and
+        // scrolls what it is given and never resizes the remote PTY — so
+        // this returns before computing a grid size that would describe the
+        // wrong machine. It was already inert (no session), which is
+        // exactly the "safe by accident" this phase keeps finding; the
+        // focused bar says "size follows the other Mac" so the refusal is
+        // read rather than discovered.
+        if !self.owns_grid() {
+            return;
+        }
         let (cols, lines) = self.grid_size_for(width, height);
         if let Some(session) = self.session.as_mut() {
             session.queue_resize(
@@ -2817,39 +3140,40 @@ impl TerminalPane {
         }
     }
 
-    /// URL spanning the given cell, if any: scans the row for http(s):// or
-    /// www. runs delimited by whitespace/quotes, trimming trailing
-    /// punctuation the way the old web-links matcher did.
+    /// URL spanning the given cell, if any.
+    ///
+    /// Works on an attached pane too, which it did not before: `url_at`
+    /// read `self.snapshot.rows`, the empty placeholder on a pane with no
+    /// session, so Cmd+click was a silent no-op — the exact failure mode
+    /// this phase exists to prevent. The row it scans is the one being
+    /// PAINTED (the same window `attached_paint_frame` picks), reassembled
+    /// by [`wire_row_text`]; the scanner itself is [`url_in_row`],
+    /// unchanged and shared with the local path.
     fn url_at(&self, col: usize, row: usize) -> Option<String> {
-        let cells = self.snapshot.rows.get(row)?;
-        let text: String = cells.iter().map(|cell| cell.ch).collect();
-        let chars: Vec<char> = text.chars().collect();
-        let is_break = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`');
-        let mut start = 0;
-        while start < chars.len() {
-            while start < chars.len() && is_break(chars[start]) {
-                start += 1;
+        let text = match (self.views_remote(), &self.attached_frame) {
+            // A remote pane with no frame has no row to scan. The
+            // placeholder grid in the `None` arm below describes THIS Mac
+            // and must not be consulted for a pane that views another one —
+            // it happens to be empty, which is exactly the "safe by
+            // accident" this file keeps correcting.
+            (true, None) => return None,
+            (_, Some(wire)) => {
+                let window = windowed_wire_rows(
+                    &wire.history,
+                    &wire.rows,
+                    clamp_attached_offset(wire.history.len(), self.attached_scroll_offset),
+                );
+                wire_row_text(window.get(row)?, wire.cols as usize)
             }
-            let mut end = start;
-            while end < chars.len() && !is_break(chars[end]) {
-                end += 1;
-            }
-            if start < end && col >= start && col < end {
-                let mut token: String = chars[start..end].iter().collect();
-                while token.ends_with([')', ']', '.', ',', ';', ':', '!', '?']) {
-                    token.pop();
-                }
-                if token.starts_with("http://") || token.starts_with("https://") {
-                    return Some(token);
-                }
-                if token.starts_with("www.") {
-                    return Some(format!("https://{token}"));
-                }
-                return None;
-            }
-            start = end;
-        }
-        None
+            (false, None) => self
+                .snapshot
+                .rows
+                .get(row)?
+                .iter()
+                .map(|cell| cell.ch)
+                .collect(),
+        };
+        url_in_row(&text, col)
     }
 
     fn handle_click(&mut self, col: usize, row: usize, cx: &mut Context<Self>) {
@@ -5258,5 +5582,281 @@ mod attached_activity_tests {
             companion_activity_of(&remote(), Some(true), Some(Activity::Unknown)),
             Activity::Unknown
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: the decisions that ARM everything above.
+//
+// Until this task nothing called `set_attachment`, so most of the machinery
+// this phase built was dormant. Three bugs of one shape were found while it
+// was: a decision about whether a pane drives ANOTHER MACHINE, made
+// correctly at one site and missed at its sibling. Every predicate below is
+// keyed on `views_remote` — the pane's TARGET — for that reason. None is
+// keyed on `attached_frame.is_some()`, which asks a different question ("has
+// a frame arrived") whose answer differs for the whole attach window.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod attached_ui_tests {
+    use super::{
+        attached_placeholder_frame, ime_anchor, input_scroll, may_attach, owns_the_grid,
+        pane_scrollback_rows, remote_limits_line, remote_status_label, url_in_row, wheel_route,
+        wire_row_text, InputScroll, WheelRoute,
+    };
+    use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
+    use crate::hosts::{ProfileId, Target};
+    use crate::peer_client::attach::Status;
+
+    fn run(col: u16, text: &str) -> WireRun {
+        WireRun {
+            col,
+            width: text.chars().count() as u16,
+            text: text.to_string(),
+            fg: "#c0caf5".to_string(),
+            bg: None,
+            b: false,
+            i: false,
+            u: false,
+        }
+    }
+
+    fn frame(history: usize, cursor: Option<(u16, u16)>) -> WireSnapshot {
+        WireSnapshot {
+            cols: 8,
+            lines: 2,
+            cursor: cursor.map(|(col, row)| WireCursor {
+                col,
+                row,
+                shape: "block".to_string(),
+            }),
+            app_cursor: false,
+            rows: vec![vec![run(0, "r0")], vec![run(0, "r1")]],
+            history: (0..history)
+                .map(|i| vec![run(0, &format!("h{i}"))])
+                .collect(),
+            bracketed_paste: false,
+            mouse_tracking: false,
+            background: "#1a1b26".to_string(),
+        }
+    }
+
+    fn remote() -> Target {
+        Target::Remote(ProfileId("peer-1".to_string()))
+    }
+
+    // --- the attach window: every gate keyed on the target -----------------
+
+    #[test]
+    fn typing_into_a_remote_pane_never_queues_a_scroll_on_this_mac() {
+        // The sibling of the click guard. `scroll_to_bottom_on_input` asked
+        // `attached_frame.is_some()`, so a remote pane between attaching and
+        // its first frame took the LOCAL arm. It is inert only because such
+        // a pane has no session; keyed on the target it is inert BY THE
+        // RULE, which is what the two earlier bugs of this shape lacked.
+        assert_eq!(input_scroll(true, 0), InputScroll::AttachedToBottom);
+        assert_eq!(
+            input_scroll(true, 40),
+            InputScroll::AttachedToBottom,
+            "a remote pane's local display_offset describes another machine's grid"
+        );
+    }
+
+    #[test]
+    fn a_local_pane_scrolls_back_down_exactly_as_it_always_did() {
+        assert_eq!(input_scroll(false, 0), InputScroll::None);
+        assert_eq!(input_scroll(false, 7), InputScroll::LocalLines(-7));
+    }
+
+    #[test]
+    fn a_wheel_on_a_remote_pane_with_no_frame_scrolls_nothing_at_all() {
+        // The same shape once more: `attached_frame.as_ref().map(..)` fell
+        // through to `session.queue_scroll` for a remote pane awaiting its
+        // first frame. There is no local grid there to scroll, and asking
+        // for one is how a wrong-machine action gets written.
+        assert_eq!(wheel_route(true, None), WheelRoute::Nowhere);
+        assert_eq!(wheel_route(true, Some(0)), WheelRoute::AttachedHistory(0));
+        assert_eq!(wheel_route(true, Some(9)), WheelRoute::AttachedHistory(9));
+    }
+
+    #[test]
+    fn a_wheel_on_a_local_pane_still_reaches_the_local_grid() {
+        assert_eq!(wheel_route(false, None), WheelRoute::LocalGrid);
+        // A local pane never carries a frame, but the route must not depend
+        // on that being true — only on the target.
+        assert_eq!(wheel_route(false, Some(3)), WheelRoute::LocalGrid);
+    }
+
+    #[test]
+    fn the_ime_candidate_window_never_anchors_at_a_phantom_cursor() {
+        // A remote pane with no frame has only the placeholder snapshot,
+        // whose cursor is a real-looking (0, 0). Popping a Japanese
+        // composition there points at a cell describing nothing.
+        assert_eq!(ime_anchor(true, None, 0, (0, Some(0))), None);
+        assert_eq!(ime_anchor(true, None, 0, (4, Some(9))), None);
+        // With a frame, the anchor is the cell being PAINTED.
+        assert_eq!(
+            ime_anchor(true, Some(&frame(0, Some((3, 1)))), 0, (0, Some(0))),
+            Some((3, 1))
+        );
+        // Scrolled back, an attached frame paints no cursor, so it offers
+        // no anchor rather than a wrong one.
+        assert_eq!(
+            ime_anchor(true, Some(&frame(5, Some((3, 1)))), 2, (0, Some(0))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_panes_ime_anchor_is_unchanged() {
+        assert_eq!(ime_anchor(false, None, 0, (6, Some(2))), Some((6, 2)));
+        assert_eq!(
+            ime_anchor(false, None, 0, (6, None)),
+            None,
+            "a local pane with no cursor row still offers no anchor"
+        );
+    }
+
+    #[test]
+    fn only_a_pane_that_views_another_machine_may_be_handed_an_attachment() {
+        // `set_attachment` clears frame and scroll state and starts a queue
+        // that types into a PEER. Handing one to a local pane would route
+        // that pane's keystrokes off this Mac.
+        assert!(may_attach(&remote()));
+        assert!(!may_attach(&Target::Local));
+    }
+
+    #[test]
+    fn a_pane_awaiting_its_first_frame_paints_no_cursor_at_all() {
+        // The placeholder `from_parts` builds carries `cursor.row: Some(0)`,
+        // so falling back to the local paint path drew a bar at (0, 0) of a
+        // terminal this pane has never seen. A cursor is a claim about
+        // where typing will land, and during the attach window there is no
+        // evidence for that claim.
+        let frame = attached_placeholder_frame(0x1a1b26);
+        assert_eq!(frame.cursor, None);
+        assert!(frame.rows.is_empty());
+        assert_eq!(frame.background, 0x1a1b26);
+    }
+
+    // --- D5, visible rather than discovered --------------------------------
+
+    #[test]
+    fn the_features_that_read_the_grid_belong_to_the_machine_that_owns_it() {
+        // Search, selection, mouse reporting and resize all act on the grid.
+        // On an attached pane there is no local grid to act on, so each must
+        // refuse VISIBLY rather than no-op through a `None` session.
+        assert!(owns_the_grid(false));
+        assert!(!owns_the_grid(true));
+    }
+
+    #[test]
+    fn the_limits_line_names_every_degraded_item_and_the_real_row_cap() {
+        let line = remote_limits_line();
+        for claim in ["search", "selection", "mouse", "scrollback", "size"] {
+            assert!(
+                line.contains(claim),
+                "the limits line must name {claim}: {line}"
+            );
+        }
+        // The number in the sentence is the number the broadcaster actually
+        // sends. A hand-written 150 that drifted from `HISTORY_TAIL` would
+        // be a confident lie.
+        assert!(
+            line.contains(&pane_scrollback_rows().to_string()),
+            "the limits line must state the real row cap: {line}"
+        );
+        assert_eq!(pane_scrollback_rows(), crate::term_session::HISTORY_TAIL);
+    }
+
+    #[test]
+    fn every_connection_state_says_something_a_user_can_act_on() {
+        // Task 6 left `Refused` and `Incompatible` with no user-visible
+        // signal at all: a pane that never attached, blank and silent.
+        assert_eq!(remote_status_label(None), "not connected");
+        assert_eq!(remote_status_label(Some(Status::Connecting)), "connecting");
+        assert_eq!(remote_status_label(Some(Status::Live)), "live");
+        assert_eq!(remote_status_label(Some(Status::Refused)), "not shared");
+        assert_eq!(remote_status_label(Some(Status::Gone)), "ended");
+        assert_eq!(
+            remote_status_label(Some(Status::Unavailable)),
+            "unreachable"
+        );
+        assert_eq!(
+            remote_status_label(Some(Status::Incompatible)),
+            "version mismatch"
+        );
+    }
+
+    // --- Cmd+click URLs on an attached pane --------------------------------
+
+    #[test]
+    fn a_wire_row_is_blitted_by_column_never_concatenated() {
+        // The Task 4 reasoning — that wire runs cannot be reassembled into
+        // row text — was too strong, but only because `col` and `width` are
+        // both on the wire. Concatenating the runs of a row whose second run
+        // starts ten columns later would splice two unrelated tokens into
+        // one, which is exactly how a click would "find" a URL that is not
+        // on screen.
+        let row = vec![run(0, "see"), run(10, "https://x.dev")];
+        let text = wire_row_text(&row, 30);
+        assert_eq!(&text[0..3], "see");
+        assert_eq!(
+            &text[3..10],
+            "       ",
+            "the gap must be padded, not closed"
+        );
+        assert!(text.starts_with("see       https://x.dev"));
+        assert_eq!(text.chars().count(), 30, "the row is exactly `cols` wide");
+    }
+
+    #[test]
+    fn a_run_that_overruns_the_row_is_clipped_rather_than_panicking() {
+        // Hostile input: a peer is free to send a col past `cols`, or a run
+        // longer than the row. Neither may index out of bounds.
+        let row = vec![run(28, "overlong"), run(99, "past the end")];
+        let text = wire_row_text(&row, 30);
+        assert_eq!(text.chars().count(), 30);
+        assert!(text.ends_with("ov"));
+    }
+
+    // NOTE, and it is a gap rather than a claim: `url_at`'s refusal to
+    // scan the LOCAL placeholder grid on a remote pane with no frame is
+    // entity-bound (it reads `self.attached_frame` and `self.views_remote`)
+    // and NO test here reaches it. A test over `url_in_row` on an empty row
+    // would pass whether the guard is there or not, so one was written,
+    // found to survive every sabotage of the code it named, and deleted
+    // rather than left implying coverage. Verified by reading.
+
+    #[test]
+    fn cmd_click_finds_a_url_in_a_row_of_wire_runs() {
+        let row = vec![run(0, "open "), run(5, "https://example.com/x")];
+        let text = wire_row_text(&row, 40);
+        assert_eq!(
+            url_in_row(&text, 8),
+            Some("https://example.com/x".to_string())
+        );
+        assert_eq!(url_in_row(&text, 2), None, "the word `open` is not a URL");
+    }
+
+    #[test]
+    fn the_local_url_scanner_is_unchanged_by_the_extraction() {
+        // Same cases the inline scanner handled: bare www, trailing
+        // punctuation, and a click outside any token.
+        assert_eq!(
+            url_in_row("go to www.rust-lang.org.", 8),
+            Some("https://www.rust-lang.org".to_string())
+        );
+        assert_eq!(
+            url_in_row("see https://a.dev/b, ok", 8),
+            Some("https://a.dev/b".to_string())
+        );
+        // A LEADING paren is not trimmed and never was: `(` is not a break
+        // character, so the token starts with it and fails the scheme test.
+        // Pinned as-is rather than "fixed" — this extraction must not
+        // change what a local pane does.
+        assert_eq!(url_in_row("(https://a.dev/b)", 3), None);
+        assert_eq!(url_in_row("     ", 2), None);
+        assert_eq!(url_in_row("plain words", 3), None);
     }
 }

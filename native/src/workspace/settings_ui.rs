@@ -26,9 +26,11 @@ pub(super) mod hints {
         "Macs online on your tailnet right now. Pair one to share terminals with it.";
     pub const PAIRED_PEERS: &str =
         "Pairing turns on view and type. Delete revokes instantly, even mid-session.";
+    pub const PEER_TERMINALS: &str =
+        "Terminals a paired Mac is sharing. Opening one gives a view, not a shell.";
 
     #[cfg(test)]
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         TOOL_ADAPTERS,
         GALLERY,
         LIVE_VIEWPORT,
@@ -38,6 +40,7 @@ pub(super) mod hints {
         AWAKE,
         PEER_CANDIDATES,
         PAIRED_PEERS,
+        PEER_TERMINALS,
     ];
 
     /// Text budget that keeps hints short enough to read as captions. This
@@ -966,6 +969,11 @@ impl Workspace {
                 ws.peer_candidates = found;
                 ws.peer_scanning = false;
                 ws.peer_scanned_once = true;
+                // A peer record carries a HOST; this scan is what turns it
+                // into an address. The peers sidebar's first probe waits
+                // for exactly this, so it is resumed here rather than
+                // needing a second click.
+                ws.probe_browsed_peer(cx);
                 cx.notify();
             });
             Ok::<(), ()>(())
@@ -1002,6 +1010,14 @@ impl Workspace {
         // the hub by replaying `self.broadcasts`, so this has to be pruned
         // first or the dead peer's visibility would be replayed right back.
         self.broadcasts.forget_peer(id);
+        // A recreated peer must not inherit the deleted one's endpoint
+        // either: `discover` found that address with the OLD secret, and a
+        // poller already built from it would keep using it.
+        self.peer_reach.remove(id);
+        self.peer_sessions.remove(id);
+        if self.peer_browse.as_ref() == Some(id) {
+            self.peer_browse = None;
+        }
         // A just-shown pairing secret for the peer being deleted must not
         // linger onscreen as if it still meant something. Compared by id,
         // not label — labels are user-editable and not unique (two peers

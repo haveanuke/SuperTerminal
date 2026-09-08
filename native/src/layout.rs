@@ -49,6 +49,18 @@ impl PaneNode {
         }
     }
 
+    /// A leaf whose terminal is NOT on this Mac. The target belongs to the
+    /// id, not the position (see [`swap_terminals`]), and it is what a
+    /// reloaded session resolves through `hosts::resolve_target` — a saved
+    /// peer pane restores DEAD rather than re-attaching itself, which is
+    /// the same rule a saved ssh-profile pane already follows.
+    pub fn terminal_at(terminal_id: impl Into<String>, target: Target) -> Self {
+        PaneNode::Terminal {
+            terminal_id: terminal_id.into(),
+            target,
+        }
+    }
+
     /// True when every split in the tree has exactly two children.
     fn is_valid(&self) -> bool {
         match self {
