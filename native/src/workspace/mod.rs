@@ -2104,9 +2104,10 @@ impl Workspace {
         self.projects_note = crate::projects::missing_dirs_note(&plan.missing);
         // Record the use NOW rather than waiting for the tab to close, so a
         // crash still leaves "you just used this" behind. `record` merges it
-        // into the existing entry by primary directory, which is why
-        // reopening a PINNED project moves it up the pinned list instead of
-        // dropping an unpinned twin of itself into recents.
+        // into the existing entry by its ANCHOR folder — carried forward by
+        // `touch_for_reopen` rather than re-derived — which is why reopening
+        // a PINNED project moves it up the pinned list instead of dropping an
+        // unpinned twin of itself into recents.
         let mut store = crate::projects::ProjectStore::load();
         store.record(crate::projects::touch_for_reopen(
             project,

@@ -42,6 +42,23 @@ pub struct Project {
     pub id: String,
     pub label: String,
     pub dirs: Vec<PathBuf>,
+    /// The one folder this project is IDENTIFIED by: chosen when the record
+    /// was FIRST written (see [`anchor_dir`]) and never moved after.
+    ///
+    /// Persisted rather than re-derived on every capture, and that is the
+    /// whole point. Derivation reads the directory SET, so opening one more
+    /// folder that ranks ahead of the current one would move the anchor —
+    /// and the project would stop matching its own record and fork into a
+    /// second entry, losing the pin, the name and the accumulated time the
+    /// first one carried. Frozen, the record keeps answering to the folder
+    /// it was first known by however the folders around it change.
+    ///
+    /// `None` only for a record written before this field existed, and only
+    /// until it is loaded: [`ProjectStore::load_from`] derives one from
+    /// `dirs` for every record that has none, so a loaded store always has
+    /// its anchors. A set with nothing but `$HOME` in it has no anchor at
+    /// all — and is not [`worth_remembering`] anyway.
+    pub anchor: Option<PathBuf>,
     pub pinned: bool,
     /// Unix timestamp, seconds. A plain integer rather than `SystemTime` so
     /// it stays comparable, sortable and human-readable once serialized.
@@ -97,41 +114,90 @@ fn dir_key(p: &Path) -> String {
     p.to_string_lossy().to_lowercase()
 }
 
-/// The directory a project is IDENTIFIED by: the first of its directories
-/// that is not `$HOME`.
+/// The directory a project is IDENTIFIED by, derived from the SET it is
+/// given: not `$HOME`, then the shallowest path, then first by `dir_key`.
 ///
-/// `None` when it has none — an empty capture, or a tab that only ever sat
-/// in `$HOME`, which [`worth_remembering`] refuses to record at all. The
-/// fallback is deliberately not "then use `$HOME`": every launch opens a
-/// starter tab there, and letting `$HOME` be a primary would make every
-/// such tab the same project as every other.
-pub fn primary_dir(dirs: &[PathBuf]) -> Option<&PathBuf> {
-    dirs.iter().find(|dir| !is_home(dir))
+/// Deterministic over the set, deliberately. The obvious rule — "the first
+/// directory that is not `$HOME`" — reads `dirs` in pane order, and pane
+/// order is LAYOUT, not intent: rebalancing splits, closing and reopening a
+/// pane, or restoring a tab a different way all reorder it, and every one
+/// of those would silently change which project this is.
+///
+/// Shallowest first because a project's own folder is an ANCESTOR of the
+/// folders its terminals wander into: `/repo` beats `/repo/native`, and
+/// `/chat` beats `/chat/packages/foo`. Ties break on `dir_key`, the same
+/// case-insensitive key every other comparison here uses, so two spellings
+/// of one path can never rank differently from each other.
+///
+/// Deliberately NOT the git root. It was suggested and is declined: finding
+/// it means touching the filesystem, and this decision has to keep working
+/// for a folder that has since been deleted, renamed or unmounted — which
+/// is exactly when a remembered project matters most. The spec records the
+/// same decision so it is not re-litigated.
+///
+/// `None` when the set holds no non-`$HOME` directory — an empty capture,
+/// or a tab that only ever sat in `$HOME`, which [`worth_remembering`]
+/// refuses to record at all. The fallback is deliberately not "then use
+/// `$HOME`": every launch opens a starter tab there, and letting `$HOME` be
+/// an anchor would make every such tab the same project as every other.
+pub fn anchor_dir(dirs: &[PathBuf]) -> Option<&PathBuf> {
+    dirs.iter()
+        .filter(|dir| !is_home(dir))
+        .min_by_key(|dir| anchor_rank(dir.as_path()))
 }
 
-/// Whether an incoming capture is the SAME project as an existing record.
+/// How two candidate anchors are ordered: the shallower path wins, then the
+/// lower `dir_key`. One function, so choosing an anchor and choosing
+/// between two records that both match can never disagree about the order.
+fn anchor_rank(dir: &Path) -> (usize, String) {
+    (dir.components().count(), dir_key(dir))
+}
+
+/// A record's anchor: the stored one, or — for a record built before the
+/// field existed and not yet through [`ProjectStore::load_from`] — the one
+/// its directories derive. Never `None` for a record the store has loaded
+/// or recorded, except the hand-edited all-`$HOME` case.
+fn project_anchor(project: &Project) -> Option<&PathBuf> {
+    project
+        .anchor
+        .as_ref()
+        .or_else(|| anchor_dir(&project.dirs))
+}
+
+/// Whether a capture of `dirs` is the SAME project as `project`: the
+/// project's own ANCHOR is still one of the folders the capture has open.
 ///
-/// The primary directory alone decides, not the whole set. Matching the
-/// whole set forked a project on ordinary use: a tab with the repo open
-/// and a second terminal sitting in `~` to run `brew upgrade` records
-/// `{repo, ~}`, the same tab tomorrow without that terminal records
-/// `{repo}`, and the two are different sets — so recents fill with
-/// near-duplicates that differ only by which incidental terminal happened
-/// to be open at close time. `cd`-ing that second terminal anywhere forks
-/// it again.
+/// One folder decides, not the whole set. Matching the whole set forked a
+/// project on ordinary use: a tab with the repo open and a second terminal
+/// sitting in `~` to run `brew upgrade` records `{repo, ~}`, the same tab
+/// tomorrow without that terminal records `{repo}`, and the two are
+/// different sets — so recents fill with near-duplicates that differ only
+/// by which incidental terminal happened to be open at close time.
+/// `cd`-ing that second terminal anywhere forks it again.
 ///
-/// The cost, and it is a real one: two genuinely separate projects rooted
-/// in the same folder now merge into one record. That is the deliberate
-/// trade — a project is the folder you work in, and the terminals beside
-/// it come and go.
+/// Note what this is NOT: a comparison of the two sets' DERIVED anchors.
+/// The capture's own derivation names a NEW project and nothing else. A
+/// derived-to-derived comparison would make the stored anchor decorative,
+/// because a matched record's `dirs` are replaced by the capture that
+/// matched it — so its derived anchor would follow the capture around,
+/// which is precisely the drift the stored anchor exists to stop. Open one
+/// folder that ranks ahead of the project's own and the record would
+/// re-anchor itself, then fail to match the plain project tomorrow.
 ///
-/// A record with no primary directory matches nothing, itself included:
-/// there is no folder to be the same as.
-fn same_project(a: &[PathBuf], b: &[PathBuf]) -> bool {
-    match (primary_dir(a), primary_dir(b)) {
-        (Some(a), Some(b)) => dir_key(a) == dir_key(b),
-        _ => false,
-    }
+/// The cost, and it is a real one: two genuinely separate projects that
+/// both keep one project's anchor folder open merge into one record. That
+/// is the deliberate trade — a project is the folder you work in, and the
+/// terminals beside it come and go.
+///
+/// A record with no anchor matches nothing, itself included: there is no
+/// folder to be the same as. `load_from` gives every record that predates
+/// the field one, so in practice that is the all-`$HOME` case alone.
+fn capture_has_anchor_of(dirs: &[PathBuf], project: &Project) -> bool {
+    let Some(anchor) = project_anchor(project) else {
+        return false;
+    };
+    let anchor = dir_key(anchor);
+    dirs.iter().any(|dir| dir_key(dir) == anchor)
 }
 
 /// Unix seconds, now — the one place `last_opened` is minted, so a capture
@@ -353,21 +419,30 @@ impl TabPaneDirs {
 /// The record an auto-capture writes for `dirs`, or `None` when there is
 /// nothing to reopen — an all-remote project is not persisted at all.
 ///
-/// The label is the first directory's basename: a fine default for one
-/// directory and useless for four, which is exactly why it is only a
-/// default. `renamed` stays false so the user's own name, once given,
-/// wins over every later capture (see `ProjectStore::record`).
+/// The label is the ANCHOR's basename: a fine default for one directory and
+/// useless for four, which is exactly why it is only a default. Naming it
+/// after `dirs[0]` instead read pane order, so a project whose first pane
+/// happened to sit in `$HOME` was labelled with home's basename — the one
+/// folder that carries no intent, and never the anchor. `renamed` stays
+/// false so the user's own name, once given, wins over every later capture
+/// (see `ProjectStore::record`).
 pub fn project_for_dirs(dirs: Vec<PathBuf>, now: u64) -> Option<Project> {
-    let first = dirs.first()?;
-    let label = first
+    let anchor = anchor_dir(&dirs).cloned();
+    // `dirs.first()` is the fallback for a capture that has no anchor at
+    // all — every directory is `$HOME` — which `record` refuses to store
+    // anyway. It only keeps this function from having to answer "what is a
+    // project with no folders called".
+    let named_by = anchor.clone().or_else(|| dirs.first().cloned())?;
+    let label = named_by
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| first.to_string_lossy().to_string());
+        .unwrap_or_else(|| named_by.to_string_lossy().to_string());
     Some(Project {
         id: project_id(&dirs),
         label,
         dirs,
+        anchor,
         pinned: false,
         last_opened: now,
         icon: ProjectIcon::default(),
@@ -529,8 +604,8 @@ pub fn project_summary(dirs: usize, terminals: usize, active_secs: u64) -> Strin
 /// A capture's id: FNV-1a over the directory keys, sorted so pane order
 /// cannot change it.
 ///
-/// `record` matches on the PRIMARY directory (see `same_project`), so an
-/// id only has to be unique. Deriving it from the whole set buys one more
+/// `record` matches on the stored ANCHOR (see `capture_has_anchor_of`), so
+/// an id only has to be unique. Deriving it from the whole set buys one more
 /// thing for nothing: a project whose `projects.json` was lost comes back
 /// under the id it always had, instead of a fresh one on every launch —
 /// and a record that IS matched keeps the id it already has, so the two
@@ -557,10 +632,31 @@ impl ProjectStore {
     /// Missing or corrupt files load defaults (an empty store) rather than
     /// erroring — losing the projects file must never be worse than an
     /// inconvenience.
+    ///
+    /// Every record written before `anchor` existed gets one here, derived
+    /// from the `dirs` it does have. Deriving it once, on the way in, is
+    /// what makes the field's promise — set at first capture, never moved
+    /// after — true for projects first captured before there was a field to
+    /// set. The alternatives are both worse: leaving it `None` and deriving
+    /// on every comparison is the drift this change removes, and dropping
+    /// such records would throw away every project the user already had.
     pub fn load_from(path: &Path) -> ProjectStore {
-        match std::fs::read_to_string(path) {
+        let mut store: ProjectStore = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => ProjectStore::default(),
+        };
+        store.adopt_anchors();
+        store
+    }
+
+    /// Give every record without a stored anchor the one its directories
+    /// derive. A record holding nothing but `$HOME` keeps `None`: there is
+    /// no folder to anchor it to, and asking must not panic.
+    fn adopt_anchors(&mut self) {
+        for project in &mut self.projects {
+            if project.anchor.is_none() {
+                project.anchor = anchor_dir(&project.dirs).cloned();
+            }
         }
     }
 
@@ -582,9 +678,11 @@ impl ProjectStore {
     /// Record a project after it closes (or on quit). Encodes:
     /// - an empty `dirs` project is not recorded — there is nothing to
     ///   reopen;
-    /// - a capture whose PRIMARY directory (see `same_project`) matches an
-    ///   existing UNPINNED, UNRENAMED record updates that record rather
-    ///   than adding a duplicate — the folders beside it may differ;
+    /// - a capture that still has an existing record's ANCHOR (see
+    ///   `capture_has_anchor_of`) updates that record rather than adding a
+    ///   duplicate — the folders beside it may differ;
+    /// - the matched record KEEPS its anchor. A capture that has picked up
+    ///   a folder ranking ahead of it does not re-anchor the project;
     /// - a pinned or renamed record is never merged into: it keeps its `id`
     ///   and the incoming capture becomes its own new record instead;
     /// - recording evicts only the oldest UNPINNED project once the unpinned
@@ -598,16 +696,20 @@ impl ProjectStore {
         if !worth_remembering(&project.dirs) {
             return;
         }
+        // Every record in the store carries its own anchor, whether it was
+        // built by `project_for_dirs` (which derives one), carried forward
+        // by `touch_for_reopen` (which keeps the stored one), or written by
+        // a build that predates the field.
+        if project.anchor.is_none() {
+            project.anchor = anchor_dir(&project.dirs).cloned();
+        }
         // A pinned or renamed record still MATCHES — it just is not
         // overwritten. Only its `last_opened` moves, which is what keeps the
         // pinned list ordered by use and stops a second, unpinned copy of
         // the same project accumulating in recents every time it is opened.
         // The spec's rule is that such a record keeps its `id`, and it does.
-        if let Some(existing) = self
-            .projects
-            .iter_mut()
-            .find(|p| same_project(&p.dirs, &project.dirs))
-        {
+        if let Some(index) = self.match_index(&project) {
+            let existing = &mut self.projects[index];
             existing.last_opened = project.last_opened;
             // Both stats move even for a pinned or renamed record. What
             // that rule protects is what the user MADE theirs — the id,
@@ -624,12 +726,43 @@ impl ProjectStore {
                 existing.label = project.label;
                 existing.dirs = project.dirs;
                 existing.icon = project.icon;
+                // `anchor` is deliberately NOT among them, pinned or not.
+                // The folders a project has move all the time; which one it
+                // IS was settled at its first capture, and a later capture
+                // that re-derived it would silently make this record answer
+                // to a different folder — after which the plain project,
+                // captured tomorrow, would no longer find it.
             }
             return;
         }
         self.projects.push(project);
         let just_added = self.projects.len() - 1;
         self.evict_past_cap(just_added);
+    }
+
+    /// Which stored record an incoming capture belongs to, if any.
+    ///
+    /// A record qualifies when the capture still has its anchor folder
+    /// open. Two records can qualify at once — a capture holding both their
+    /// anchors — so the tie is settled deterministically rather than by
+    /// storage order, which is insertion order and says nothing about the
+    /// project: the record anchored at the capture's OWN derived anchor
+    /// first (the folder this capture is most plausibly rooted in), then by
+    /// the same rank `anchor_dir` chooses with, then by position.
+    fn match_index(&self, project: &Project) -> Option<usize> {
+        let derived = anchor_dir(&project.dirs).map(|dir| dir_key(dir));
+        self.projects
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| capture_has_anchor_of(&project.dirs, candidate))
+            .min_by_key(|(index, candidate)| {
+                let anchor = project_anchor(candidate).expect("a match has an anchor");
+                let (depth, key) = anchor_rank(anchor);
+                // `false` sorts first, so "this IS the capture's own
+                // derived anchor" has to be stated the other way up.
+                (derived.as_deref() != Some(key.as_str()), depth, key, *index)
+            })
+            .map(|(index, _)| index)
     }
 
     /// Drop the oldest unpinned project(s) until the unpinned count is back
@@ -695,10 +828,10 @@ pub struct SidebarSections<'a> {
 /// opened would look like pinning had broken, exactly when the user is
 /// using it.
 ///
-/// Matched on the PRIMARY directory, the same way `record` decides two
-/// captures are one project — so a tab that has picked up an extra
+/// Matched on the project's stored ANCHOR, the same way `record` decides
+/// two captures are one project — so a tab that has picked up an extra
 /// terminal in `~` since the record was written still counts as open, and
-/// a tab rooted somewhere else hides nothing, however many later folders
+/// a tab rooted somewhere else hides nothing, however many other folders
 /// the two happen to share.
 pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> SidebarSections<'a> {
     SidebarSections {
@@ -706,7 +839,7 @@ pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> S
         recent: store
             .recent()
             .into_iter()
-            .filter(|project| !open.iter().any(|dirs| same_project(dirs, &project.dirs)))
+            .filter(|project| !open.iter().any(|dirs| capture_has_anchor_of(dirs, project)))
             .collect(),
     }
 }
@@ -729,6 +862,10 @@ mod tests {
             id: id.to_string(),
             label: id.to_string(),
             dirs: dirs.iter().map(PathBuf::from).collect(),
+            // Left unset on purpose: a hand-built record is the shape a
+            // record written before the field had, so these tests exercise
+            // the derive-on-the-way-in path as well as the rules they name.
+            anchor: None,
             pinned: false,
             last_opened,
             icon: ProjectIcon::default(),
@@ -943,13 +1080,14 @@ mod tests {
     }
 
     #[test]
-    fn record_matches_on_the_primary_folder_whatever_order_follows_it() {
-        // REWRITTEN when identity moved from the whole directory set to
-        // the primary directory. What it used to assert — that ANY
-        // reordering still matched — is no longer true, and deliberately
-        // so: the FIRST non-$HOME directory is what names the project.
-        // Everything after it may be reordered, added or dropped freely,
-        // which is the point (see `same_project`).
+    fn record_matches_on_the_anchor_whatever_order_the_rest_arrive_in() {
+        // REWRITTEN TWICE. First when identity moved from the whole
+        // directory set to one directory; then again when that directory
+        // stopped being "the first non-$HOME one". Pane order is LAYOUT,
+        // so identity may not read it at all: the anchor is derived from
+        // the SET (shallowest, then by key) and then frozen on the record.
+        // Everything beside it may be reordered, added or dropped freely,
+        // which is the point (see `capture_has_anchor_of`).
         let mut store = ProjectStore::default();
         store.record(project("orig", &["/chat", "/board-kid", "/penpot"], 100));
         store.record(project(
@@ -958,7 +1096,7 @@ mod tests {
             500,
         ));
         let recent = store.recent();
-        assert_eq!(recent.len(), 1, "the folders after the primary are free");
+        assert_eq!(recent.len(), 1, "the folders beside the anchor are free");
         assert_eq!(recent[0].id, "orig");
         assert_eq!(recent[0].last_opened, 500);
     }
@@ -1134,18 +1272,18 @@ mod tests {
     #[test]
     fn record_does_not_merge_projects_rooted_in_different_folders() {
         // REWRITTEN when identity moved from the whole directory set to
-        // the primary directory. `{/a, /b}` and `{/a, /c}`, which this
+        // a single anchor folder. `{/a, /b}` and `{/a, /c}`, which this
         // used to hold apart, are now ONE project — that is exactly the
         // fork the change removes. What still separates two projects is
-        // being rooted somewhere else, and sharing every later folder does
-        // not bring them back together.
+        // being anchored somewhere else, and sharing every other folder
+        // does not bring them back together.
         let mut store = ProjectStore::default();
         store.record(project("a", &["/a", "/shared"], 100));
         store.record(project("b", &["/b", "/shared"], 200));
         assert_eq!(
             store.recent().len(),
             2,
-            "different primary folders are different projects"
+            "different anchor folders are different projects"
         );
         let mut merging = ProjectStore::default();
         merging.record(project("one", &["/a", "/b"], 100));
@@ -1153,7 +1291,7 @@ mod tests {
         assert_eq!(
             merging.recent().len(),
             1,
-            "the same primary folder is one project, whatever sits beside it"
+            "the same anchor folder is one project, whatever sits beside it"
         );
         assert_eq!(merging.recent()[0].id, "one");
     }
@@ -1265,10 +1403,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_label_is_the_first_directorys_basename() {
-        // A basename is a fine default for one directory and useless for
+    fn the_default_label_is_the_anchors_basename() {
+        // REWRITTEN when the label stopped coming from `dirs[0]`. A
+        // basename is a fine default for one directory and useless for
         // four — "chat" is not derivable from those four paths — so the
-        // FIRST one names the project until the user renames it.
+        // folder the project IS names it until the user renames it.
         let captured = project_for_dirs(
             vec![PathBuf::from("/a/chat"), PathBuf::from("/b/penpot")],
             42,
@@ -1281,6 +1420,26 @@ mod tests {
             !captured.renamed,
             "an auto-capture is never the user's name"
         );
+    }
+
+    #[test]
+    fn a_project_whose_first_pane_sits_in_home_is_not_called_home() {
+        // The defect the anchor label fixes. `dirs[0]` is pane order, and
+        // a tab whose first pane never left `$HOME` handed the project the
+        // one basename that carries no intent — "tomas" — for a project
+        // that is plainly the repo beside it.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let home_name = Path::new(&home)
+            .file_name()
+            .expect("$HOME has a basename")
+            .to_string_lossy()
+            .to_string();
+        let captured =
+            project_for_dirs(vec![PathBuf::from(&home), PathBuf::from("/work/chat")], 42)
+                .expect("dirs present");
+        assert_eq!(captured.label, "chat", "the anchor names it");
+        assert_ne!(captured.label, home_name, "never the home folder");
+        assert_eq!(captured.anchor, Some(PathBuf::from("/work/chat")));
     }
 
     #[test]
@@ -1334,6 +1493,10 @@ mod stats_tests {
             id: id.to_string(),
             label: id.to_string(),
             dirs: dirs.iter().map(PathBuf::from).collect(),
+            // Left unset on purpose: a hand-built record is the shape a
+            // record written before the field had, so these tests exercise
+            // the derive-on-the-way-in path as well as the rules they name.
+            anchor: None,
             pinned: false,
             last_opened,
             icon: ProjectIcon::default(),
@@ -1556,6 +1719,7 @@ mod tab_memory_tests {
             id: id.to_string(),
             label: id.to_string(),
             dirs: dirs.iter().map(PathBuf::from).collect(),
+            anchor: None,
             pinned,
             last_opened,
             icon: ProjectIcon::default(),
@@ -1774,7 +1938,7 @@ mod tab_memory_tests {
     fn an_incidental_terminal_anywhere_does_not_fork_a_project() {
         // The same terminal `cd`ed out of `~` and into `/tmp` forked the
         // record a SECOND time under whole-set identity. The folders
-        // beside the primary one are free to be anything.
+        // beside the anchor one are free to be anything.
         let mut store = ProjectStore::default();
         store.record(project("repo", &["/repo", "/tmp"], 100, false));
         store.record(project("would-be-a-twin", &["/repo"], 200, false));
@@ -1784,14 +1948,14 @@ mod tab_memory_tests {
 
     #[test]
     fn a_tab_that_only_ever_sat_in_home_is_still_not_a_project() {
-        // "First non-$HOME directory" must not fall back to `$HOME` when
-        // there is no other — every launch opens a starter tab there, and
-        // a `$HOME` primary would make every one of them the same project.
-        // Nor may asking for the primary of such a capture panic.
+        // Excluding `$HOME` must not fall back to it when there is no
+        // other candidate — every launch opens a starter tab there, and a
+        // `$HOME` anchor would make every one of them the same project.
+        // Nor may asking such a capture for its anchor panic.
         let home = std::env::var("HOME").expect("HOME is set in this environment");
         let home_only = [PathBuf::from(&home)];
-        assert_eq!(primary_dir(&home_only), None, "$HOME is never a primary");
-        assert_eq!(primary_dir(&[]), None, "nor is nothing at all");
+        assert_eq!(anchor_dir(&home_only), None, "$HOME is never an anchor");
+        assert_eq!(anchor_dir(&[]), None, "nor is nothing at all");
         let mut store = ProjectStore::default();
         store.record(project("starter", &[&home], 100, false));
         store.record(project("another-starter", &[&home], 200, false));
@@ -1803,7 +1967,7 @@ mod tab_memory_tests {
 
     #[test]
     fn two_projects_rooted_in_different_folders_stay_apart() {
-        // Sharing every folder BUT the primary one is not sharing an
+        // Sharing every folder BUT the anchor one is not sharing an
         // identity — otherwise a scratch folder both projects happen to
         // open would silently merge them.
         let mut store = ProjectStore::default();
@@ -1814,13 +1978,21 @@ mod tab_memory_tests {
     }
 
     #[test]
-    fn a_pinned_project_matched_by_its_primary_folder_keeps_what_is_its_own() {
-        // Matching more loosely must not loosen what a pinned or renamed
-        // record protects: its id, its label and its folders are still the
-        // user's, and only "you just used this" moves.
+    fn a_pinned_project_matched_by_its_anchor_keeps_what_is_its_own() {
+        // REWRITTEN when the anchor stopped being "the first non-$HOME
+        // directory": under that rule `{/repo, /docs}` was anchored at
+        // /repo because /repo came first, and this test leaned on it. The
+        // set derives /docs now (same depth, lower key), so the folders
+        // here say what they mean — /repo is the ancestor, and the
+        // shallowest path wins.
+        //
+        // What is being asserted is unchanged: matching more loosely must
+        // not loosen what a pinned or renamed record protects. Its id, its
+        // label and its folders are still the user's, and only "you just
+        // used this" moves.
         let home = std::env::var("HOME").expect("HOME is set in this environment");
         let mut store = ProjectStore::default();
-        let mut fav = project("fav-1", &["/repo", "/docs"], 100, true);
+        let mut fav = project("fav-1", &["/repo", "/repo/docs"], 100, true);
         fav.label = "Chat stack".to_string();
         fav.renamed = true;
         store.record(fav);
@@ -1832,7 +2004,7 @@ mod tab_memory_tests {
         assert_eq!(kept.label, "Chat stack", "so is the name the user gave it");
         assert_eq!(
             kept.dirs,
-            vec![PathBuf::from("/repo"), PathBuf::from("/docs")],
+            vec![PathBuf::from("/repo"), PathBuf::from("/repo/docs")],
             "and so are its folders — the capture's $HOME did not get in"
         );
         assert_eq!(kept.last_opened, 500, "but it did just get used");
@@ -1849,7 +2021,7 @@ mod tab_memory_tests {
         store.record(project("open", &["/chat", "/penpot"], 200, false));
         store.record(project("closed", &["/other"], 100, false));
         // The live tab has since picked up a terminal in /tmp and lost the
-        // one in /penpot. Same primary folder, so it is the same project.
+        // one in /penpot. Same anchor folder, so it is the same project.
         let open = vec![vec![PathBuf::from("/chat"), PathBuf::from("/tmp")]];
         let sections = sidebar_sections(&store, &open);
         let ids: Vec<&str> = sections.recent.iter().map(|p| p.id.as_str()).collect();
@@ -1882,5 +2054,308 @@ mod tab_memory_tests {
         let sections = sidebar_sections(&store, &open);
         let ids: Vec<&str> = sections.recent.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["mine"], "a shared folder is not shared identity");
+    }
+}
+
+/// What a project IS: the one folder it is anchored to, derived from the
+/// set of folders it was first captured with and frozen there.
+///
+/// Two rules, tested apart from each other: [`anchor_dir`] chooses (and
+/// must not read pane order), and `ProjectStore` keeps (and must not
+/// re-derive). Both are pure — no gpui harness is involved or needed.
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("st-native-anchor-{}-{}", std::process::id(), name))
+    }
+
+    fn dirs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn capture(paths: &[&str], now: u64) -> Project {
+        project_for_dirs(dirs(paths), now).expect("dirs present")
+    }
+
+    fn home() -> String {
+        std::env::var("HOME").expect("HOME is set in this environment")
+    }
+
+    // --- choosing: over the SET, never over pane order ---
+
+    #[test]
+    fn the_shallowest_folder_anchors_the_project_in_whatever_order_it_arrives() {
+        // `dirs` comes out of the split tree, so its order is LAYOUT.
+        // Rebalancing splits, closing and reopening a pane, or restoring a
+        // tab differently all reorder it — and under "the first non-$HOME
+        // directory" every one of those silently changed which project
+        // this was. A project's own folder is the ANCESTOR of the folders
+        // its terminals wander into, so the shallowest path is the one.
+        let repo = PathBuf::from("/repo");
+        assert_eq!(anchor_dir(&dirs(&["/repo/native", "/repo"])), Some(&repo));
+        assert_eq!(anchor_dir(&dirs(&["/repo", "/repo/native"])), Some(&repo));
+
+        // Depth decides BEFORE the key does, and the two genuinely
+        // disagree: `/apps/thing` sorts first alphabetically, `/zed` is the
+        // shallower path. Ancestor pairs like the one above cannot show
+        // this — a prefix sorts ahead of the longer path anyway, so the
+        // tie-break alone would answer them correctly and "shallowest"
+        // would be untested.
+        let zed = PathBuf::from("/zed");
+        assert_eq!(anchor_dir(&dirs(&["/apps/thing", "/zed"])), Some(&zed));
+        assert_eq!(anchor_dir(&dirs(&["/zed", "/apps/thing"])), Some(&zed));
+
+        let chat = PathBuf::from("/chat");
+        for order in [
+            ["/chat/packages/foo", "/chat/packages", "/chat"],
+            ["/chat", "/chat/packages/foo", "/chat/packages"],
+            ["/chat/packages", "/chat", "/chat/packages/foo"],
+        ] {
+            assert_eq!(
+                anchor_dir(&dirs(&order)),
+                Some(&chat),
+                "order must not decide: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_folders_at_one_depth_break_their_tie_the_same_way_in_any_order() {
+        // A tie has to be settled by something stated, or the set's order
+        // leaks back in through the back door.
+        let alpha = PathBuf::from("/alpha");
+        assert_eq!(anchor_dir(&dirs(&["/beta", "/alpha"])), Some(&alpha));
+        assert_eq!(anchor_dir(&dirs(&["/alpha", "/beta"])), Some(&alpha));
+
+        // On `dir_key` — the same case-insensitive key everything else here
+        // matches on — not on raw bytes, where '/B' sorts before '/a' and
+        // the two rules disagree.
+        let lower = PathBuf::from("/alpha");
+        assert_eq!(
+            anchor_dir(&dirs(&["/Beta", "/alpha"])),
+            Some(&lower),
+            "ranked case-insensitively, not by byte order"
+        );
+        assert_eq!(anchor_dir(&dirs(&["/alpha", "/Beta"])), Some(&lower));
+    }
+
+    #[test]
+    fn home_is_excluded_before_depth_is_ever_considered() {
+        // $HOME is usually the shallowest path in the set, so a rule that
+        // ranked before it excluded would anchor half the user's projects
+        // to their home folder — and every launch opens a starter tab
+        // there, which would make all of them one project.
+        let home = home();
+        let deep = PathBuf::from("/work/chat/packages/foo");
+        assert_eq!(
+            anchor_dir(&dirs(&[&home, "/work/chat/packages/foo"])),
+            Some(&deep),
+            "$HOME is shallower and still not the anchor"
+        );
+        assert_eq!(
+            anchor_dir(&[PathBuf::from(&home)]),
+            None,
+            "$HOME alone anchors nothing"
+        );
+        assert_eq!(anchor_dir(&[]), None, "nor does nothing at all");
+    }
+
+    // --- keeping: the stored anchor decides, and never moves ---
+
+    #[test]
+    fn a_repo_alone_beside_home_or_beside_a_scratch_folder_is_one_project() {
+        // The three shapes one project takes across three days: the repo
+        // on its own, the repo with a terminal left in `~`, and the repo
+        // with one in /tmp. One record, not three.
+        //
+        // /tmp is the interesting one: it is SHALLOWER than the repo, so a
+        // freshly derived anchor would name it — the incidental terminal
+        // stealing the project's identity. The stored anchor is what stops
+        // that.
+        let home = home();
+        let mut store = ProjectStore::default();
+        store.record(capture(&["/work/repo"], 100));
+        store.record(capture(&["/work/repo", &home], 200));
+        store.record(capture(&["/work/repo", "/tmp"], 300));
+        assert_eq!(store.projects.len(), 1, "{:?}", store.projects);
+        assert_eq!(
+            store.projects[0].anchor,
+            Some(PathBuf::from("/work/repo")),
+            "still the folder it was first captured as"
+        );
+        assert_eq!(store.projects[0].last_opened, 300);
+    }
+
+    #[test]
+    fn adding_a_shallower_folder_does_not_re_anchor_the_project() {
+        // The failure a per-capture derivation hides. Open one terminal at
+        // the top of the repo you have been working inside, and the newly
+        // derived anchor is that shallower folder — so the record answers
+        // to a different folder from tomorrow on, and the project as it
+        // usually looks no longer finds it. It forks, losing its pin, its
+        // name and its accumulated time.
+        let mut store = ProjectStore::default();
+        store.record(capture(&["/repo/native"], 100));
+        assert_eq!(
+            store.projects[0].anchor,
+            Some(PathBuf::from("/repo/native")),
+            "first capture settles it"
+        );
+
+        store.record(capture(&["/repo/native", "/repo"], 200));
+        assert_eq!(store.projects.len(), 1, "still one project");
+        assert_eq!(
+            store.projects[0].anchor,
+            Some(PathBuf::from("/repo/native")),
+            "a later capture must not move the anchor"
+        );
+        assert_eq!(
+            store.projects[0].dirs,
+            dirs(&["/repo/native", "/repo"]),
+            "its folders DO move — only the anchor is frozen"
+        );
+
+        // And the point of freezing it: the plain project, captured
+        // tomorrow, still finds its own record.
+        store.record(capture(&["/repo/native"], 300));
+        assert_eq!(store.projects.len(), 1, "no fork");
+        assert_eq!(store.projects[0].last_opened, 300);
+    }
+
+    #[test]
+    fn a_reopen_finds_the_record_it_came_from_by_its_stored_anchor() {
+        // A record can hold folders whose derived anchor is NOT its own —
+        // that is exactly what freezing the anchor produces. Matching has
+        // to ask "is this record's anchor still open", not "do the two
+        // sets derive the same anchor", or reopening a project would fork
+        // the very record it was opened from.
+        let mut store = ProjectStore::default();
+        store.record(capture(&["/repo/native"], 100));
+        store.record(capture(&["/repo/native", "/repo"], 200));
+        let stored = store.recent()[0].clone();
+        assert_eq!(stored.anchor, Some(PathBuf::from("/repo/native")));
+        assert_eq!(
+            anchor_dir(&stored.dirs),
+            Some(&PathBuf::from("/repo")),
+            "the two genuinely differ, which is what makes this a test"
+        );
+
+        store.record(touch_for_reopen(&stored, 300, 2));
+        assert_eq!(store.projects.len(), 1, "reopening must not fork it");
+        assert_eq!(store.projects[0].last_opened, 300);
+    }
+
+    #[test]
+    fn two_projects_with_different_anchors_stay_apart_even_sharing_folders() {
+        // A scratch folder both projects happen to keep open is not a
+        // shared identity. Only the anchor is.
+        let mut store = ProjectStore::default();
+        store.record(capture(&["/work/chat", "/work/shared"], 100));
+        store.record(capture(&["/work/penpot", "/work/shared"], 200));
+        assert_eq!(store.projects.len(), 2, "{:?}", store.projects);
+        assert_eq!(store.projects[0].anchor, Some(PathBuf::from("/work/chat")));
+        assert_eq!(
+            store.projects[1].anchor,
+            Some(PathBuf::from("/work/penpot"))
+        );
+
+        // And each one still finds itself rather than the other.
+        store.record(capture(&["/work/chat"], 300));
+        assert_eq!(store.projects.len(), 2, "no third record");
+        assert_eq!(store.projects[0].last_opened, 300);
+        assert_eq!(store.projects[1].last_opened, 200, "the other is untouched");
+    }
+
+    #[test]
+    fn a_capture_holding_two_anchors_picks_the_same_record_every_time() {
+        // Both records qualify, so the tie needs a rule: the record
+        // anchored at the capture's OWN derived anchor wins. Storage order
+        // would answer it too, and answer it arbitrarily — insertion order
+        // says nothing about which project the user is in.
+        let mut store = ProjectStore::default();
+        store.record(capture(&["/work/alpha"], 100));
+        store.record(capture(&["/beta"], 200));
+        // /beta is shallower, so it is what this capture derives.
+        store.record(capture(&["/work/alpha", "/beta"], 300));
+        assert_eq!(store.projects.len(), 2, "no third record");
+        assert_eq!(
+            store.projects[0].last_opened, 100,
+            "the record it did NOT derive is untouched"
+        );
+        assert_eq!(
+            store.projects[1].last_opened, 300,
+            "the derived one matched"
+        );
+    }
+
+    // --- records written before the field existed ---
+
+    #[test]
+    fn a_record_written_before_anchors_gets_one_when_it_loads() {
+        // `projects.json` on disk today has no `anchor`. Such a record must
+        // not be orphaned (matching nothing, so every capture forks it) and
+        // must not be dropped (that is the user's whole recents list). It
+        // is given the anchor its own folders derive, once, on the way in.
+        let dir = tmp("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{"projects":[{"id":"p1","label":"native","dirs":["/repo/native","/repo"],"lastOpened":5}]}"#,
+        )
+        .unwrap();
+
+        let mut store = ProjectStore::load_from(&path);
+        assert_eq!(store.projects.len(), 1, "the record must survive");
+        assert_eq!(
+            store.projects[0].anchor,
+            Some(PathBuf::from("/repo")),
+            "derived from the dirs it does have, not left empty"
+        );
+
+        // And it is a real identity, not a decoration: the next capture of
+        // that project updates it instead of adding a twin.
+        store.record(capture(&["/repo", "/repo/native"], 9));
+        assert_eq!(store.projects.len(), 1, "no twin");
+        assert_eq!(store.projects[0].id, "p1", "it kept its own id");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_home_only_record_has_no_anchor_and_asking_does_not_panic() {
+        // Nothing writes one — a bare `$HOME` tab is not worth
+        // remembering — but a hand-edited or hand-copied file can hold
+        // one, and load, matching and the sidebar all have to survive it.
+        let home = home();
+        let mut store = ProjectStore::default();
+        store.record(capture(&[&home], 100));
+        assert!(
+            store.projects.is_empty(),
+            "a bare $HOME tab is still not a project"
+        );
+
+        let dir = tmp("home-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"projects":[{{"id":"h1","label":"home","dirs":[{home:?}],"lastOpened":5}}]}}"#
+            ),
+        )
+        .unwrap();
+        let store = ProjectStore::load_from(&path);
+        assert_eq!(store.projects.len(), 1, "loaded, not dropped");
+        assert_eq!(
+            store.projects[0].anchor, None,
+            "there is no folder to anchor it to"
+        );
+        // It matches nothing, itself included — so the open tab does not
+        // hide it, and nothing panics looking for an anchor it has not got.
+        let sections = sidebar_sections(&store, &[vec![PathBuf::from(&home)]]);
+        assert_eq!(sections.recent.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
