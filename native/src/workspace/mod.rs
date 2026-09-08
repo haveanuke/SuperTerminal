@@ -1269,6 +1269,17 @@ impl Workspace {
                         }
                         found
                     };
+                    // The sibling of the publish gate, and the sixth
+                    // instance of this phase's recurring bug: this was
+                    // ungated and safe only because `spawn_dead_pane` never
+                    // registers a remote id — true by coincidence, which is
+                    // exactly what D3e exists to remove. Without it, giving
+                    // a remote pane an id for any future reason would
+                    // announce the PEER's activity in this Mac's session
+                    // list on the phone.
+                    if !may_share_terminal(pane.read(cx).target()) {
+                        continue;
+                    }
                     let activity = pane.read(cx).companion_activity();
                     hub.set_meta_activity(id, &label, true, activity);
                 }
@@ -3315,7 +3326,12 @@ impl Workspace {
                                     .text_color(rgb(theme.ui_accent))
                                     .child("remote")
                             }))
-                            .children(bc_on.then(|| {
+                            // Not on a remote pane: broadcast membership is
+                            // keyed on local panes, so `toggle_member`
+                            // matches nothing and the chip is a control that
+                            // reports a state it cannot change. The Share
+                            // icon is already hidden for the same reason.
+                            .children((bc_on && !views_remote).then(|| {
                                 pane_btn(if bc_member { "bc:on" } else { "bc:off" }).on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |ws, _, _, cx| {
@@ -3352,21 +3368,31 @@ impl Workspace {
                                     cx.notify();
                                 }),
                             ))
-                            .child(pane_btn("timer").on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |ws, _, _, cx| {
-                                    // Clear highlights BEFORE retargeting
-                                    // focus, or the wrong pane gets cleared.
-                                    ws.leave_search_highlights(cx);
-                                    ws.set_focused_terminal(Some(id_timer.clone()), cx);
-                                    ws.overlay = if ws.overlay == Overlay::AutoRun {
-                                        Overlay::None
-                                    } else {
-                                        Overlay::AutoRun
-                                    };
-                                    cx.notify();
-                                }),
-                            ))
+                            // No timer on a pane that views another Mac.
+                            // `set_auto_run` refuses it, so offering the
+                            // chip meant the sheet opened, accepted a
+                            // command, closed on Enter, and nothing ever
+                            // ran — the silent no-op the search box was
+                            // already fixed for. Named in
+                            // `remote_limits_line` as well, so it reads as
+                            // a stated limit rather than a broken button.
+                            .children((!views_remote).then(|| {
+                                pane_btn("timer").on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |ws, _, _, cx| {
+                                        // Clear highlights BEFORE retargeting
+                                        // focus, or the wrong pane gets cleared.
+                                        ws.leave_search_highlights(cx);
+                                        ws.set_focused_terminal(Some(id_timer.clone()), cx);
+                                        ws.overlay = if ws.overlay == Overlay::AutoRun {
+                                            Overlay::None
+                                        } else {
+                                            Overlay::AutoRun
+                                        };
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
                             .child(pane_btn("x").on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |ws, _, window, cx| {

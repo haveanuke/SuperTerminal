@@ -968,10 +968,18 @@ impl TerminalPane {
         owns_the_grid(self.views_remote())
     }
 
-    /// The connection word for an attached pane's chrome, or `None` for a
-    /// pane whose terminal is local. See [`remote_status_label`].
+    /// The connection word for an ATTACHED pane's chrome, or `None`.
+    ///
+    /// Keyed on holding an attachment, not on `views_remote()`. `Target::
+    /// Remote` also covers an ssh PROFILE pane, which has no peer and never
+    /// gets an attachment — keying on the target made a restored ssh pane
+    /// claim "attached / not connected / view only / size follows the other
+    /// Mac", every clause of which is false for it. A peer pane restored
+    /// from a saved session has no attachment either, and correctly says
+    /// nothing until it is reattached.
     pub fn remote_state(&self) -> Option<&'static str> {
-        self.views_remote()
+        self.attachment
+            .is_some()
             .then(|| remote_status_label(self.attachment_status()))
     }
 
@@ -1481,7 +1489,7 @@ fn pane_scrollback_rows() -> usize {
 /// naming them here would be a limit that no longer exists.
 pub fn remote_limits_line() -> String {
     format!(
-        "view only \u{b7} no search, selection or mouse reporting \u{b7} \
+        "view only \u{b7} no search, selection, timer or mouse reporting \u{b7} \
          {} rows of scrollback \u{b7} size follows the other Mac",
         pane_scrollback_rows()
     )
@@ -1604,13 +1612,28 @@ fn ime_anchor(
 ///
 /// Hostile input is clipped, never trusted: a peer is free to send a `col`
 /// past `cols` or a run longer than the row, and neither may index out of
-/// bounds. Wide characters are the stated imprecision — `width` counts
-/// CELLS and `text` carries CHARS, and the wire does not say which chars
-/// were wide — so a run of CJK text leaves its tail padded. URLs are ASCII,
-/// and the drift cannot escape the run it happens in.
-fn wire_row_text(runs: &[WireRun], cols: usize) -> String {
+/// bounds.
+///
+/// **A row containing a run this cannot map is refused outright, and that
+/// is the whole point of the return type.** `width` counts CELLS while
+/// `text` carries CHARS, and the wire never says which chars were wide, so
+/// a run where the two disagree contains at least one wide glyph and every
+/// character after it in that run sits one column left of where this blit
+/// puts it. An earlier version scanned such rows anyway on the reasoning
+/// that "the drift cannot escape the run" — true, and it does not bound the
+/// harm. A review demonstrated it: one run of
+/// `"见见见 http://a.com http://evil.com"` puts `http://a.com` on cells
+/// 7-18, and clicking cell 17 returned `http://evil.com`.
+///
+/// Opening the wrong link is far worse than opening none, so a row that
+/// cannot be mapped exactly yields `None` and the click does nothing. The
+/// ordinary case — ASCII, where chars and cells agree — is unaffected.
+fn wire_row_text(runs: &[WireRun], cols: usize) -> Option<String> {
     let mut cells = vec![' '; cols];
     for run in runs {
+        if run.text.chars().count() != run.width as usize {
+            return None;
+        }
         let start = run.col as usize;
         for (offset, ch) in run.text.chars().enumerate() {
             match cells.get_mut(start + offset) {
@@ -1619,7 +1642,42 @@ fn wire_row_text(runs: &[WireRun], cols: usize) -> String {
             }
         }
     }
-    cells.into_iter().collect()
+    Some(cells.into_iter().collect())
+}
+
+/// Which row of text a Cmd+click should scan, if any.
+///
+/// Extracted rather than left inline because the interesting arm — a remote
+/// pane with NO frame — is the one a reader will assume is fine. A prior
+/// version of this task called it entity-bound and untestable; it is not,
+/// and a reviewer said so. It takes the same shape `ime_anchor` already
+/// uses.
+///
+/// The remote-no-frame arm must never fall through to the local grid. That
+/// grid is the placeholder describing THIS Mac; it happens to be empty, so
+/// consulting it would be harmless today and wrong the moment it is not —
+/// the "safe by accident" this file keeps correcting.
+fn url_row_text(
+    views_remote: bool,
+    frame: Option<&WireSnapshot>,
+    scroll_offset: usize,
+    row: usize,
+    local_row: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match (views_remote, frame) {
+        (true, None) => None,
+        (_, Some(wire)) => {
+            let window = windowed_wire_rows(
+                &wire.history,
+                &wire.rows,
+                clamp_attached_offset(wire.history.len(), scroll_offset),
+            );
+            // `None` here is a row this cannot column-map exactly (a wide
+            // glyph inside a run), and a wrong URL is worse than no URL.
+            wire_row_text(window.get(row)?, wire.cols as usize)
+        }
+        (false, None) => local_row(),
+    }
 }
 
 /// URL spanning `col` in a row of text, if any: whitespace/quote-delimited
@@ -3150,29 +3208,19 @@ impl TerminalPane {
     /// by [`wire_row_text`]; the scanner itself is [`url_in_row`],
     /// unchanged and shared with the local path.
     fn url_at(&self, col: usize, row: usize) -> Option<String> {
-        let text = match (self.views_remote(), &self.attached_frame) {
-            // A remote pane with no frame has no row to scan. The
-            // placeholder grid in the `None` arm below describes THIS Mac
-            // and must not be consulted for a pane that views another one —
-            // it happens to be empty, which is exactly the "safe by
-            // accident" this file keeps correcting.
-            (true, None) => return None,
-            (_, Some(wire)) => {
-                let window = windowed_wire_rows(
-                    &wire.history,
-                    &wire.rows,
-                    clamp_attached_offset(wire.history.len(), self.attached_scroll_offset),
-                );
-                wire_row_text(window.get(row)?, wire.cols as usize)
-            }
-            (false, None) => self
-                .snapshot
+        let local_row = || {
+            self.snapshot
                 .rows
-                .get(row)?
-                .iter()
-                .map(|cell| cell.ch)
-                .collect(),
+                .get(row)
+                .map(|cells| cells.iter().map(|cell| cell.ch).collect::<String>())
         };
+        let text = url_row_text(
+            self.views_remote(),
+            self.attached_frame.as_deref(),
+            self.attached_scroll_offset,
+            row,
+            local_row,
+        )?;
         url_in_row(&text, col)
     }
 
@@ -5601,8 +5649,8 @@ mod attached_activity_tests {
 mod attached_ui_tests {
     use super::{
         attached_placeholder_frame, ime_anchor, input_scroll, may_attach, owns_the_grid,
-        pane_scrollback_rows, remote_limits_line, remote_status_label, url_in_row, wheel_route,
-        wire_row_text, InputScroll, WheelRoute,
+        pane_scrollback_rows, remote_limits_line, remote_status_label, url_in_row, url_row_text,
+        wheel_route, wire_row_text, InputScroll, WheelRoute,
     };
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
@@ -5799,7 +5847,7 @@ mod attached_ui_tests {
         // one, which is exactly how a click would "find" a URL that is not
         // on screen.
         let row = vec![run(0, "see"), run(10, "https://x.dev")];
-        let text = wire_row_text(&row, 30);
+        let text = wire_row_text(&row, 30).expect("an all-ASCII row maps exactly");
         assert_eq!(&text[0..3], "see");
         assert_eq!(
             &text[3..10],
@@ -5811,27 +5859,89 @@ mod attached_ui_tests {
     }
 
     #[test]
+    fn a_row_with_a_wide_glyph_is_refused_rather_than_mapped_wrongly() {
+        // The demonstrated attack, from the Task 7 review. `width` counts
+        // CELLS, `text` counts CHARS, and the wire never says which chars
+        // were wide — so every character after a wide glyph in the same run
+        // sits one column left of where a naive blit puts it.
+        //
+        // On screen this row shows `http://a.com` at cells 7-18. Blitting
+        // it by char put `http://evil.com` under cell 17, so a click on the
+        // SAFE url opened the other one. Opening the wrong link is worse
+        // than opening none, so the row is refused outright.
+        let wide = WireRun {
+            col: 0,
+            // Three CJK glyphs are 6 cells but 3 chars; the rest is ASCII.
+            width: 6 + " http://a.com http://evil.com".chars().count() as u16,
+            text: "见见见 http://a.com http://evil.com".to_string(),
+            fg: "#c0caf5".to_string(),
+            bg: None,
+            b: false,
+            i: false,
+            u: false,
+        };
+        assert_ne!(
+            wide.text.chars().count(),
+            wide.width as usize,
+            "the fixture must actually disagree, or it proves nothing"
+        );
+        assert_eq!(
+            wire_row_text(&[wide], 60),
+            None,
+            "a row this cannot map exactly must be refused, not scanned"
+        );
+    }
+
+    #[test]
+    fn an_all_ascii_row_is_still_mapped_because_chars_and_cells_agree() {
+        // The refusal above must not cost the ordinary case: a terminal
+        // showing ASCII maps exactly and Cmd+click keeps working.
+        let row = vec![run(0, "see https://x.dev now")];
+        assert!(wire_row_text(&row, 40).is_some());
+    }
+
+    #[test]
     fn a_run_that_overruns_the_row_is_clipped_rather_than_panicking() {
         // Hostile input: a peer is free to send a col past `cols`, or a run
         // longer than the row. Neither may index out of bounds.
         let row = vec![run(28, "overlong"), run(99, "past the end")];
-        let text = wire_row_text(&row, 30);
+        let text = wire_row_text(&row, 30).expect("clipping is not a mapping failure");
         assert_eq!(text.chars().count(), 30);
         assert!(text.ends_with("ov"));
     }
 
-    // NOTE, and it is a gap rather than a claim: `url_at`'s refusal to
-    // scan the LOCAL placeholder grid on a remote pane with no frame is
-    // entity-bound (it reads `self.attached_frame` and `self.views_remote`)
-    // and NO test here reaches it. A test over `url_in_row` on an empty row
-    // would pass whether the guard is there or not, so one was written,
-    // found to survive every sabotage of the code it named, and deleted
-    // rather than left implying coverage. Verified by reading.
+    #[test]
+    fn a_remote_pane_with_no_frame_never_scans_this_macs_grid_for_a_url() {
+        // This was called entity-bound and left untested; a reviewer showed
+        // it was not, so it is extracted and tested now. The local closure
+        // returns a row containing a URL and MUST NOT be consulted — it
+        // describes THIS Mac, and today it is empty only by luck.
+        let mut consulted = false;
+        let answer = url_row_text(true, None, 0, 0, || {
+            consulted = true;
+            Some("see https://not-on-that-screen.example now".to_string())
+        });
+        assert_eq!(answer, None, "a remote pane with no frame has no row");
+        assert!(
+            !consulted,
+            "the local placeholder grid must not even be read for a remote pane"
+        );
+    }
+
+    #[test]
+    fn a_local_pane_still_scans_its_own_grid() {
+        // The other half: extracting the decision must not cost the local
+        // path, which is the one that works today.
+        let answer = url_row_text(false, None, 0, 0, || {
+            Some("see https://example.com now".to_string())
+        });
+        assert_eq!(answer, Some("see https://example.com now".to_string()));
+    }
 
     #[test]
     fn cmd_click_finds_a_url_in_a_row_of_wire_runs() {
         let row = vec![run(0, "open "), run(5, "https://example.com/x")];
-        let text = wire_row_text(&row, 40);
+        let text = wire_row_text(&row, 40).expect("an all-ASCII row maps exactly");
         assert_eq!(
             url_in_row(&text, 8),
             Some("https://example.com/x".to_string())

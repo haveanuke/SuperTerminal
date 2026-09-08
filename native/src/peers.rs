@@ -29,7 +29,23 @@ pub struct Grants {
     pub spawn: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Hand-written so `secret` cannot reach a log line, a panic message or a
+/// `{:?}` in a test failure. Same reasoning as `peer_client::Endpoint`'s,
+/// which redacts the same value one file over — deriving it here left the
+/// hazard that type exists to avoid.
+impl std::fmt::Debug for PeerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerRecord")
+            .field("id", &self.id)
+            .field("host", &self.host)
+            .field("label", &self.label)
+            .field("secret", &"<redacted>")
+            .field("grants", &self.grants)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerRecord {
     pub id: PeerId,
@@ -1057,6 +1073,27 @@ mod tests {
     fn an_unchanged_snapshot_needs_no_restart() {
         let peers = vec![pair("work-mbp")];
         assert!(!peer_mutation_requires_restart(&peers, &peers));
+    }
+
+    #[test]
+    fn a_peer_secret_never_appears_in_debug_output() {
+        // A paired secret is the credential that lets another machine drive
+        // terminals here. Deriving Debug put it one `{:?}` away from a log
+        // line, a panic message, or a failing test's output.
+        let record = pair("work-mbp");
+        let rendered = format!("{record:?}");
+        assert!(
+            !rendered.contains(&record.secret),
+            "the secret leaked into Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "the field must still be visible as redacted, not silently dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("work-mbp"),
+            "the rest of the record must stay debuggable: {rendered}"
+        );
     }
 
     #[test]

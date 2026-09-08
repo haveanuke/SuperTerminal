@@ -280,7 +280,7 @@ impl Workspace {
 
     /// Rebind the companion on EXACTLY `addr` after a forced restart (token
     /// rotation, a peer revoked or narrowed). Unlike a cold
-    /// [`Self::toggle_companion`], this never searches `43110..43121`:
+    /// [`Self::toggle_companion`], this never searches the port range:
     /// falling through to the next port after losing the old listener's
     /// release race would silently move the server out from under the
     /// phone's saved bookmark, which encodes host:port. A visible error the
