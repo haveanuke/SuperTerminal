@@ -106,6 +106,39 @@ pub fn insert_split(
     }
 }
 
+/// A balanced split tree over `terminal_ids`, in order — the layout a
+/// reopened project gets, one pane per remembered directory.
+///
+/// Halving the list at each level rather than splitting the newest pane
+/// again (what a loop of [`insert_split`] gives) is the difference between
+/// a 2x2 grid and a staircase whose first terminal is a sliver. Depth
+/// alternates the direction, starting side-by-side because a wide window
+/// has more room across than down.
+///
+/// `None` for an empty list: a tab with no terminals has no tree, and
+/// `Tab` has no way to represent one.
+pub fn grid_of(terminal_ids: &[String]) -> Option<PaneNode> {
+    fn build(ids: &[String], depth: usize) -> PaneNode {
+        if let [only] = ids {
+            return PaneNode::terminal(only.clone());
+        }
+        let mid = ids.len().div_ceil(2);
+        PaneNode::Split {
+            direction: if depth % 2 == 0 {
+                SplitDirection::Horizontal
+            } else {
+                SplitDirection::Vertical
+            },
+            children: vec![build(&ids[..mid], depth + 1), build(&ids[mid..], depth + 1)],
+            sizes: None,
+        }
+    }
+    if terminal_ids.is_empty() {
+        return None;
+    }
+    Some(build(terminal_ids, 0))
+}
+
 /// Remove the terminal `terminal_id` from the tree.
 ///
 /// A split left with a single child collapses to that child (dropping the
@@ -787,5 +820,81 @@ mod tests {
         // Missing activeTabId.
         let missing_active = json!({ "tabs": [] });
         assert_eq!(Layout::from_session_json(&missing_active), None);
+    }
+}
+
+#[cfg(test)]
+mod grid_tests {
+    use super::*;
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn no_terminals_means_no_tree() {
+        assert_eq!(grid_of(&[]), None);
+    }
+
+    #[test]
+    fn one_terminal_needs_no_split() {
+        assert_eq!(grid_of(&ids(&["a"])), Some(PaneNode::terminal("a")));
+    }
+
+    #[test]
+    fn two_terminals_sit_side_by_side() {
+        // Horizontal is the row direction (`render_tree` maps it to
+        // `flex_row`), so two folders reopen beside each other rather than
+        // stacked into two short strips.
+        assert_eq!(
+            grid_of(&ids(&["a", "b"])),
+            Some(PaneNode::Split {
+                direction: SplitDirection::Horizontal,
+                children: vec![PaneNode::terminal("a"), PaneNode::terminal("b")],
+                sizes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn four_terminals_make_a_two_by_two_grid() {
+        // A staircase of nested splits (what repeated `insert_split` on the
+        // newest pane gives) leaves the first terminal a sliver. Halving
+        // the list keeps every pane the same size.
+        assert_eq!(
+            grid_of(&ids(&["a", "b", "c", "d"])),
+            Some(PaneNode::Split {
+                direction: SplitDirection::Horizontal,
+                children: vec![
+                    PaneNode::Split {
+                        direction: SplitDirection::Vertical,
+                        children: vec![PaneNode::terminal("a"), PaneNode::terminal("b")],
+                        sizes: None,
+                    },
+                    PaneNode::Split {
+                        direction: SplitDirection::Vertical,
+                        children: vec![PaneNode::terminal("c"), PaneNode::terminal("d")],
+                        sizes: None,
+                    },
+                ],
+                sizes: None,
+            })
+        );
+    }
+
+    #[test]
+    fn every_remembered_folder_gets_its_own_pane_in_order() {
+        // Reopening spawns one terminal per directory: none may be dropped
+        // and none duplicated, whatever the count, and the order is the
+        // order the directories were remembered in.
+        for count in 1..=9usize {
+            let names: Vec<String> = (0..count).map(|i| format!("t{i}")).collect();
+            let tree = grid_of(&names).expect("terminals present");
+            assert_eq!(collect_terminal_ids(&tree), names, "count {count}");
+            assert!(
+                tree.is_valid(),
+                "count {count}: every split must have exactly two children"
+            );
+        }
     }
 }

@@ -6,8 +6,9 @@
 //! path. This module is pure and file-backed only: no gpui, no `Workspace`,
 //! no `TerminalPane` — only `hosts::Target`, itself a plain enum.
 //! `Workspace` calls [`project_dirs`] and [`project_for_dirs`] to turn a
-//! tab that is about to disappear into a record; the sidebar UI
-//! (pinned/recent lists, reopening) is still to come.
+//! tab that is about to disappear into a record, and [`ProjectStore::pinned`],
+//! [`ProjectStore::recent`], [`plan_reopen`] and [`project_summary`] to list
+//! those records and open them again.
 
 use std::collections::HashSet;
 use std::io;
@@ -52,6 +53,17 @@ pub struct Project {
     /// never merge into it (see `ProjectStore::record`) — the record is the
     /// user's now, identified by `id`, not by its paths.
     pub renamed: bool,
+    /// How many terminals the project had when it was LAST captured —
+    /// "how big is this thing" before you open it. Latest capture wins:
+    /// unlike the label, this is a measurement, not something the user
+    /// made theirs, so a pinned record's count still moves.
+    pub terminals: usize,
+    /// Wall-clock seconds this project has been open, SUMMED across every
+    /// session. On the way into [`ProjectStore::record`] the field carries
+    /// one session's increment; in the store it carries the total. A
+    /// session that never closes cleanly loses its increment rather than
+    /// inventing one, so 0 means "never measured", not "no time spent".
+    pub active_secs: u64,
 }
 
 /// The whole persisted set: every recorded project, pinned or not.
@@ -189,7 +201,158 @@ pub fn project_for_dirs(dirs: Vec<PathBuf>, now: u64) -> Option<Project> {
         last_opened: now,
         icon: ProjectIcon::default(),
         renamed: false,
+        // Both are the caller's to fill: only `Workspace` knows how many
+        // panes the tab had and how long it was open. Left at zero here so
+        // a capture that cannot answer reports nothing rather than a
+        // number it made up.
+        terminals: 0,
+        active_secs: 0,
     })
+}
+
+/// One session's worth of open time, from the mark laid when the tab was
+/// created or reopened to the moment of capture.
+///
+/// Saturating, deliberately. Both ends come from the system clock, and a
+/// clock that steps backwards — NTP correcting, a sleep/wake, a restored
+/// backup — would otherwise wrap `u64` into hundreds of billions of years
+/// of "work" and poison the accumulated total permanently.
+pub fn session_secs(opened_at: u64, now: u64) -> u64 {
+    now.saturating_sub(opened_at)
+}
+
+/// The record a REOPEN writes: the project as it stands, marked as used
+/// now, with the terminal count it just opened with.
+///
+/// `active_secs` is zero because this is the increment, not the total —
+/// opening a project has not yet spent any time in it. Recording this
+/// (rather than waiting for the tab to close) means a crash still leaves
+/// "you just used this" behind; and because it carries the project's own
+/// `dirs`, `record` merges it into the existing entry — a pinned project
+/// reopened does not also appear as an unpinned twin in recents.
+pub fn touch_for_reopen(project: &Project, now: u64, terminals: usize) -> Project {
+    Project {
+        last_opened: now,
+        terminals,
+        active_secs: 0,
+        ..project.clone()
+    }
+}
+
+/// Where each remembered directory actually reopens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReopenPlan {
+    /// One entry per remembered directory, in order: the directory to
+    /// spawn the shell in, or `None` for "the shell's default", which is
+    /// `$HOME` (see `TermSession::spawn`).
+    pub spawns: Vec<Option<PathBuf>>,
+    /// The remembered directories that are no longer there, in order —
+    /// what the note tells the user about.
+    pub missing: Vec<PathBuf>,
+}
+
+/// Decide where a project's terminals open, given a way to ask whether a
+/// directory is still there.
+///
+/// A directory that has been deleted, renamed or unmounted falls back to
+/// `$HOME` — the project still opens, and every folder that IS there opens
+/// where it belongs. Refusing the whole project because one of four
+/// folders went would lose the three that survived; spawning in a gone
+/// path fails at the PTY, leaving a dead pane and no explanation.
+///
+/// `exists` is a parameter rather than a `Path::is_dir` call so the
+/// decision is testable without creating and deleting real directories.
+/// The caller passes `|p| p.is_dir()`.
+pub fn plan_reopen(dirs: &[PathBuf], exists: impl Fn(&Path) -> bool) -> ReopenPlan {
+    let mut spawns = Vec::with_capacity(dirs.len());
+    let mut missing = Vec::new();
+    for dir in dirs {
+        if exists(dir) {
+            spawns.push(Some(dir.clone()));
+        } else {
+            spawns.push(None);
+            missing.push(dir.clone());
+        }
+    }
+    ReopenPlan { spawns, missing }
+}
+
+/// The visible note a reopen leaves when folders were missing, or `None`
+/// when they were all there.
+///
+/// Names the folders. "Some folders are gone" would leave the user with
+/// four terminals and no way to tell which one is not where they think it
+/// is — the silent failure the spec rules out, only wordier.
+pub fn missing_dirs_note(missing: &[PathBuf]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = missing
+        .iter()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .collect();
+    Some(format!(
+        "{} gone \u{2014} opened in ~ instead: {}",
+        count_label(missing.len(), "folder"),
+        names.join(", ")
+    ))
+}
+
+/// "no folders" / "1 folder" / "4 folders".
+///
+/// Zero is a word rather than a bare `0`, which reads like a value that
+/// failed to load instead of one that was stated.
+pub fn count_label(n: usize, noun: &str) -> String {
+    match n {
+        0 => format!("no {noun}s"),
+        1 => format!("1 {noun}"),
+        _ => format!("{n} {noun}s"),
+    }
+}
+
+/// How long a project has been worked in, at the coarsest unit that still
+/// says something true.
+///
+/// Sub-minute reads as sub-minute: rounding it into hours gives "0h",
+/// which looks like a bug rather than a measurement. Only the two largest
+/// units ever appear — "3h 12m", never "3h 12m 7s".
+pub fn duration_label(secs: u64) -> String {
+    if secs < 60 {
+        return "under a minute".to_string();
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let odd_minutes = minutes % 60;
+    if hours < 24 {
+        return match odd_minutes {
+            0 => format!("{hours}h"),
+            m => format!("{hours}h {m}m"),
+        };
+    }
+    let days = hours / 24;
+    match hours % 24 {
+        0 => format!("{days}d"),
+        h => format!("{days}d {h}h"),
+    }
+}
+
+/// What a project row says about itself beneath its name.
+///
+/// Time is omitted entirely at zero. A record written before `active_secs`
+/// existed, or one whose only session never closed cleanly, has no
+/// measurement to report — and "under a minute" would invent one.
+pub fn project_summary(dirs: usize, terminals: usize, active_secs: u64) -> String {
+    let mut parts = vec![
+        count_label(dirs, "folder"),
+        count_label(terminals, "terminal"),
+    ];
+    if active_secs > 0 {
+        parts.push(duration_label(active_secs));
+    }
+    parts.join(" \u{b7} ")
 }
 
 /// A capture's id: FNV-1a over the directory keys, sorted so pane order
@@ -273,6 +436,17 @@ impl ProjectStore {
             .find(|p| same_dir_set(&p.dirs, &project.dirs))
         {
             existing.last_opened = project.last_opened;
+            // Both stats move even for a pinned or renamed record. What
+            // that rule protects is what the user MADE theirs — the id,
+            // the name, the folders. How many terminals it had and how
+            // long it has been worked in are measurements; freezing them
+            // at pin time would make a pinned project's row go stale and
+            // stop answering the question it exists to answer.
+            existing.terminals = project.terminals;
+            // Summed, never replaced: `active_secs` answers "how much have
+            // I actually worked here" across every session, so the
+            // incoming value is one session's increment.
+            existing.active_secs = existing.active_secs.saturating_add(project.active_secs);
             if !existing.pinned && !existing.renamed {
                 existing.label = project.label;
                 existing.dirs = project.dirs;
@@ -314,21 +488,13 @@ impl ProjectStore {
     }
 
     /// Pinned projects, newest first. Never capped.
-    ///
-    /// Read by the sidebar (Task 3); nothing in the capture path lists
-    /// projects, so until that lands this is staged code. Marked here, on
-    /// the two items it actually covers, rather than module-wide — a
-    /// blanket allow would hide a genuinely dead item written later.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pinned(&self) -> Vec<&Project> {
         let mut v: Vec<&Project> = self.projects.iter().filter(|p| p.pinned).collect();
         v.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
         v
     }
 
-    /// Unpinned projects, newest first, capped at `RECENT_CAP`. Staged for
-    /// the sidebar, exactly as [`ProjectStore::pinned`] is.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Unpinned projects, newest first, capped at `RECENT_CAP`.
     pub fn recent(&self) -> Vec<&Project> {
         let mut v: Vec<&Project> = self.projects.iter().filter(|p| !p.pinned).collect();
         v.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
@@ -359,6 +525,8 @@ mod tests {
             last_opened,
             icon: ProjectIcon::default(),
             renamed: false,
+            terminals: 0,
+            active_secs: 0,
         }
     }
 
@@ -925,5 +1093,210 @@ mod tests {
         );
         assert_eq!(recent[0].label, "chat");
         assert_eq!(recent[0].last_opened, 77);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    fn project(id: &str, dirs: &[&str], last_opened: u64) -> Project {
+        Project {
+            id: id.to_string(),
+            label: id.to_string(),
+            dirs: dirs.iter().map(PathBuf::from).collect(),
+            pinned: false,
+            last_opened,
+            icon: ProjectIcon::default(),
+            renamed: false,
+            terminals: 0,
+            active_secs: 0,
+        }
+    }
+
+    // --- how a row states what the project is ---
+
+    #[test]
+    fn folder_and_terminal_counts_read_as_none_one_or_many() {
+        // "1 folders" is the tell that nobody looked at the row. Zero is
+        // its own word rather than a bare 0, which reads as a missing
+        // value instead of a stated one.
+        assert_eq!(count_label(0, "folder"), "no folders");
+        assert_eq!(count_label(1, "folder"), "1 folder");
+        assert_eq!(count_label(4, "folder"), "4 folders");
+        assert_eq!(count_label(0, "terminal"), "no terminals");
+        assert_eq!(count_label(1, "terminal"), "1 terminal");
+        assert_eq!(count_label(6, "terminal"), "6 terminals");
+    }
+
+    #[test]
+    fn a_sub_minute_project_does_not_read_as_zero_hours() {
+        // The whole point of the duration is "how much have I worked
+        // here". "0h" answers that with a number that looks like a bug.
+        assert_eq!(duration_label(1), "under a minute");
+        assert_eq!(duration_label(59), "under a minute");
+        assert_eq!(duration_label(60), "1m");
+        assert_eq!(duration_label(3_599), "59m");
+        for secs in [1, 59, 60, 3_599] {
+            assert!(
+                !duration_label(secs).contains('h'),
+                "{secs}s must not claim hours: {}",
+                duration_label(secs)
+            );
+        }
+        assert_eq!(duration_label(3_600), "1h");
+        assert_eq!(duration_label(3_660), "1h 1m");
+        assert_eq!(duration_label(86_400), "1d");
+        assert_eq!(duration_label(90_000), "1d 1h");
+    }
+
+    #[test]
+    fn a_project_with_no_recorded_time_says_nothing_about_time() {
+        // A record written before `active_secs` existed, or one whose only
+        // session never closed cleanly, has NO time to report. Saying
+        // "under a minute" would invent a measurement that was never made.
+        let summary = project_summary(1, 1, 0);
+        assert_eq!(summary, "1 folder \u{b7} 1 terminal");
+        assert!(!summary.contains("minute"));
+    }
+
+    #[test]
+    fn the_summary_states_folders_terminals_and_time_together() {
+        assert_eq!(
+            project_summary(4, 6, 11_520),
+            "4 folders \u{b7} 6 terminals \u{b7} 3h 12m"
+        );
+    }
+
+    // --- time open ---
+
+    #[test]
+    fn time_open_cannot_run_backwards() {
+        // `last_opened` and the mark both come from the system clock, and a
+        // clock that steps backwards (NTP, a sleep/wake) would otherwise
+        // wrap into ~584 billion years of "work".
+        assert_eq!(session_secs(100, 160), 60);
+        assert_eq!(session_secs(100, 100), 0);
+        assert_eq!(session_secs(100, 90), 0);
+    }
+
+    #[test]
+    fn a_project_captured_twice_accumulates_its_time() {
+        // "how much have I actually worked here", summed across sessions —
+        // not "how long was the last session", which overwriting gives.
+        let mut store = ProjectStore::default();
+        let mut first = project("chat", &["/chat", "/penpot"], 100);
+        first.active_secs = 100;
+        store.record(first);
+        let mut second = project("chat-again", &["/penpot", "/chat"], 200);
+        second.active_secs = 50;
+        store.record(second);
+        assert_eq!(store.recent().len(), 1, "still one project");
+        assert_eq!(store.recent()[0].active_secs, 150, "summed, not replaced");
+    }
+
+    #[test]
+    fn a_pinned_project_accumulates_time_like_any_other() {
+        // Time worked is a measurement, not something the user made
+        // theirs — the rule that protects a pinned record's id, label and
+        // dirs has nothing to say about it.
+        let mut store = ProjectStore::default();
+        let mut original = project("pinned-1", &["/chat"], 100);
+        original.pinned = true;
+        original.active_secs = 600;
+        store.projects.push(original);
+        let mut capture = project("auto-2", &["/chat"], 200);
+        capture.active_secs = 60;
+        store.record(capture);
+        assert_eq!(store.pinned().len(), 1);
+        assert_eq!(store.pinned()[0].active_secs, 660);
+    }
+
+    #[test]
+    fn a_capture_states_how_many_terminals_the_project_had() {
+        // Latest wins: the count answers "how big is this thing" for the
+        // shape it was in when it was last closed, not the first time.
+        let mut store = ProjectStore::default();
+        let mut first = project("chat", &["/chat"], 100);
+        first.terminals = 2;
+        store.record(first);
+        let mut second = project("chat-again", &["/chat"], 200);
+        second.terminals = 5;
+        store.record(second);
+        assert_eq!(store.recent()[0].terminals, 5);
+    }
+
+    // --- reopening ---
+
+    #[test]
+    fn reopening_a_pinned_project_does_not_leave_a_copy_in_recents() {
+        // The reopen path records the project it just opened, so "you just
+        // used this" survives a crash. That record must merge into the
+        // pinned one, not sit beneath it as an unpinned twin of itself.
+        let mut store = ProjectStore::default();
+        let mut original = project("pinned-1", &["/chat", "/board-kid"], 100);
+        original.pinned = true;
+        original.label = "Chat stack".to_string();
+        original.active_secs = 600;
+        store.projects.push(original.clone());
+
+        store.record(touch_for_reopen(&original, 500, 2));
+
+        assert_eq!(store.pinned().len(), 1);
+        assert!(
+            store.recent().is_empty(),
+            "reopening must not create a recent entry"
+        );
+        assert_eq!(store.pinned()[0].id, "pinned-1");
+        assert_eq!(store.pinned()[0].label, "Chat stack");
+        assert_eq!(store.pinned()[0].last_opened, 500, "it did just get used");
+        assert_eq!(
+            store.pinned()[0].active_secs,
+            600,
+            "opening it adds no worked time on its own"
+        );
+        assert_eq!(store.pinned()[0].terminals, 2);
+    }
+
+    #[test]
+    fn a_missing_folder_falls_back_to_home_and_the_others_still_open() {
+        // Refusing the whole project because one of four folders was
+        // deleted would lose the three that are still there.
+        let dirs = [
+            PathBuf::from("/chat"),
+            PathBuf::from("/gone"),
+            PathBuf::from("/penpot"),
+            PathBuf::from("/forgejo"),
+        ];
+        let plan = plan_reopen(&dirs, |p| p != Path::new("/gone"));
+        assert_eq!(plan.spawns.len(), 4, "one terminal per remembered folder");
+        assert_eq!(plan.spawns[0], Some(PathBuf::from("/chat")));
+        assert_eq!(plan.spawns[1], None, "the gone one falls back to $HOME");
+        assert_eq!(plan.spawns[2], Some(PathBuf::from("/penpot")));
+        assert_eq!(plan.spawns[3], Some(PathBuf::from("/forgejo")));
+        assert_eq!(plan.missing, vec![PathBuf::from("/gone")]);
+    }
+
+    #[test]
+    fn a_project_whose_folders_are_all_gone_still_opens() {
+        let dirs = [PathBuf::from("/gone-a"), PathBuf::from("/gone-b")];
+        let plan = plan_reopen(&dirs, |_| false);
+        assert_eq!(plan.spawns, vec![None, None], "two shells, both in $HOME");
+        assert_eq!(plan.missing.len(), 2, "and both are named in the note");
+    }
+
+    #[test]
+    fn a_note_names_the_folders_that_are_gone() {
+        // "Failing silently" is the thing the spec forbids: the user must
+        // be told WHICH folder they are not in.
+        assert_eq!(missing_dirs_note(&[]), None, "nothing gone, nothing said");
+        let one = missing_dirs_note(&[PathBuf::from("/gone")]).expect("a note");
+        assert!(one.contains("/gone"), "{one}");
+        assert!(one.contains('~'), "and where it opened instead: {one}");
+        assert!(one.contains("1 folder"), "{one}");
+        let two = missing_dirs_note(&[PathBuf::from("/gone-a"), PathBuf::from("/gone-b")])
+            .expect("a note");
+        assert!(two.contains("2 folders"), "{two}");
+        assert!(two.contains("/gone-a") && two.contains("/gone-b"), "{two}");
     }
 }

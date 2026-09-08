@@ -490,6 +490,20 @@ pub struct Workspace {
     sidebar_status_cache: HashMap<String, (String, Activity)>,
     /// Projects collapsed in the sidebar (by tab id).
     collapsed_projects: std::collections::HashSet<String>,
+    /// When each open tab started accruing `active_secs` (unix seconds, by
+    /// tab id): its creation, its reopen, or its last capture. Reset on
+    /// capture rather than cleared, so a tab that is captured twice — the
+    /// window closing AND the app quitting, say — cannot count the same
+    /// minutes twice.
+    tab_opened_at: HashMap<String, u64>,
+    /// The persisted store, read on the sidebar poll and never during
+    /// render — the projects view redraws every frame and must not touch
+    /// the filesystem to do it.
+    projects_cache: crate::projects::ProjectStore,
+    /// What the last reopen has to say for itself: which remembered
+    /// folders were gone, and that their shells opened in `~` instead.
+    /// `None` once a reopen finds every folder where it left it.
+    projects_note: Option<String>,
     /// Per-terminal cue gates (bell → Ping, long-job finish → Glass).
     cue_gates: HashMap<String, superterminal_core::cue::CueGate>,
     /// The currently speaking `say` process (killed before a new note).
@@ -679,6 +693,12 @@ impl Workspace {
             sidebar_view: SidebarView::Projects,
             sidebar_status_cache: HashMap::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            tab_opened_at: HashMap::new(),
+            // Read once at startup: the sidebar opens on the projects view,
+            // so the pinned and recent lists are there on the first frame
+            // rather than after the first poll.
+            projects_cache: crate::projects::ProjectStore::load(),
+            projects_note: None,
             cue_gates: HashMap::new(),
             tts_child: None,
             caffeinate_child: None,
@@ -1082,6 +1102,7 @@ impl Workspace {
         }
         let tab_id = format!("tab-{}", self.next_id);
         self.next_id += 1;
+        self.mark_tab_opened(&tab_id);
         self.tabs.push(Tab::single(
             tab_id,
             attached_tab_label(&peer_label, &session_label),
@@ -1328,6 +1349,10 @@ impl Workspace {
             // its cwd column comes from this cache — refresh both on the
             // poll while it's open, never during render.
             if self.sidebar_view == SidebarView::Projects {
+                // Pinned and recent come from the file, and the file is
+                // written by other paths (a capture, a quit). Re-read it on
+                // the poll, never during render.
+                self.projects_cache = crate::projects::ProjectStore::load();
                 let home = std::env::var("HOME").unwrap_or_default();
                 self.sidebar_status_cache = self
                     .panes
@@ -1772,6 +1797,7 @@ impl Workspace {
         self.spawn_pane(terminal_id.clone(), cwd, cx);
         let tab_id = format!("tab-{}", self.next_id);
         self.next_id += 1;
+        self.mark_tab_opened(&tab_id);
         self.tabs.push(Tab::single(
             tab_id,
             "terminal",
@@ -1807,11 +1833,24 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Drop sidebar state for projects that no longer exist.
-    fn prune_collapsed_projects(&mut self) {
+    /// Drop per-tab state for projects that no longer exist: the sidebar's
+    /// collapsed set and the `active_secs` marks alike. Both are keyed by
+    /// tab id, so both would otherwise hand a future tab that reused the
+    /// id someone else's state — a collapsed row, or an uptime measured
+    /// from a project that closed hours ago.
+    fn prune_closed_tab_state(&mut self) {
         let live: std::collections::HashSet<String> =
             self.tabs.iter().map(|tab| tab.id.clone()).collect();
         self.collapsed_projects.retain(|id| live.contains(id));
+        self.tab_opened_at.retain(|id, _| live.contains(id));
+    }
+
+    /// Start (or restart) a tab's `active_secs` clock. Every path that
+    /// brings a tab into existence calls this: `add_tab`, the peer-attach
+    /// tab, the `load_session` rebuild and `open_project`.
+    fn mark_tab_opened(&mut self, tab_id: &str) {
+        self.tab_opened_at
+            .insert(tab_id.to_string(), crate::projects::now_secs());
     }
 
     /// Keep an in-progress tab rename pointing at the same tab after a tab
@@ -1858,19 +1897,59 @@ impl Workspace {
         crate::projects::project_dirs(&panes)
     }
 
-    /// Write `tabs` into the persistent project store, so closing them is
-    /// not the same as losing them.
+    /// The stats a capture carries beyond its directories: how many
+    /// terminals the tab had, and how long it has been open since the mark
+    /// laid at its creation, reopen or last capture.
+    ///
+    /// A tab with no mark reports zero rather than a guess — the spec's
+    /// rule that a session which never closes cleanly loses its increment
+    /// instead of inventing one.
+    fn tab_stats(&self, tab: &Tab, now: u64) -> (usize, u64) {
+        let active = self
+            .tab_opened_at
+            .get(&tab.id)
+            .map(|opened_at| crate::projects::session_secs(*opened_at, now))
+            .unwrap_or(0);
+        (tab.all_terminal_ids().len(), active)
+    }
+
+    /// Write the tabs at `indices` into the persistent project store, so
+    /// closing them is not the same as losing them.
     ///
     /// One load and one save for the whole batch: quitting with eight tabs
     /// open must not rewrite `projects.json` eight times. What is worth
     /// keeping, what merges with an existing record and what gets evicted
     /// are all `ProjectStore::record`'s call, not this one's.
-    fn record_projects(&self, tabs: &[Tab], cx: &App) {
+    ///
+    /// Takes INDICES rather than tabs because it also has to write back to
+    /// `tab_opened_at`, and a borrowed slice of `self.tabs` would hold the
+    /// workspace immutably for the whole call.
+    fn record_projects(&mut self, indices: &[usize], cx: &App) {
         let now = crate::projects::now_secs();
-        let captured: Vec<crate::projects::Project> = tabs
-            .iter()
-            .filter_map(|tab| crate::projects::project_for_dirs(self.tab_dirs(tab, cx), now))
-            .collect();
+        let mut captured: Vec<crate::projects::Project> = Vec::new();
+        let mut marked: Vec<String> = Vec::new();
+        for tab in indices.iter().filter_map(|index| self.tabs.get(*index)) {
+            // The mark moves for every tab that was ASKED to be captured,
+            // including one that turned out to have no directories at all
+            // (an all-remote tab). Otherwise a tab that spends an hour on a
+            // peer and then opens one local pane would hand that hour to
+            // the first project it ever manages to record.
+            marked.push(tab.id.clone());
+            let Some(mut project) = crate::projects::project_for_dirs(self.tab_dirs(tab, cx), now)
+            else {
+                continue;
+            };
+            let (terminals, active_secs) = self.tab_stats(tab, now);
+            project.terminals = terminals;
+            project.active_secs = active_secs;
+            captured.push(project);
+        }
+        // Reset rather than clear: a tab captured twice (the window closing
+        // AND the app quitting) must not count the same minutes twice, and
+        // one that survives its capture keeps accruing from here.
+        for id in marked {
+            self.tab_opened_at.insert(id, now);
+        }
         if captured.is_empty() {
             return;
         }
@@ -1881,19 +1960,70 @@ impl Workspace {
         // A failed write is an inconvenience, never a reason to interrupt
         // a close or a quit — the same discipline `settings.rs` uses.
         let _ = store.save();
+        // The sidebar reads this, never the file, so it has to learn about
+        // a capture from the same call that made it.
+        self.projects_cache = store;
     }
 
     /// Remember the tab at `index`, if there is one.
-    fn record_project_at(&self, index: usize, cx: &App) {
-        if let Some(tab) = self.tabs.get(index) {
-            self.record_projects(std::slice::from_ref(tab), cx);
-        }
+    fn record_project_at(&mut self, index: usize, cx: &App) {
+        self.record_projects(&[index], cx);
     }
 
     /// Remember every open project: the quit and load-session paths, where
     /// the whole workspace goes at once.
-    fn record_open_projects(&self, cx: &App) {
-        self.record_projects(&self.tabs, cx);
+    fn record_open_projects(&mut self, cx: &App) {
+        let all: Vec<usize> = (0..self.tabs.len()).collect();
+        self.record_projects(&all, cx);
+    }
+
+    /// Reopen a remembered project: one terminal per remembered directory,
+    /// all in one new tab under the project's own label.
+    ///
+    /// A directory that is no longer there does NOT stop the others — its
+    /// shell opens in `$HOME` and `projects_note` says which folder and
+    /// where it went instead. The decisions are `projects::plan_reopen`
+    /// (where each shell lands), `projects::missing_dirs_note` (what the
+    /// user is told) and `layout::grid_of` (the shape of the tab); all
+    /// three are pure and tested. This function is the wiring.
+    fn open_project(&mut self, project: &crate::projects::Project, cx: &mut Context<Self>) {
+        if project.dirs.is_empty() {
+            return; // nothing to reopen; the store should never hold one
+        }
+        let plan = crate::projects::plan_reopen(&project.dirs, |dir| dir.is_dir());
+        let mut terminal_ids: Vec<String> = Vec::with_capacity(plan.spawns.len());
+        for cwd in &plan.spawns {
+            let terminal_id = self.fresh_id();
+            self.spawn_pane(terminal_id.clone(), cwd.clone(), cx);
+            terminal_ids.push(terminal_id);
+        }
+        let Some(tree) = crate::layout::grid_of(&terminal_ids) else {
+            return; // unreachable: dirs is non-empty, so ids is too
+        };
+        let tab_id = format!("tab-{}", self.next_id);
+        self.next_id += 1;
+        // The reopen starts the clock, exactly as a fresh tab does.
+        self.mark_tab_opened(&tab_id);
+        self.tabs
+            .push(Tab::single(tab_id, project.label.clone(), tree));
+        self.active_tab = self.tabs.len() - 1;
+        self.set_focused_terminal(terminal_ids.first().cloned(), cx);
+        self.projects_note = crate::projects::missing_dirs_note(&plan.missing);
+        // Record the use NOW rather than waiting for the tab to close, so a
+        // crash still leaves "you just used this" behind. `record` merges it
+        // into the existing entry by directory set, which is why reopening a
+        // PINNED project moves it up the pinned list instead of dropping an
+        // unpinned twin of itself into recents.
+        let mut store = crate::projects::ProjectStore::load();
+        store.record(crate::projects::touch_for_reopen(
+            project,
+            crate::projects::now_secs(),
+            terminal_ids.len(),
+        ));
+        let _ = store.save();
+        self.projects_cache = store;
+        self.push_git_cwd(cx);
+        cx.notify();
     }
 
     fn close_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
@@ -1969,7 +2099,7 @@ impl Workspace {
                     || self.focused_terminal.as_deref() == Some(terminal_id);
                 self.tabs.remove(tab_index);
                 self.fix_rename_after_removal(tab_index);
-                self.prune_collapsed_projects();
+                self.prune_closed_tab_state();
                 if self.tabs.is_empty() {
                     self.add_tab(None, cx);
                 } else {
@@ -1995,7 +2125,7 @@ impl Workspace {
     /// Close a whole tab: every terminal in its tree shuts down (the old
     /// app's removeTab). The last remaining tab is respawned fresh.
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(ids) = self.tabs.get(index).map(|tab| tab.all_terminal_ids()) else {
             return;
         };
         // The sibling of the capture in `close_terminal`: here the whole
@@ -2003,7 +2133,6 @@ impl Workspace {
         // for the same reason, before the shutdown loop below kills the
         // shells that know where they are.
         self.record_project_at(index, cx);
-        let ids = tab.all_terminal_ids();
         let was_active = index == self.active_tab
             || self
                 .focused_terminal
@@ -2027,7 +2156,7 @@ impl Workspace {
         self.share_open.retain(|id| self.panes.contains_key(id));
         self.tabs.remove(index);
         self.fix_rename_after_removal(index);
-        self.prune_collapsed_projects();
+        self.prune_closed_tab_state();
         if self.tabs.is_empty() {
             self.add_tab(None, cx);
         } else {
@@ -2903,6 +3032,32 @@ impl Workspace {
                 }
             }
         }
+        // Remembered projects, beneath the live ones. Cloned out of the
+        // cache: a row's click handler outlives this borrow, and a
+        // `Project` is self-contained data (unlike a tab INDEX, which goes
+        // stale the moment a tab closes and so is always re-resolved).
+        let pinned: Vec<crate::projects::Project> =
+            self.projects_cache.pinned().into_iter().cloned().collect();
+        let recent: Vec<crate::projects::Project> =
+            self.projects_cache.recent().into_iter().cloned().collect();
+        for (heading, section) in [("PINNED", &pinned), ("RECENT", &recent)] {
+            if section.is_empty() {
+                continue;
+            }
+            rows.push(
+                div()
+                    .px(px(8.0))
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(heading)
+                    .into_any_element(),
+            );
+            for project in section {
+                rows.push(self.render_project_row(project, cx));
+            }
+        }
         div()
             .w(px(240.0))
             .flex_none()
@@ -2953,6 +3108,27 @@ impl Workspace {
                             ),
                     ),
             )
+            .children(self.projects_note.clone().map(|note| {
+                // What the last reopen could not do, said where the user
+                // just clicked. Click to dismiss.
+                div()
+                    .id("projects-note")
+                    .cursor_pointer()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .border_b_1()
+                    .border_color(rgb(theme.ui_border))
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.yellow))
+                    .child(SharedString::from(note))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, _, cx| {
+                            ws.projects_note = None;
+                            cx.notify();
+                        }),
+                    )
+            }))
             .child(
                 div()
                     .id("projects-scroll")
@@ -2962,6 +3138,53 @@ impl Workspace {
                     .flex_col()
                     .py(px(2.0))
                     .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// One remembered project: its name, and what it IS — folder count,
+    /// terminal count and time worked, from `projects::project_summary`.
+    /// Clicking reopens it.
+    fn render_project_row(
+        &self,
+        project: &crate::projects::Project,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+        let summary = crate::projects::project_summary(
+            project.dirs.len(),
+            project.terminals,
+            project.active_secs,
+        );
+        let to_open = project.clone();
+        div()
+            .id(SharedString::from(format!("project-open-{}", project.id)))
+            .flex()
+            .flex_col()
+            .px(px(8.0))
+            .py(px(3.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(theme.ui_surface)))
+            .child(
+                div()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_color(rgb(theme.ui_text))
+                    .child(SharedString::from(project.label.clone())),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(SharedString::from(summary)),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, _, window, cx| {
+                    ws.open_project(&to_open, cx);
+                    ws.focus_active_pane(window, cx);
+                }),
             )
             .into_any_element()
     }
@@ -2995,7 +3218,10 @@ impl Workspace {
         self.sidebar_open = true;
         self.sidebar_view = view;
         match view {
-            SidebarView::Projects | SidebarView::Peers => {}
+            // Opening the view must not wait for the next poll to show
+            // what is in the store.
+            SidebarView::Projects => self.projects_cache = crate::projects::ProjectStore::load(),
+            SidebarView::Peers => {}
             SidebarView::Git => {
                 if self.git_panel.is_none() {
                     let theme = self.theme;
@@ -3324,6 +3550,7 @@ impl Workspace {
                 .map(|window| remap_ids(window, &mapping))
                 .collect();
             let active_window = tab.active_window.min(windows.len() - 1);
+            self.mark_tab_opened(&tab.id);
             self.tabs.push(Tab {
                 id: tab.id,
                 label: tab.label,
@@ -3331,6 +3558,9 @@ impl Workspace {
                 active_window,
             });
         }
+        // A saved layout carries its OWN tab ids, so the marks and the
+        // collapsed set can both be holding ids no live tab answers to.
+        self.prune_closed_tab_state();
         if self.tabs.is_empty() {
             self.add_tab(None, cx);
         } else {
