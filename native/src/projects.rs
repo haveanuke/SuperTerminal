@@ -8,6 +8,12 @@
 //! project) and the sidebar UI (pinned/recent lists, reopening) on top of
 //! this store.
 
+// Wired by Task 2 (capture) and Task 3 (the sidebar). Until then the whole
+// module is built but uncalled, and the repo's convention for staged code is
+// this attribute rather than leaving warnings to accumulate — expected
+// warnings sharing space with real ones is how a real one gets missed.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
