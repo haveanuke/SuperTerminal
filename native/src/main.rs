@@ -14,6 +14,7 @@ mod pane;
 mod peer_client;
 mod peers;
 mod projects;
+mod scrollback;
 mod settings;
 mod term_session;
 mod text_field;
