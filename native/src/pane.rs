@@ -1614,24 +1614,40 @@ fn ime_anchor(
 /// past `cols` or a run longer than the row, and neither may index out of
 /// bounds.
 ///
-/// **A row containing a run this cannot map is refused outright, and that
-/// is the whole point of the return type.** `width` counts CELLS while
-/// `text` carries CHARS, and the wire never says which chars were wide, so
-/// a run where the two disagree contains at least one wide glyph and every
-/// character after it in that run sits one column left of where this blit
-/// puts it. An earlier version scanned such rows anyway on the reasoning
-/// that "the drift cannot escape the run" — true, and it does not bound the
-/// harm. A review demonstrated it: one run of
+/// **A row this cannot map to columns EXACTLY is refused outright, and the
+/// bar for "exactly" is ASCII.** Anything else is refused, including text
+/// that looks self-consistent.
+///
+/// Two rounds of getting this wrong, both worth keeping written down.
+///
+/// First: the blit advanced one column per CHAR while `width` counts CELLS,
+/// so every character after a wide glyph in a run sat one column left of
+/// where it was drawn. A review demonstrated it — one run of
 /// `"见见见 http://a.com http://evil.com"` puts `http://a.com` on cells
 /// 7-18, and clicking cell 17 returned `http://evil.com`.
 ///
-/// Opening the wrong link is far worse than opening none, so a row that
-/// cannot be mapped exactly yields `None` and the click does nothing. The
-/// ordinary case — ASCII, where chars and cells agree — is unaffected.
+/// Second: requiring `chars().count() == width` looked like the fix and is
+/// not. A peer is NOT trusted input, and zero-width joiners, combining
+/// marks and emoji sequences all let a crafted run satisfy that equation
+/// while rendering at completely different columns — so a malicious peer
+/// could still slide a safe-looking URL under a hostile one. The equation
+/// proves the peer's arithmetic is self-consistent, never that it matches
+/// what was drawn.
+///
+/// ASCII is the only claim this can verify without a shaper: one byte, one
+/// char, one column, no clusters, no combining. So a run is mappable only
+/// if it is entirely ASCII AND its length matches its declared width.
+///
+/// The cost is real and accepted: a row mixing non-ASCII text with a URL is
+/// not clickable on an attached pane. URLs themselves are ASCII, so this
+/// costs a click on a line that also happens to contain CJK or an emoji —
+/// against opening a link the user did not choose, which is not a trade.
 fn wire_row_text(runs: &[WireRun], cols: usize) -> Option<String> {
     let mut cells = vec![' '; cols];
     for run in runs {
-        if run.text.chars().count() != run.width as usize {
+        // `len()` is bytes, which equals chars and columns for ASCII only —
+        // which is exactly why the ASCII check has to come first.
+        if !run.text.is_ascii() || run.text.len() != run.width as usize {
             return None;
         }
         let start = run.col as usize;
@@ -5890,6 +5906,60 @@ mod attached_ui_tests {
             None,
             "a row this cannot map exactly must be refused, not scanned"
         );
+    }
+
+    #[test]
+    fn a_self_consistent_but_unmappable_run_is_still_refused() {
+        // The second round of this bug, found by an external reviewer at
+        // the push gate. `chars().count() == width` proves the PEER'S
+        // ARITHMETIC is self-consistent; it proves nothing about what was
+        // drawn. Zero-width joiners and combining marks occupy no column,
+        // so a peer can satisfy that equation and still render the second
+        // URL under columns the scanner reads as part of the first.
+        //
+        // A peer is not trusted input, so the bar is ASCII: one byte, one
+        // char, one column, verifiable without a text shaper.
+        let text = "http://evil.example/\u{200d}\u{200d}\u{200d} http://safe.example";
+        let hostile = WireRun {
+            col: 0,
+            // Deliberately CONSISTENT with the char count - this is what
+            // makes it slip past the previous guard.
+            width: text.chars().count() as u16,
+            text: text.to_string(),
+            fg: "#c0caf5".to_string(),
+            bg: None,
+            b: false,
+            i: false,
+            u: false,
+        };
+        assert_eq!(
+            hostile.text.chars().count(),
+            hostile.width as usize,
+            "the fixture must PASS the old chars-vs-cells check, or it proves nothing"
+        );
+        assert_eq!(
+            wire_row_text(&[hostile], 80),
+            None,
+            "self-consistent is not the same as column-mappable"
+        );
+    }
+
+    #[test]
+    fn a_run_whose_declared_width_disagrees_with_its_ascii_length_is_refused() {
+        // A peer lying in the other direction: pure ASCII, but a width that
+        // does not match. Nothing else in the row can be trusted to sit
+        // where the blit puts it.
+        let liar = WireRun {
+            col: 0,
+            width: 99,
+            text: "http://a.example http://b.example".to_string(),
+            fg: "#c0caf5".to_string(),
+            bg: None,
+            b: false,
+            i: false,
+            u: false,
+        };
+        assert_eq!(wire_row_text(&[liar], 80), None);
     }
 
     #[test]
