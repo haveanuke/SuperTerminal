@@ -49,8 +49,8 @@ pub struct Project {
     pub icon: ProjectIcon,
     /// Set once the user renames the project away from its auto-assigned
     /// label. Together with `pinned`, this protects the record's `id`: once
-    /// either is true, a later auto-capture of the same directory set must
-    /// never merge into it (see `ProjectStore::record`) — the record is the
+    /// either is true, a later auto-capture of the same project must never
+    /// merge into it (see `ProjectStore::record`) — the record is the
     /// user's now, identified by `id`, not by its paths.
     pub renamed: bool,
     /// How many terminals the project had when it was LAST captured —
@@ -97,13 +97,41 @@ fn dir_key(p: &Path) -> String {
     p.to_string_lossy().to_lowercase()
 }
 
-/// Directory-set equality: same members, order irrelevant, case-insensitive.
-/// Used to decide whether an incoming auto-capture is "the same project" as
-/// an existing record.
-fn same_dir_set(a: &[PathBuf], b: &[PathBuf]) -> bool {
-    let a: HashSet<String> = a.iter().map(|p| dir_key(p)).collect();
-    let b: HashSet<String> = b.iter().map(|p| dir_key(p)).collect();
-    a == b
+/// The directory a project is IDENTIFIED by: the first of its directories
+/// that is not `$HOME`.
+///
+/// `None` when it has none — an empty capture, or a tab that only ever sat
+/// in `$HOME`, which [`worth_remembering`] refuses to record at all. The
+/// fallback is deliberately not "then use `$HOME`": every launch opens a
+/// starter tab there, and letting `$HOME` be a primary would make every
+/// such tab the same project as every other.
+pub fn primary_dir(dirs: &[PathBuf]) -> Option<&PathBuf> {
+    dirs.iter().find(|dir| !is_home(dir))
+}
+
+/// Whether an incoming capture is the SAME project as an existing record.
+///
+/// The primary directory alone decides, not the whole set. Matching the
+/// whole set forked a project on ordinary use: a tab with the repo open
+/// and a second terminal sitting in `~` to run `brew upgrade` records
+/// `{repo, ~}`, the same tab tomorrow without that terminal records
+/// `{repo}`, and the two are different sets — so recents fill with
+/// near-duplicates that differ only by which incidental terminal happened
+/// to be open at close time. `cd`-ing that second terminal anywhere forks
+/// it again.
+///
+/// The cost, and it is a real one: two genuinely separate projects rooted
+/// in the same folder now merge into one record. That is the deliberate
+/// trade — a project is the folder you work in, and the terminals beside
+/// it come and go.
+///
+/// A record with no primary directory matches nothing, itself included:
+/// there is no folder to be the same as.
+fn same_project(a: &[PathBuf], b: &[PathBuf]) -> bool {
+    match (primary_dir(a), primary_dir(b)) {
+        (Some(a), Some(b)) => dir_key(a) == dir_key(b),
+        _ => false,
+    }
 }
 
 /// Unix seconds, now — the one place `last_opened` is minted, so a capture
@@ -154,9 +182,21 @@ pub fn worth_remembering(dirs: &[PathBuf]) -> bool {
     if dirs.len() > 1 {
         return true;
     }
+    !is_home(&dirs[0])
+}
+
+/// Whether `dir` is the user's home directory, matched the same
+/// case-insensitive way every other directory comparison here is.
+///
+/// Two rules lean on this: a bare-`$HOME` tab is not a project
+/// ([`worth_remembering`]), and a shell sitting in the `$HOME` fallback is
+/// a shell that never reached the folder it was asked for
+/// ([`pane_capture_cwd`]). With `HOME` unset nothing is home, which leaves
+/// both rules erring towards remembering rather than discarding.
+fn is_home(dir: &Path) -> bool {
     match std::env::var_os("HOME") {
-        Some(home) => dir_key(&dirs[0]) != dir_key(Path::new(&home)),
-        None => true,
+        Some(home) => dir_key(dir) == dir_key(Path::new(&home)),
+        None => false,
     }
 }
 
@@ -177,6 +217,137 @@ pub fn project_dirs(panes: &[(Target, Option<String>)]) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// One pane of a tab, as the tab remembers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaneDir {
+    /// Where the pane's shell runs. Only a local one contributes a
+    /// directory — see [`project_dirs`], which still owns that rule.
+    pub target: Target,
+    /// The last directory this pane was SEEN in, exactly as its shell
+    /// reported it. `None` for a remote pane, and for a pane that has not
+    /// answered yet.
+    pub seen: Option<String>,
+    /// The folder a project reopen ASKED this pane for and could not give
+    /// it, because the folder was gone at the time. `None` for every
+    /// ordinary pane. See [`pane_capture_cwd`].
+    pub requested: Option<PathBuf>,
+}
+
+/// What a pane contributes to its project's directory set.
+///
+/// Normally the last directory it was seen in — the spec's "live cwd, not
+/// spawn cwd", so a shell that `cd`s into the subdirectory the user
+/// actually works in reopens there.
+///
+/// A pane a reopen spawned for a folder that had GONE is the exception.
+/// Its shell landed in `$HOME` (the fallback `TermSession::spawn` uses
+/// when given no cwd), so letting that `$HOME` stand would put a folder
+/// in the record that the user never chose — and if the missing folder
+/// were the project's PRIMARY one (see `same_project`), the capture would
+/// be identified by whatever came next instead. The folder it was asked
+/// for stands instead: a project is those folders, and one of them being
+/// temporarily missing does not change which project it is.
+///
+/// It stands only while the shell is still sitting in that fallback. Once
+/// the user moves that terminal somewhere real, where it actually is is
+/// the truth again, and the ordinary rule resumes.
+pub fn pane_capture_cwd(pane: &PaneDir) -> Option<String> {
+    let Some(requested) = &pane.requested else {
+        return pane.seen.clone();
+    };
+    match &pane.seen {
+        Some(seen) if !is_home(Path::new(seen)) => Some(seen.clone()),
+        _ => Some(requested.to_string_lossy().to_string()),
+    }
+}
+
+/// Every pane a tab has HAD, and where each of them was last seen.
+///
+/// Capture reads this rather than the panes still alive when the tab dies,
+/// and the difference is the whole point: a tab dies when its LAST
+/// terminal goes, so a four-folder project closed one pane at a time was
+/// captured as a ONE-folder project with one terminal — the survivor —
+/// and reopened as a single shell. Closing panes individually is
+/// completely ordinary, so reading the survivors defeated the feature in
+/// its commonest case.
+///
+/// A union over PANES, never over time. A pane's entry is REPLACED when
+/// its shell moves, so a terminal that `cd`s around all day contributes
+/// one directory rather than every directory it ever visited, and the
+/// whole structure is bounded by panes opened rather than by `cd`s.
+///
+/// It belongs to one tab and dies with it: `Workspace` keys these by tab
+/// id and prunes them in `prune_closed_tab_state`, alongside
+/// `tab_opened_at`, so no entry outlives the tab it describes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TabPaneDirs {
+    /// Ordered, not a `HashMap`: reopening spawns one terminal per
+    /// directory, so first-seen pane order is the order the user gets
+    /// their shells back in — and a hashed order would scramble it
+    /// differently on every run.
+    entries: Vec<(String, PaneDir)>,
+}
+
+impl TabPaneDirs {
+    fn entry_mut(&mut self, pane_id: &str, target: &Target) -> &mut PaneDir {
+        if let Some(index) = self.entries.iter().position(|(id, _)| id == pane_id) {
+            return &mut self.entries[index].1;
+        }
+        self.entries.push((
+            pane_id.to_string(),
+            PaneDir {
+                target: target.clone(),
+                seen: None,
+                requested: None,
+            },
+        ));
+        &mut self.entries.last_mut().expect("just pushed").1
+    }
+
+    /// Note that `pane_id` is one of this tab's panes, and where its shell
+    /// is now.
+    ///
+    /// A `None` cwd never erases a directory already seen. A shell that
+    /// has exited stops answering, and forgetting where it was is exactly
+    /// the failure `last_known_cwd` exists to prevent. It still creates
+    /// the entry, so a pane that never reports a directory at all — a
+    /// remote one — is still counted among the terminals the project had.
+    pub fn saw(&mut self, pane_id: &str, target: &Target, cwd: Option<String>) {
+        let entry = self.entry_mut(pane_id, target);
+        if cwd.is_some() {
+            entry.seen = cwd;
+        }
+    }
+
+    /// Record the folder a project reopen asked `pane_id` for but could
+    /// not give it. See [`pane_capture_cwd`].
+    pub fn asked_for(&mut self, pane_id: &str, target: &Target, dir: PathBuf) {
+        self.entry_mut(pane_id, target).requested = Some(dir);
+    }
+
+    /// How many terminals the project has had — every pane that has ever
+    /// belonged to this tab, not just the ones still alive. That is the
+    /// honest answer to "how big is this thing", and it is the same
+    /// population the directories are drawn from, so the two halves of a
+    /// project's row can never disagree.
+    pub fn terminals(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Every directory this tab's panes contribute, deduped, in first-seen
+    /// pane order. The rules — local panes only, no empty paths, deduped
+    /// case-insensitively — stay in [`project_dirs`]; this only decides
+    /// WHICH cwd each pane offers it.
+    pub fn dirs(&self) -> Vec<PathBuf> {
+        let panes: Vec<(Target, Option<String>)> = self
+            .entries
+            .iter()
+            .map(|(_, pane)| (pane.target.clone(), pane_capture_cwd(pane)))
+            .collect();
+        project_dirs(&panes)
+    }
 }
 
 /// The record an auto-capture writes for `dirs`, or `None` when there is
@@ -358,10 +529,12 @@ pub fn project_summary(dirs: usize, terminals: usize, active_secs: u64) -> Strin
 /// A capture's id: FNV-1a over the directory keys, sorted so pane order
 /// cannot change it.
 ///
-/// `record` matches on the directory SET, so an id only has to be unique.
-/// Deriving it from that same set buys one more thing for nothing: a
-/// project whose `projects.json` was lost comes back under the id it
-/// always had, instead of a fresh one on every launch. Hand-rolled rather
+/// `record` matches on the PRIMARY directory (see `same_project`), so an
+/// id only has to be unique. Deriving it from the whole set buys one more
+/// thing for nothing: a project whose `projects.json` was lost comes back
+/// under the id it always had, instead of a fresh one on every launch —
+/// and a record that IS matched keeps the id it already has, so the two
+/// rules never disagree about a project that still exists. Hand-rolled rather
 /// than `DefaultHasher`, whose output std does not promise to keep stable
 /// across releases — a persisted id must not change under the app.
 fn project_id(dirs: &[PathBuf]) -> String {
@@ -409,9 +582,9 @@ impl ProjectStore {
     /// Record a project after it closes (or on quit). Encodes:
     /// - an empty `dirs` project is not recorded — there is nothing to
     ///   reopen;
-    /// - a `dirs` set matching an existing UNPINNED, UNRENAMED record
-    ///   updates that record's `last_opened` rather than adding a duplicate,
-    ///   regardless of order within `dirs`;
+    /// - a capture whose PRIMARY directory (see `same_project`) matches an
+    ///   existing UNPINNED, UNRENAMED record updates that record rather
+    ///   than adding a duplicate — the folders beside it may differ;
     /// - a pinned or renamed record is never merged into: it keeps its `id`
     ///   and the incoming capture becomes its own new record instead;
     /// - recording evicts only the oldest UNPINNED project once the unpinned
@@ -433,7 +606,7 @@ impl ProjectStore {
         if let Some(existing) = self
             .projects
             .iter_mut()
-            .find(|p| same_dir_set(&p.dirs, &project.dirs))
+            .find(|p| same_project(&p.dirs, &project.dirs))
         {
             existing.last_opened = project.last_opened;
             // Both stats move even for a pinned or renamed record. What
@@ -500,6 +673,41 @@ impl ProjectStore {
         v.sort_by(|a, b| b.last_opened.cmp(&a.last_opened));
         v.truncate(RECENT_CAP);
         v
+    }
+}
+
+/// The two remembered sections the sidebar lists beneath the live tabs.
+#[derive(Debug, PartialEq)]
+pub struct SidebarSections<'a> {
+    pub pinned: Vec<&'a Project>,
+    pub recent: Vec<&'a Project>,
+}
+
+/// Split the store into what the sidebar shows, given the directory sets
+/// of the projects that are open RIGHT NOW.
+///
+/// A project that is open is already listed above as a live tab, so
+/// repeating it under RECENT shows the user the same thing twice and
+/// invites them to "reopen" what they are looking at.
+///
+/// PINNED is deliberately NOT filtered. Pinning is a promise that the
+/// project is always in that list; making it vanish the moment it is
+/// opened would look like pinning had broken, exactly when the user is
+/// using it.
+///
+/// Matched on the PRIMARY directory, the same way `record` decides two
+/// captures are one project — so a tab that has picked up an extra
+/// terminal in `~` since the record was written still counts as open, and
+/// a tab rooted somewhere else hides nothing, however many later folders
+/// the two happen to share.
+pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> SidebarSections<'a> {
+    SidebarSections {
+        pinned: store.pinned(),
+        recent: store
+            .recent()
+            .into_iter()
+            .filter(|project| !open.iter().any(|dirs| same_project(dirs, &project.dirs)))
+            .collect(),
     }
 }
 
@@ -735,17 +943,22 @@ mod tests {
     }
 
     #[test]
-    fn record_match_ignores_directory_order() {
+    fn record_matches_on_the_primary_folder_whatever_order_follows_it() {
+        // REWRITTEN when identity moved from the whole directory set to
+        // the primary directory. What it used to assert — that ANY
+        // reordering still matched — is no longer true, and deliberately
+        // so: the FIRST non-$HOME directory is what names the project.
+        // Everything after it may be reordered, added or dropped freely,
+        // which is the point (see `same_project`).
         let mut store = ProjectStore::default();
         store.record(project("orig", &["/chat", "/board-kid", "/penpot"], 100));
-        // Same set, different order.
         store.record(project(
             "would-be-new-id",
-            &["/penpot", "/chat", "/board-kid"],
+            &["/chat", "/penpot", "/board-kid"],
             500,
         ));
         let recent = store.recent();
-        assert_eq!(recent.len(), 1, "order must not defeat the match");
+        assert_eq!(recent.len(), 1, "the folders after the primary are free");
         assert_eq!(recent[0].id, "orig");
         assert_eq!(recent[0].last_opened, 500);
     }
@@ -919,15 +1132,30 @@ mod tests {
     }
 
     #[test]
-    fn record_does_not_merge_different_dir_sets() {
+    fn record_does_not_merge_projects_rooted_in_different_folders() {
+        // REWRITTEN when identity moved from the whole directory set to
+        // the primary directory. `{/a, /b}` and `{/a, /c}`, which this
+        // used to hold apart, are now ONE project — that is exactly the
+        // fork the change removes. What still separates two projects is
+        // being rooted somewhere else, and sharing every later folder does
+        // not bring them back together.
         let mut store = ProjectStore::default();
-        store.record(project("a", &["/a", "/b"], 100));
-        store.record(project("b", &["/a", "/c"], 200));
+        store.record(project("a", &["/a", "/shared"], 100));
+        store.record(project("b", &["/b", "/shared"], 200));
         assert_eq!(
             store.recent().len(),
             2,
-            "overlapping but unequal sets are different projects"
+            "different primary folders are different projects"
         );
+        let mut merging = ProjectStore::default();
+        merging.record(project("one", &["/a", "/b"], 100));
+        merging.record(project("also-one", &["/a", "/c"], 200));
+        assert_eq!(
+            merging.recent().len(),
+            1,
+            "the same primary folder is one project, whatever sits beside it"
+        );
+        assert_eq!(merging.recent()[0].id, "one");
     }
 
     // --- project_dirs(): what a closing tab contributes ---
@@ -1057,17 +1285,18 @@ mod tests {
 
     #[test]
     fn one_project_gets_one_id_however_its_panes_were_ordered() {
-        // The store matches on the directory SET, so a capture's id only
-        // has to be unique — but deriving it from that same set means a
-        // project whose store file was lost comes back under the id it
-        // always had, rather than a fresh one each launch.
+        // The store matches on the PRIMARY directory, so a capture's id
+        // only has to be unique — but deriving it from the whole set means
+        // a project whose store file was lost comes back under the id it
+        // always had, rather than a fresh one each launch. A project that
+        // still exists is matched and keeps its stored id either way.
         let a = project_for_dirs(vec![PathBuf::from("/chat"), PathBuf::from("/penpot")], 1)
             .expect("dirs present");
         let b = project_for_dirs(vec![PathBuf::from("/Penpot"), PathBuf::from("/chat")], 2)
             .expect("dirs present");
-        assert_eq!(a.id, b.id, "same directory set, same project");
+        assert_eq!(a.id, b.id, "same directory set, same id");
         let other = project_for_dirs(vec![PathBuf::from("/chat")], 3).expect("dirs present");
-        assert_ne!(a.id, other.id, "a different set is a different project");
+        assert_ne!(a.id, other.id, "a different set mints a different id");
         assert!(!a.id.is_empty());
     }
 
@@ -1184,11 +1413,15 @@ mod stats_tests {
     fn a_project_captured_twice_accumulates_its_time() {
         // "how much have I actually worked here", summed across sessions —
         // not "how long was the last session", which overwriting gives.
+        // The second capture drops the incidental second folder rather
+        // than reordering it, which is how a real second session differs
+        // and what `same_project` now matches on. The assertion below is
+        // untouched: the same 150 seconds, in the same one project.
         let mut store = ProjectStore::default();
         let mut first = project("chat", &["/chat", "/penpot"], 100);
         first.active_secs = 100;
         store.record(first);
-        let mut second = project("chat-again", &["/penpot", "/chat"], 200);
+        let mut second = project("chat-again", &["/chat"], 200);
         second.active_secs = 50;
         store.record(second);
         assert_eq!(store.recent().len(), 1, "still one project");
@@ -1298,5 +1531,356 @@ mod stats_tests {
             .expect("a note");
         assert!(two.contains("2 folders"), "{two}");
         assert!(two.contains("/gone-a") && two.contains("/gone-b"), "{two}");
+    }
+}
+
+/// The three decisions behind "closing a project pane by pane, reopening
+/// one whose folder is gone, and listing it once rather than twice".
+///
+/// The wiring that feeds these — folding every live pane's `last_known_cwd`
+/// into `Workspace::tab_pane_dirs` before anything is torn down, pruning
+/// that map with the tab, and seeding it in `open_project` — has no test
+/// harness (there is no gpui one, and none may be introduced). It is
+/// verified by reading, and the report says which paths.
+#[cfg(test)]
+mod tab_memory_tests {
+    use super::*;
+    use crate::hosts::{ProfileId, Target};
+
+    fn remote() -> Target {
+        Target::Remote(ProfileId("work-mac".to_string()))
+    }
+
+    fn project(id: &str, dirs: &[&str], last_opened: u64, pinned: bool) -> Project {
+        Project {
+            id: id.to_string(),
+            label: id.to_string(),
+            dirs: dirs.iter().map(PathBuf::from).collect(),
+            pinned,
+            last_opened,
+            icon: ProjectIcon::default(),
+            renamed: false,
+            terminals: 0,
+            active_secs: 0,
+        }
+    }
+
+    /// One fold of `Workspace::remember_pane_dirs`: the panes that are
+    /// still alive, each reporting where its shell is.
+    fn fold(remembered: &mut TabPaneDirs, live: &[(&str, Option<&str>)]) {
+        for (pane_id, cwd) in live {
+            remembered.saw(pane_id, &Target::Local, cwd.map(String::from));
+        }
+    }
+
+    // --- a project closed one pane at a time keeps every folder ---
+
+    #[test]
+    fn a_project_closed_one_pane_at_a_time_keeps_every_folder() {
+        // THE defect. A tab dies when its LAST terminal goes, so a capture
+        // that reads whoever is still alive sees one pane and records a
+        // four-folder project as a one-folder one — reopened, the user
+        // gets a single shell back. Closing panes individually is entirely
+        // ordinary, so reading the survivors defeats the feature outright.
+        let mut remembered = TabPaneDirs::default();
+        fold(
+            &mut remembered,
+            &[
+                ("p1", Some("/chat")),
+                ("p2", Some("/board-kid")),
+                ("p3", Some("/penpot")),
+                ("p4", Some("/forgejo")),
+            ],
+        );
+        // Three panes closed, one at a time. Each later fold sees only who
+        // is left, exactly as the workspace's does.
+        fold(
+            &mut remembered,
+            &[
+                ("p2", Some("/board-kid")),
+                ("p3", Some("/penpot")),
+                ("p4", Some("/forgejo")),
+            ],
+        );
+        fold(
+            &mut remembered,
+            &[("p3", Some("/penpot")), ("p4", Some("/forgejo"))],
+        );
+        fold(&mut remembered, &[("p4", Some("/forgejo"))]);
+        assert_eq!(
+            remembered.dirs(),
+            vec![
+                PathBuf::from("/chat"),
+                PathBuf::from("/board-kid"),
+                PathBuf::from("/penpot"),
+                PathBuf::from("/forgejo"),
+            ],
+            "all four folders, in the order their panes first appeared"
+        );
+        assert_eq!(
+            remembered.terminals(),
+            4,
+            "and four terminals, not the one that happened to be last"
+        );
+    }
+
+    #[test]
+    fn a_shell_that_cds_around_contributes_one_folder() {
+        // The union is over PANES, never over time. A terminal that walks
+        // a repo all day is still one terminal in one place — the place it
+        // ended up. Accumulating every directory it ever visited would
+        // reopen the project as a dozen shells and grow without bound.
+        let mut remembered = TabPaneDirs::default();
+        fold(&mut remembered, &[("p1", Some("/chat"))]);
+        fold(&mut remembered, &[("p1", Some("/chat/src"))]);
+        fold(&mut remembered, &[("p1", Some("/chat/src/net"))]);
+        assert_eq!(
+            remembered.dirs(),
+            vec![PathBuf::from("/chat/src/net")],
+            "where it is now, not everywhere it has been"
+        );
+        assert_eq!(remembered.terminals(), 1, "still one terminal");
+    }
+
+    #[test]
+    fn a_pane_that_stops_answering_keeps_where_it_was() {
+        // Typing `exit` is the commonest way to close a terminal and
+        // leaves no process to ask. Letting that `None` erase the folder
+        // would undo the very thing `last_known_cwd` exists for.
+        let mut remembered = TabPaneDirs::default();
+        fold(&mut remembered, &[("p1", Some("/chat"))]);
+        fold(&mut remembered, &[("p1", None)]);
+        assert_eq!(remembered.dirs(), vec![PathBuf::from("/chat")]);
+    }
+
+    #[test]
+    fn a_remote_pane_is_a_terminal_the_project_had_but_not_a_folder() {
+        // Its directory is on ANOTHER machine, so reopening it here would
+        // spawn a local shell in a path that may not exist — but it was
+        // still a terminal in this project, and the count says so.
+        let mut remembered = TabPaneDirs::default();
+        remembered.saw("p1", &Target::Local, Some("/chat".to_string()));
+        remembered.saw("p2", &remote(), Some("/home/tomas/work".to_string()));
+        assert_eq!(
+            remembered.dirs(),
+            vec![PathBuf::from("/chat")],
+            "only the local pane's folder"
+        );
+        assert_eq!(remembered.terminals(), 2, "both were terminals");
+    }
+
+    // --- a folder that has gone does not fork the project ---
+
+    #[test]
+    fn a_folder_that_was_gone_still_counts_as_itself() {
+        // The reopened shell for a deleted folder sits in `$HOME`. Letting
+        // that stand makes the captured directory SET differ from the
+        // project's own — and identity is matched on that set, so the
+        // project splits into a second record the moment it is reopened.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let mut remembered = TabPaneDirs::default();
+        remembered.asked_for("p1", &Target::Local, PathBuf::from("/gone"));
+        remembered.saw("p1", &Target::Local, Some(home.clone()));
+        assert_eq!(
+            remembered.dirs(),
+            vec![PathBuf::from("/gone")],
+            "the folder it was asked for, not the fallback it landed in"
+        );
+    }
+
+    #[test]
+    fn a_shell_moved_off_the_fallback_reports_where_it_actually_is() {
+        // The asked-for folder stands only while the shell is still
+        // sitting in the fallback. Once the user takes that terminal
+        // somewhere real, "live cwd, not spawn cwd" is the rule again.
+        let mut remembered = TabPaneDirs::default();
+        remembered.asked_for("p1", &Target::Local, PathBuf::from("/gone"));
+        remembered.saw("p1", &Target::Local, Some("/chat".to_string()));
+        assert_eq!(remembered.dirs(), vec![PathBuf::from("/chat")]);
+    }
+
+    #[test]
+    fn reopening_a_project_with_a_missing_folder_does_not_fork_the_record() {
+        // End to end over the decisions `open_project` and the capture use
+        // between them: plan the reopen, seed the tab's memory the way
+        // `open_project` does, let the fallback shell report `$HOME`, then
+        // capture. One record must come back out, not two.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let dirs = vec![
+            PathBuf::from("/chat"),
+            PathBuf::from("/gone"),
+            PathBuf::from("/penpot"),
+        ];
+        let mut store = ProjectStore::default();
+        store.record(project("orig", &["/chat", "/gone", "/penpot"], 100, false));
+
+        let plan = plan_reopen(&dirs, |dir| dir != Path::new("/gone"));
+        let mut remembered = TabPaneDirs::default();
+        for (index, (spawn, wanted)) in plan.spawns.iter().zip(dirs.iter()).enumerate() {
+            let pane_id = format!("p{index}");
+            remembered.saw(&pane_id, &Target::Local, None);
+            if spawn.is_none() {
+                remembered.asked_for(&pane_id, &Target::Local, wanted.clone());
+            }
+            // What each shell reports once it is up: its folder, or the
+            // `$HOME` `TermSession::spawn` falls back to.
+            let landed = spawn
+                .clone()
+                .map(|dir| dir.to_string_lossy().to_string())
+                .unwrap_or_else(|| home.clone());
+            remembered.saw(&pane_id, &Target::Local, Some(landed));
+        }
+
+        let captured =
+            project_for_dirs(remembered.dirs(), 200).expect("the reopened tab is a project");
+        store.record(captured);
+        assert_eq!(
+            store.recent().len(),
+            1,
+            "one project, not one plus a $HOME-shaped twin"
+        );
+        assert_eq!(store.recent()[0].id, "orig", "and it is the same record");
+        assert_eq!(
+            store.recent()[0].dirs,
+            dirs,
+            "with the folder that is temporarily missing still in it"
+        );
+    }
+
+    // --- what makes two captures the same project ---
+
+    #[test]
+    fn an_incidental_terminal_in_home_does_not_fork_a_project() {
+        // The case that forced this rule. One tab, two terminals: the repo,
+        // and a second one sitting in `~` to run `brew upgrade`. Closing it
+        // records `{repo, ~}`; closing it tomorrow without that second
+        // terminal records `{repo}`. Under whole-set identity those are two
+        // projects, and recents fill with near-duplicates that differ only
+        // by which side-terminal happened to be open at close time.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let mut store = ProjectStore::default();
+        store.record(project("repo", &["/repo", &home], 100, false));
+        // And again with the home terminal opened FIRST, which is what
+        // makes "the first non-$HOME directory" different from "the first
+        // directory".
+        store.record(project("would-be-a-twin", &[&home, "/repo"], 150, false));
+        store.record(project("would-be-another", &["/repo"], 200, false));
+        assert_eq!(store.recent().len(), 1, "one project, not three");
+        assert_eq!(store.recent()[0].id, "repo", "and it is the first record");
+        assert_eq!(store.recent()[0].last_opened, 200, "which just got used");
+    }
+
+    #[test]
+    fn an_incidental_terminal_anywhere_does_not_fork_a_project() {
+        // The same terminal `cd`ed out of `~` and into `/tmp` forked the
+        // record a SECOND time under whole-set identity. The folders
+        // beside the primary one are free to be anything.
+        let mut store = ProjectStore::default();
+        store.record(project("repo", &["/repo", "/tmp"], 100, false));
+        store.record(project("would-be-a-twin", &["/repo"], 200, false));
+        assert_eq!(store.recent().len(), 1, "still one project");
+        assert_eq!(store.recent()[0].id, "repo");
+    }
+
+    #[test]
+    fn a_tab_that_only_ever_sat_in_home_is_still_not_a_project() {
+        // "First non-$HOME directory" must not fall back to `$HOME` when
+        // there is no other — every launch opens a starter tab there, and
+        // a `$HOME` primary would make every one of them the same project.
+        // Nor may asking for the primary of such a capture panic.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let home_only = [PathBuf::from(&home)];
+        assert_eq!(primary_dir(&home_only), None, "$HOME is never a primary");
+        assert_eq!(primary_dir(&[]), None, "nor is nothing at all");
+        let mut store = ProjectStore::default();
+        store.record(project("starter", &[&home], 100, false));
+        store.record(project("another-starter", &[&home], 200, false));
+        assert!(
+            store.recent().is_empty(),
+            "a bare home tab is recorded no more than it ever was"
+        );
+    }
+
+    #[test]
+    fn two_projects_rooted_in_different_folders_stay_apart() {
+        // Sharing every folder BUT the primary one is not sharing an
+        // identity — otherwise a scratch folder both projects happen to
+        // open would silently merge them.
+        let mut store = ProjectStore::default();
+        store.record(project("a", &["/a", "/shared"], 100, false));
+        store.record(project("b", &["/b", "/shared"], 200, false));
+        let ids: Vec<&str> = store.recent().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"], "two projects, newest first");
+    }
+
+    #[test]
+    fn a_pinned_project_matched_by_its_primary_folder_keeps_what_is_its_own() {
+        // Matching more loosely must not loosen what a pinned or renamed
+        // record protects: its id, its label and its folders are still the
+        // user's, and only "you just used this" moves.
+        let home = std::env::var("HOME").expect("HOME is set in this environment");
+        let mut store = ProjectStore::default();
+        let mut fav = project("fav-1", &["/repo", "/docs"], 100, true);
+        fav.label = "Chat stack".to_string();
+        fav.renamed = true;
+        store.record(fav);
+        store.record(project("auto-capture", &["/repo", &home], 500, false));
+        assert_eq!(store.pinned().len(), 1, "no unpinned twin appeared");
+        assert!(store.recent().is_empty());
+        let kept = store.pinned()[0];
+        assert_eq!(kept.id, "fav-1", "its id is its own");
+        assert_eq!(kept.label, "Chat stack", "so is the name the user gave it");
+        assert_eq!(
+            kept.dirs,
+            vec![PathBuf::from("/repo"), PathBuf::from("/docs")],
+            "and so are its folders — the capture's $HOME did not get in"
+        );
+        assert_eq!(kept.last_opened, 500, "but it did just get used");
+    }
+
+    // --- a project that is open is listed once, not twice ---
+
+    #[test]
+    fn a_project_that_is_open_is_not_also_listed_under_recent() {
+        // It is the live tab above. Offering it again under RECENT shows
+        // the same thing twice and invites the user to "reopen" what they
+        // are already looking at.
+        let mut store = ProjectStore::default();
+        store.record(project("open", &["/chat", "/penpot"], 200, false));
+        store.record(project("closed", &["/other"], 100, false));
+        // The live tab has since picked up a terminal in /tmp and lost the
+        // one in /penpot. Same primary folder, so it is the same project.
+        let open = vec![vec![PathBuf::from("/chat"), PathBuf::from("/tmp")]];
+        let sections = sidebar_sections(&store, &open);
+        let ids: Vec<&str> = sections.recent.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["closed"], "the open one is the tab above");
+    }
+
+    #[test]
+    fn a_pinned_project_stays_in_pinned_while_it_is_open() {
+        // Pinning is a promise that it is always in that list. Hiding it
+        // the moment it is opened would make pinning look broken exactly
+        // when the user is using it.
+        let mut store = ProjectStore::default();
+        store.record(project("fav", &["/chat"], 200, true));
+        let open = vec![vec![PathBuf::from("/chat")]];
+        let sections = sidebar_sections(&store, &open);
+        let ids: Vec<&str> = sections.pinned.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["fav"], "still pinned, still shown");
+        assert!(sections.recent.is_empty(), "and pinned is never in recents");
+    }
+
+    #[test]
+    fn a_tab_rooted_elsewhere_hides_nothing_however_much_it_shares() {
+        // Matched on the PRIMARY directory, the way `record` matches. A
+        // tab rooted in another folder is another project, and sharing
+        // every later folder with a remembered one must not make that one
+        // vanish from the list.
+        let mut store = ProjectStore::default();
+        store.record(project("mine", &["/chat", "/shared"], 200, false));
+        let open = vec![vec![PathBuf::from("/other"), PathBuf::from("/shared")]];
+        let sections = sidebar_sections(&store, &open);
+        let ids: Vec<&str> = sections.recent.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["mine"], "a shared folder is not shared identity");
     }
 }

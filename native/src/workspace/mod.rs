@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, MouseButton, MouseMoveEvent,
-    MouseUpEvent, Pixels, SharedString, Window,
+    App, Context, Entity, FocusHandle, Focusable, MouseButton, MouseMoveEvent, MouseUpEvent,
+    Pixels, SharedString, Window, div, px, rgb,
 };
 
 use superterminal_core::activity::Activity;
@@ -22,7 +22,7 @@ use superterminal_core::session::SessionManager;
 use crate::buddy_pet::Companion;
 use crate::git_panel::GitPanel;
 use crate::layout::{
-    collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
+    Layout, PaneNode, SplitDirection, Tab, collect_terminal_ids, insert_split, remove_terminal,
 };
 use crate::pane::{BroadcastHub, PaneEvent, TerminalPane};
 use crate::peer_client::sessions::SessionPoller as PeerSessionPoller;
@@ -496,6 +496,20 @@ pub struct Workspace {
     /// window closing AND the app quitting, say — cannot count the same
     /// minutes twice.
     tab_opened_at: HashMap<String, u64>,
+    /// What each open tab remembers about its OWN panes (by tab id): every
+    /// pane it has had, and where each of those panes was last seen.
+    ///
+    /// Capture reads this instead of the panes still alive at the moment
+    /// the tab dies. A tab dies when its LAST terminal goes, so reading
+    /// the survivors recorded a four-folder project closed pane by pane as
+    /// a one-folder project — see `projects::TabPaneDirs`, which holds the
+    /// decision and the reasoning.
+    ///
+    /// Keyed by tab id and pruned in `prune_closed_tab_state` exactly like
+    /// `tab_opened_at`: the memory dies with the tab, so it can neither
+    /// leak entries for tabs that no longer exist nor hand a future tab
+    /// that reused an id someone else's folders.
+    tab_pane_dirs: HashMap<String, crate::projects::TabPaneDirs>,
     /// The persisted store, read on the sidebar poll and never during
     /// render — the projects view redraws every frame and must not touch
     /// the filesystem to do it.
@@ -694,6 +708,7 @@ impl Workspace {
             sidebar_status_cache: HashMap::new(),
             collapsed_projects: std::collections::HashSet::new(),
             tab_opened_at: HashMap::new(),
+            tab_pane_dirs: HashMap::new(),
             // Read once at startup: the sidebar opens on the projects view,
             // so the pinned and recent lists are there on the first frame
             // rather than after the first poll.
@@ -767,25 +782,29 @@ impl Workspace {
             async {}
         })
         .detach();
-        cx.spawn(async move |ws, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(4)).await;
-            if ws
-                .update(cx, |ws: &mut Workspace, cx| ws.buddy_tick(cx))
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |ws, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(4)).await;
+                if ws
+                    .update(cx, |ws: &mut Workspace, cx| ws.buddy_tick(cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
-        cx.spawn(async move |ws, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(300))
-                .await;
-            if ws
-                .update(cx, |ws: &mut Workspace, cx| ws.pet_tick(cx))
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |ws, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                if ws
+                    .update(cx, |ws: &mut Workspace, cx| ws.pet_tick(cx))
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -1353,6 +1372,11 @@ impl Workspace {
                 // written by other paths (a capture, a quit). Re-read it on
                 // the poll, never during render.
                 self.projects_cache = crate::projects::ProjectStore::load();
+                // Which projects are OPEN decides what RECENT hides, and a
+                // shell that has just `cd`ed can change that. Fold here for
+                // the same reason the cache is reloaded here: the render
+                // must not go asking panes anything.
+                self.remember_pane_dirs(cx);
                 let home = std::env::var("HOME").unwrap_or_default();
                 self.sidebar_status_cache = self
                     .panes
@@ -1834,15 +1858,17 @@ impl Workspace {
     }
 
     /// Drop per-tab state for projects that no longer exist: the sidebar's
-    /// collapsed set and the `active_secs` marks alike. Both are keyed by
-    /// tab id, so both would otherwise hand a future tab that reused the
-    /// id someone else's state — a collapsed row, or an uptime measured
-    /// from a project that closed hours ago.
+    /// collapsed set, the `active_secs` marks and each tab's memory of its
+    /// own panes alike. All three are keyed by tab id, so all three would
+    /// otherwise hand a future tab that reused the id someone else's state
+    /// — a collapsed row, an uptime measured from a project that closed
+    /// hours ago, or another project's folders.
     fn prune_closed_tab_state(&mut self) {
         let live: std::collections::HashSet<String> =
             self.tabs.iter().map(|tab| tab.id.clone()).collect();
         self.collapsed_projects.retain(|id| live.contains(id));
         self.tab_opened_at.retain(|id, _| live.contains(id));
+        self.tab_pane_dirs.retain(|id, _| live.contains(id));
     }
 
     /// Start (or restart) a tab's `active_secs` clock. Every path that
@@ -1866,51 +1892,99 @@ impl Workspace {
 
     // --- projects: remembering a tab before it disappears ---
 
-    /// Every directory `tab`'s LOCAL panes are sitting in right now, in
-    /// pane order.
+    /// Fold what every open tab's panes are doing right now into that
+    /// tab's own memory of itself (`tab_pane_dirs`).
     ///
     /// Uses `last_known_cwd`, not `cwd`. A shell that has already exited —
     /// which is what typing `exit`, the commonest way to close a terminal,
     /// leaves behind — reports no cwd at all, because the process whose
-    /// directory it would read is gone. Capturing on `cwd()` therefore
-    /// silently dropped exactly those projects. The session keeps its last
+    /// directory it would read is gone. Reading `cwd()` therefore silently
+    /// dropped exactly those projects. The session keeps its last
     /// successful reading for this, refreshed on a slow tick.
     ///
-    /// Callers still capture BEFORE tearing anything down: a pane already
-    /// dropped from `self.panes` cannot answer at all, cache or no cache.
+    /// Every path that is about to make a pane unreadable calls this
+    /// FIRST: a pane already dropped from `self.panes` cannot answer at
+    /// all, cache or no cache. `close_terminal` calls it at its very top —
+    /// including for a close that does NOT kill the tab, which is the
+    /// whole point: that pane's folder has to be remembered now, because
+    /// nothing will be able to ask it again.
     ///
-    /// The decision itself — which panes count, dedupe, order — lives in
-    /// `projects::project_dirs`, where it is testable without a gpui
-    /// harness.
-    fn tab_dirs(&self, tab: &Tab, cx: &App) -> Vec<PathBuf> {
-        let panes: Vec<(crate::hosts::Target, Option<String>)> = tab
-            .all_terminal_targets()
-            .into_iter()
-            .map(|(terminal_id, target)| {
-                let cwd = self
-                    .panes
-                    .get(&terminal_id)
-                    .and_then(|pane| pane.read(cx).last_known_cwd());
-                (target, cwd)
+    /// Folding rather than replacing is what makes a project the union of
+    /// its panes instead of a snapshot of its survivors; `TabPaneDirs`
+    /// holds that decision, and is where it is tested.
+    fn remember_pane_dirs(&mut self, cx: &App) {
+        type Observed = (String, crate::hosts::Target, Option<String>);
+        // Collected first: writing into `tab_pane_dirs` needs `&mut self`,
+        // and reading the panes borrows `self` immutably.
+        let observed: Vec<(String, Vec<Observed>)> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let panes = tab
+                    .all_terminal_targets()
+                    .into_iter()
+                    .map(|(terminal_id, target)| {
+                        let cwd = self
+                            .panes
+                            .get(&terminal_id)
+                            .and_then(|pane| pane.read(cx).last_known_cwd());
+                        (terminal_id, target, cwd)
+                    })
+                    .collect();
+                (tab.id.clone(), panes)
             })
             .collect();
-        crate::projects::project_dirs(&panes)
+        for (tab_id, panes) in observed {
+            let remembered = self.tab_pane_dirs.entry(tab_id).or_default();
+            for (terminal_id, target, cwd) in panes {
+                remembered.saw(&terminal_id, &target, cwd);
+            }
+        }
+    }
+
+    /// Every directory `tab` has had a local pane in, in first-seen pane
+    /// order — its panes' union, not the survivors' snapshot.
+    ///
+    /// The decision itself — which panes count, which directory each one
+    /// offers, dedupe, order — lives in `projects::TabPaneDirs` and
+    /// `projects::project_dirs`, where it is testable without a gpui
+    /// harness.
+    fn tab_dirs(&self, tab: &Tab) -> Vec<PathBuf> {
+        self.tab_pane_dirs
+            .get(&tab.id)
+            .map(|remembered| remembered.dirs())
+            .unwrap_or_default()
     }
 
     /// The stats a capture carries beyond its directories: how many
     /// terminals the tab had, and how long it has been open since the mark
     /// laid at its creation, reopen or last capture.
     ///
-    /// A tab with no mark reports zero rather than a guess — the spec's
-    /// rule that a session which never closes cleanly loses its increment
-    /// instead of inventing one.
+    /// The terminal count is the tab's remembered pane count, not its LIVE
+    /// one, for the same reason the directories are: a project closed one
+    /// pane at a time has a single pane left by the time it dies, and
+    /// "1 terminal" is not what the user had. Counting the same population
+    /// the directories come from also keeps the two halves of a project's
+    /// row from ever disagreeing.
+    ///
+    /// A tab with no mark reports zero seconds rather than a guess — the
+    /// spec's rule that a session which never closes cleanly loses its
+    /// increment instead of inventing one.
     fn tab_stats(&self, tab: &Tab, now: u64) -> (usize, u64) {
         let active = self
             .tab_opened_at
             .get(&tab.id)
             .map(|opened_at| crate::projects::session_secs(*opened_at, now))
             .unwrap_or(0);
-        (tab.all_terminal_ids().len(), active)
+        let terminals = self
+            .tab_pane_dirs
+            .get(&tab.id)
+            .map(|remembered| remembered.terminals())
+            // Only reachable for a tab this workspace has never observed;
+            // every capture path folds first. Falling back to the live
+            // count keeps it a measurement rather than a zero.
+            .unwrap_or_else(|| tab.all_terminal_ids().len());
+        (terminals, active)
     }
 
     /// Write the tabs at `indices` into the persistent project store, so
@@ -1925,6 +1999,9 @@ impl Workspace {
     /// `tab_opened_at`, and a borrowed slice of `self.tabs` would hold the
     /// workspace immutably for the whole call.
     fn record_projects(&mut self, indices: &[usize], cx: &App) {
+        // Last chance to ask the shells where they are: below, and in
+        // every caller, they are about to be torn down.
+        self.remember_pane_dirs(cx);
         let now = crate::projects::now_secs();
         let mut captured: Vec<crate::projects::Project> = Vec::new();
         let mut marked: Vec<String> = Vec::new();
@@ -1935,7 +2012,7 @@ impl Workspace {
             // peer and then opens one local pane would hand that hour to
             // the first project it ever manages to record.
             marked.push(tab.id.clone());
-            let Some(mut project) = crate::projects::project_for_dirs(self.tab_dirs(tab, cx), now)
+            let Some(mut project) = crate::projects::project_for_dirs(self.tab_dirs(tab), now)
             else {
                 continue;
             };
@@ -1992,9 +2069,24 @@ impl Workspace {
         }
         let plan = crate::projects::plan_reopen(&project.dirs, |dir| dir.is_dir());
         let mut terminal_ids: Vec<String> = Vec::with_capacity(plan.spawns.len());
-        for cwd in &plan.spawns {
+        // The tab's memory of its own panes, seeded as they are spawned.
+        let mut remembered = crate::projects::TabPaneDirs::default();
+        for (cwd, wanted) in plan.spawns.iter().zip(project.dirs.iter()) {
             let terminal_id = self.fresh_id();
             self.spawn_pane(terminal_id.clone(), cwd.clone(), cx);
+            // Seeded even for a folder that IS there, so the pane counts as
+            // one of the project's terminals from the instant it opens
+            // rather than from the first fold.
+            remembered.saw(&terminal_id, &crate::hosts::Target::Local, None);
+            if cwd.is_none() {
+                // This folder was gone, so the shell landed in `$HOME`.
+                // Remembering what it was ASKED for keeps the capture's
+                // folders equal to the project's — otherwise `$HOME`
+                // enters `dirs`, and if the missing folder was the
+                // project's PRIMARY one the record would be identified by
+                // whatever came after it instead.
+                remembered.asked_for(&terminal_id, &crate::hosts::Target::Local, wanted.clone());
+            }
             terminal_ids.push(terminal_id);
         }
         let Some(tree) = crate::layout::grid_of(&terminal_ids) else {
@@ -2004,6 +2096,7 @@ impl Workspace {
         self.next_id += 1;
         // The reopen starts the clock, exactly as a fresh tab does.
         self.mark_tab_opened(&tab_id);
+        self.tab_pane_dirs.insert(tab_id.clone(), remembered);
         self.tabs
             .push(Tab::single(tab_id, project.label.clone(), tree));
         self.active_tab = self.tabs.len() - 1;
@@ -2011,9 +2104,9 @@ impl Workspace {
         self.projects_note = crate::projects::missing_dirs_note(&plan.missing);
         // Record the use NOW rather than waiting for the tab to close, so a
         // crash still leaves "you just used this" behind. `record` merges it
-        // into the existing entry by directory set, which is why reopening a
-        // PINNED project moves it up the pinned list instead of dropping an
-        // unpinned twin of itself into recents.
+        // into the existing entry by primary directory, which is why
+        // reopening a PINNED project moves it up the pinned list instead of
+        // dropping an unpinned twin of itself into recents.
         let mut store = crate::projects::ProjectStore::load();
         store.record(crate::projects::touch_for_reopen(
             project,
@@ -2027,6 +2120,13 @@ impl Workspace {
     }
 
     fn close_terminal(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
+        // THIS pane is about to stop existing, whether or not its tab goes
+        // with it, so its folder has to be folded into the tab's memory
+        // now — after the `self.panes.remove` below nothing can ask it
+        // again. Closing a project's panes one at a time is completely
+        // ordinary, and without this the tab would remember only whoever
+        // happened to be last.
+        self.remember_pane_dirs(cx);
         // A tab dies exactly when its LAST terminal goes, and every
         // directory in it dies with it. Capture here, at the top, while the
         // pane is still in `self.panes` and its shell still running — the
@@ -3036,10 +3136,21 @@ impl Workspace {
         // cache: a row's click handler outlives this borrow, and a
         // `Project` is self-contained data (unlike a tab INDEX, which goes
         // stale the moment a tab closes and so is always re-resolved).
-        let pinned: Vec<crate::projects::Project> =
-            self.projects_cache.pinned().into_iter().cloned().collect();
-        let recent: Vec<crate::projects::Project> =
-            self.projects_cache.recent().into_iter().cloned().collect();
+        //
+        // A project that is open right now is the live tab above, so it is
+        // filtered out of RECENT and left in PINNED — `sidebar_sections`
+        // says why. The open sets come from `tab_pane_dirs`, which is
+        // plain data this workspace already holds: no pane is read and no
+        // process is queried to render a frame.
+        let open_now: Vec<Vec<PathBuf>> = self
+            .tabs
+            .iter()
+            .map(|tab| self.tab_dirs(tab))
+            .filter(|dirs| !dirs.is_empty())
+            .collect();
+        let sections = crate::projects::sidebar_sections(&self.projects_cache, &open_now);
+        let pinned: Vec<crate::projects::Project> = sections.pinned.into_iter().cloned().collect();
+        let recent: Vec<crate::projects::Project> = sections.recent.into_iter().cloned().collect();
         for (heading, section) in [("PINNED", &pinned), ("RECENT", &recent)] {
             if section.is_empty() {
                 continue;
@@ -3219,8 +3330,12 @@ impl Workspace {
         self.sidebar_view = view;
         match view {
             // Opening the view must not wait for the next poll to show
-            // what is in the store.
-            SidebarView::Projects => self.projects_cache = crate::projects::ProjectStore::load(),
+            // what is in the store — nor to know which of those projects
+            // is already open, which is what RECENT hides.
+            SidebarView::Projects => {
+                self.projects_cache = crate::projects::ProjectStore::load();
+                self.remember_pane_dirs(cx);
+            }
             SidebarView::Peers => {}
             SidebarView::Git => {
                 if self.git_panel.is_none() {
@@ -5538,8 +5653,8 @@ impl Render for Workspace {
 #[cfg(test)]
 mod peer_attach_tests {
     use super::{
-        attached_tab_label, may_review_pane, may_share_terminal, peer_listing, peer_pollers_needed,
-        peer_target, remote_target_label, search_offer, PeerListing, SearchOffer,
+        PeerListing, SearchOffer, attached_tab_label, may_review_pane, may_share_terminal,
+        peer_listing, peer_pollers_needed, peer_target, remote_target_label, search_offer,
     };
     use crate::companion::auth::PeerId;
     use crate::hosts::{HostOs, ProfileId, RemoteProfile, ShellKind, Target};
