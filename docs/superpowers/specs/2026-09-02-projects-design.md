@@ -50,9 +50,32 @@ directory exists on ANOTHER machine, so reopening it here would silently spawn
 a local shell in a path that may not exist, or worse, may exist and be
 something else entirely.
 
-**Identity is the directory set.** Opening `~/projects/foo` today, quitting,
-and opening it again tomorrow must UPDATE one entry rather than accumulate
-duplicates.
+**Identity is the primary directory** — the first directory in `dirs` that is
+not `$HOME`. Opening `~/projects/foo` today, quitting, and opening it again
+tomorrow must UPDATE one entry rather than accumulate duplicates. The full set
+is still stored, and reopening still spawns one terminal per directory; the set
+just does not decide *which* project this is.
+
+An earlier draft made identity the whole SET, and that forked a project on
+entirely ordinary use. A tab with the repo open and a second terminal sitting
+in `~` to run `brew upgrade` records `{repo, ~}`. The same tab tomorrow,
+without that second terminal, records `{repo}` — a different set, so a second
+record, and recents fill with near-duplicates that differ only by which
+incidental terminal happened to be open at close time. `cd`-ing that second
+terminal from `~` to `/tmp` forks it a third time.
+
+`$HOME` is skipped rather than allowed to be a primary because every launch
+opens a starter tab there: a `$HOME` primary would make every one of them the
+same project. A capture with no non-`$HOME` directory has no primary and
+matches nothing — which changes nothing in practice, since the rule below
+already refuses to record it.
+
+The cost, and it is a real one: **two genuinely separate projects rooted in the
+same folder now merge into one record.** That is a deliberate call — a project
+is the folder you work in, and the terminals beside it come and go — not an
+oversight. A consequence of the same rule: the folders AFTER the primary may be
+reordered, added or dropped freely, but a capture that puts a *different*
+folder first is a different project.
 
 A pinned or renamed project keeps what the user made theirs — its `id`, its
 `label`, its `dirs` — and an auto-capture never overwrites those. It does move
@@ -91,7 +114,10 @@ knows you. Two fields, added while the record's shape is still soft rather than
 retrofitted:
 
 - `terminals: usize` — how many terminals the project had when it was last
-  captured. Answers "how big is this thing" before you open it.
+  captured. Answers "how big is this thing" before you open it. Every pane the
+  tab ever had, not the ones still alive when it died — see "A project is the
+  union of its panes" below, which is the same population its `dirs` come from,
+  so the two halves of a row cannot disagree.
 - `active_secs: u64` — accumulated wall-clock time the project has been open,
   summed across sessions. Answers "how much have I actually worked here",
   which is what separates a real project from a folder visited once.
@@ -138,7 +164,12 @@ later without disturbing anything built here.
 ## Edge cases that need an answer, not a guess
 
 - A directory that no longer exists at reopen time: spawn in `$HOME` and say
-  so, rather than failing silently or refusing to open the project.
+  so, rather than failing silently or refusing to open the project. That pane
+  still contributes the folder it was ASKED for, not the `$HOME` it landed in,
+  for as long as its shell stays in that fallback — otherwise a folder that is
+  temporarily missing would drop out of the project's `dirs` and `$HOME` would
+  take its place. Once the user moves that terminal somewhere real, live cwd is
+  the truth again.
 - A project whose panes are all remote: `dirs` is empty. Do not persist it —
   there is nothing to reopen.
 - **A tab that only ever sat in `$HOME` is not a project.** Every launch opens a
@@ -152,6 +183,23 @@ later without disturbing anything built here.
   can be read — so capture reads a last-known cwd the session caches on a slow
   tick, not the live one. `cwd()` keeps answering "where is it NOW", which is
   `None` for a dead shell and which panels and the folder picker rely on.
+- **A project is the union of its PANES, not a snapshot of its survivors.** A
+  tab dies when its LAST terminal closes, so a capture that reads whoever is
+  still alive records a four-folder project closed one pane at a time as a
+  one-folder project with one terminal — and reopens it as a single shell.
+  Closing panes individually is completely ordinary, so the workspace keeps,
+  per tab, each pane's last known directory, maintained as panes come and go,
+  and capture reads that. The union is over panes and never over time: a pane's
+  entry is REPLACED when its cwd changes, so a shell that `cd`s around all day
+  contributes one directory rather than every directory it ever visited. The
+  map dies with its tab, alongside the tab's other per-tab state.
+- **A project that is open is not also listed in RECENT.** It is the live tab
+  above; listing it twice invites the user to "reopen" what they are looking
+  at. It IS still listed in PINNED when pinned — pinning is a promise that the
+  project is always in that list, and hiding it the moment it is opened would
+  look like pinning had broken. "Open" is decided by the same primary-directory
+  rule identity uses, so a tab that has since picked up an extra terminal
+  somewhere still counts as the project it is.
 - The cap evicts the oldest UNPINNED project only, and never the capture that
   was just recorded: `last_opened` comes from the system clock, so a store
   carrying future timestamps (skew, a restored backup, a hand-edited file) would
