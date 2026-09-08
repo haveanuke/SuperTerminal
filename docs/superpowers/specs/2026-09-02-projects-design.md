@@ -25,6 +25,7 @@ Project {
     id: String,
     label: String,
     dirs: Vec<PathBuf>,
+    anchor: Option<PathBuf>,
     pinned: bool,
     last_opened: SystemTime,
     icon: ProjectIcon,
@@ -50,11 +51,11 @@ directory exists on ANOTHER machine, so reopening it here would silently spawn
 a local shell in a path that may not exist, or worse, may exist and be
 something else entirely.
 
-**Identity is the primary directory** — the first directory in `dirs` that is
-not `$HOME`. Opening `~/projects/foo` today, quitting, and opening it again
-tomorrow must UPDATE one entry rather than accumulate duplicates. The full set
-is still stored, and reopening still spawns one terminal per directory; the set
-just does not decide *which* project this is.
+**Identity is one folder — the project's ANCHOR.** Opening `~/projects/foo`
+today, quitting, and opening it again tomorrow must UPDATE one entry rather
+than accumulate duplicates. The full set is still stored, and reopening still
+spawns one terminal per directory; the set just does not decide *which* project
+this is.
 
 An earlier draft made identity the whole SET, and that forked a project on
 entirely ordinary use. A tab with the repo open and a second terminal sitting
@@ -64,18 +65,66 @@ record, and recents fill with near-duplicates that differ only by which
 incidental terminal happened to be open at close time. `cd`-ing that second
 terminal from `~` to `/tmp` forks it a third time.
 
-`$HOME` is skipped rather than allowed to be a primary because every launch
-opens a starter tab there: a `$HOME` primary would make every one of them the
-same project. A capture with no non-`$HOME` directory has no primary and
-matches nothing — which changes nothing in practice, since the rule below
-already refuses to record it.
+**The anchor is derived from the SET, never from pane order.** The draft after
+that one took "the first directory in `dirs` that is not `$HOME`", and `dirs`
+comes out of the split tree — so its order is LAYOUT, not intent. Rebalancing
+splits, closing and reopening a pane, or restoring a tab a different way all
+reorder it, and every one of those silently changed which project it was. The
+derivation instead:
 
-The cost, and it is a real one: **two genuinely separate projects rooted in the
-same folder now merge into one record.** That is a deliberate call — a project
-is the folder you work in, and the terminals beside it come and go — not an
-oversight. A consequence of the same rule: the folders AFTER the primary may be
-reordered, added or dropped freely, but a capture that puts a *different*
-folder first is a different project.
+1. drop `$HOME`;
+2. of what remains, take the SHALLOWEST path — fewest components. A project's
+   own folder is the ancestor of the folders its terminals wander into, so
+   `/repo` beats `/repo/native` and `/chat` beats `/chat/packages/foo`;
+3. break ties on the same case-insensitive path key everything else here
+   matches on, so two spellings of one path cannot rank differently.
+
+**Not the git root.** It was suggested as an input and is declined
+deliberately, so it is not re-litigated: finding it means touching the
+filesystem, and this decision has to keep working for a folder that has since
+been deleted, renamed or unmounted — exactly when a remembered project matters
+most. It is the same reason `canonicalize` is refused below.
+
+**The anchor is stored on the record and never moves.** Derived fresh on every
+capture it would drift, and the drift is the fork this whole rule exists to
+prevent: open one more folder that ranks ahead of the current anchor — a
+shallower one, or one earlier by key — and the project re-anchors itself, so
+the plain project captured tomorrow no longer matches its own record and lands
+in recents as a second entry, without the pin, the name or the accumulated time
+the first one carried. `/tmp` is the everyday version: it is shallower than any
+real project folder, so one incidental terminal there would otherwise take the
+project's identity with it.
+
+So a capture matches a record when **the record's anchor is still one of the
+folders the capture has**. That is the question asked, not "do the two sets
+derive the same anchor" — a matched record's `dirs` are replaced by the capture
+that matched it, so a derived-to-derived comparison would let its anchor follow
+the capture around and the stored field would be decorative. A capture's own
+derivation names a NEW project and nothing else. When two records both qualify,
+because the capture holds both their anchor folders, the tie goes to the record
+anchored at the capture's own derived anchor, then by the same rank the
+derivation uses — never by storage order, which is insertion order and says
+nothing about which project the user is in.
+
+`$HOME` is excluded before depth is even considered — it is usually the
+shallowest path in the set — because every launch opens a starter tab there: a
+`$HOME` anchor would make every one of them the same project. A capture with no
+non-`$HOME` directory has no anchor and matches nothing, itself included, which
+changes nothing in practice since the rule below already refuses to record it.
+
+**A record written before `anchor` existed gets one when it loads**, derived
+from the `dirs` it does have. Doing it once, on the way in, is what makes "set
+at first capture, never moved after" true for projects first captured before
+there was a field to set. Leaving it empty and deriving on every comparison is
+the drift above; dropping such records would throw away the user's whole
+recents list.
+
+The cost, and it is a real one: **two genuinely separate projects that both
+keep one project's anchor folder open merge into one record.** That is a
+deliberate call — a project is the folder you work in, and the terminals beside
+it come and go — not an oversight. A consequence of the same rule: the folders
+beside the anchor may be reordered, added or dropped freely, but a capture that
+does not have the anchor folder open at all is a different project.
 
 A pinned or renamed project keeps what the user made theirs — its `id`, its
 `label`, its `dirs` — and an auto-capture never overwrites those. It does move
@@ -104,7 +153,10 @@ wrong request: "reopen my project" should return the project, not a menu.
 
 **The label is the user's.** A folder basename is a fine default for one
 directory and useless for four — "chat" is not derivable from those four paths.
-Default to the first directory's basename; keep whatever the user renames it to.
+Default to the ANCHOR's basename; keep whatever the user renames it to.
+Defaulting to `dirs[0]` read pane order and so labelled a project whose first
+pane happened to sit in `$HOME` with home's basename — the one folder in the
+set that carries no intent, and never the anchor.
 
 ## Stats a project carries
 
@@ -166,7 +218,8 @@ later without disturbing anything built here.
 - A directory that no longer exists at reopen time: spawn in `$HOME` and say
   so, rather than failing silently or refusing to open the project. That pane
   still contributes the folder it was ASKED for, not the `$HOME` it landed in,
-  for as long as its shell stays in that fallback — otherwise a folder that is
+  for as long as its shell stays in that fallback — a project whose anchor
+  folder is temporarily missing is still that project — otherwise a folder that is
   temporarily missing would drop out of the project's `dirs` and `$HOME` would
   take its place. Once the user moves that terminal somewhere real, live cwd is
   the truth again.
@@ -197,9 +250,9 @@ later without disturbing anything built here.
   above; listing it twice invites the user to "reopen" what they are looking
   at. It IS still listed in PINNED when pinned — pinning is a promise that the
   project is always in that list, and hiding it the moment it is opened would
-  look like pinning had broken. "Open" is decided by the same primary-directory
-  rule identity uses, so a tab that has since picked up an extra terminal
-  somewhere still counts as the project it is.
+  look like pinning had broken. "Open" is decided by the same anchor rule
+  identity uses, so a tab that has since picked up an extra terminal somewhere
+  still counts as the project it is.
 - The cap evicts the oldest UNPINNED project only, and never the capture that
   was just recorded: `last_opened` comes from the system clock, so a store
   carrying future timestamps (skew, a restored backup, a hand-edited file) would
