@@ -336,10 +336,22 @@ pub const HISTORY_TAIL: usize = 150;
 
 /// Deferred UI -> terminal operations, applied at the next sync.
 enum TermOp {
-    Resize { size: TermSize, window: WindowSize },
+    Resize {
+        size: TermSize,
+        window: WindowSize,
+    },
     Scroll(i32),
-    StartSelection { col: usize, row: usize },
-    UpdateSelection { col: usize, row: usize },
+    StartSelection {
+        col: usize,
+        row: usize,
+        /// True when the press landed in the cell's right half, so the
+        /// boundary is that character's RIGHT edge and it is excluded.
+        side_right: bool,
+    },
+    UpdateSelection {
+        col: usize,
+        row: usize,
+    },
     ClearSelection,
 }
 
@@ -623,10 +635,15 @@ impl TermSession {
         self.deferred.push(TermOp::Scroll(delta));
     }
 
-    pub fn queue_selection_start(&mut self, col: usize, viewport_row: usize) {
+    /// `side` is which edge of the cell the press anchored to. Passing
+    /// `Left` unconditionally — as this used to — includes the character
+    /// under the pointer even when the user pressed in its right half,
+    /// which reads as the selection starting one character too far left.
+    pub fn queue_selection_start(&mut self, col: usize, viewport_row: usize, side_right: bool) {
         self.deferred.push(TermOp::StartSelection {
             col,
             row: viewport_row,
+            side_right,
         });
     }
 
@@ -801,12 +818,20 @@ impl TermSession {
                     }
                 }
                 TermOp::Scroll(delta) => term.scroll_display(Scroll::Delta(delta)),
-                TermOp::StartSelection { col, row } => {
+                TermOp::StartSelection {
+                    col,
+                    row,
+                    side_right,
+                } => {
                     let point = viewport_to_buffer(&term, col, row);
                     term.selection = Some(Selection::new(
                         SelectionType::Simple,
                         point,
-                        alacritty_terminal::index::Side::Left,
+                        if side_right {
+                            alacritty_terminal::index::Side::Right
+                        } else {
+                            alacritty_terminal::index::Side::Left
+                        },
                     ));
                 }
                 TermOp::UpdateSelection { col, row } => {

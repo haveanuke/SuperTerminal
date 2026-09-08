@@ -1187,6 +1187,19 @@ impl TerminalPane {
         (cols, lines)
     }
 
+    /// Which HALF of its cell a press landed in, for anchoring a selection.
+    ///
+    /// `cell_at` answers which cell was pressed and throws the sub-cell
+    /// position away, and the selection anchor then assumed the LEFT edge
+    /// unconditionally — so pressing anywhere in a character, including the
+    /// right-hand 90% where you would click to start selecting AFTER it,
+    /// swallowed that character. That is the "highlight starts one to the
+    /// left" report.
+    fn press_side(&self, pos_x: Pixels, origin_x: Pixels) -> SelectionSide {
+        let x = (f32::from(pos_x) - f32::from(origin_x) - PADDING).max(0.0);
+        selection_side(x, f32::from(self.cell_width))
+    }
+
     fn cell_at(
         &self,
         pos_x: Pixels,
@@ -1199,6 +1212,42 @@ impl TerminalPane {
         let col = (x / f32::from(self.cell_width)) as usize;
         let row = (y / f32::from(self.line_height)) as usize;
         (col, row)
+    }
+}
+
+/// Which edge of a cell a selection boundary sits on.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SelectionSide {
+    /// The boundary is the cell's LEFT edge, so the cell is included when
+    /// the selection extends rightwards.
+    Left,
+    /// The boundary is the cell's RIGHT edge, so the cell is excluded.
+    Right,
+}
+
+/// Which edge a press at `x` (pixels from the grid's left edge) anchors to.
+///
+/// Past the midpoint of a cell means the user is pointing at the gap AFTER
+/// that character, so the boundary belongs on its right edge and the
+/// character is not selected. This is what alacritty's own mouse handling
+/// does, and skipping it is why a drag begun just right of a character
+/// included it anyway.
+///
+/// A zero or negative `cell_width` — its value before the first layout —
+/// yields `Left` rather than dividing by zero. Same hazard the scroll
+/// accumulator had.
+fn selection_side(x: f32, cell_width: f32) -> SelectionSide {
+    if !(cell_width > 0.0) || !x.is_finite() {
+        return SelectionSide::Left;
+    }
+    let within = x % cell_width;
+    // The midpoint itself counts as the right half: at exactly half a cell
+    // the pointer is nearer the following character's edge than the
+    // preceding one's, and a stated tie-break beats an inherited one.
+    if within * 2.0 >= cell_width {
+        SelectionSide::Right
+    } else {
+        SelectionSide::Left
     }
 }
 
@@ -3083,7 +3132,8 @@ impl Render for TerminalPane {
                         this.last_origin_x(),
                         this.last_origin_y(),
                     );
-                    this.handle_click(col, row, cx);
+                    let side = this.press_side(event.position.x, this.last_origin_x());
+                    this.handle_click(col, row, side, cx);
                 }),
             )
             .on_mouse_move(
@@ -3277,7 +3327,13 @@ impl TerminalPane {
         url_in_row(&text, col)
     }
 
-    fn handle_click(&mut self, col: usize, row: usize, cx: &mut Context<Self>) {
+    fn handle_click(
+        &mut self,
+        col: usize,
+        row: usize,
+        side: SelectionSide,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = &self.snapshot;
         // Click-to-move guards (ported from the web app): prompt row only, at
         // bottom, no selection, no app mouse tracking, normal buffer implied
@@ -3335,7 +3391,7 @@ impl TerminalPane {
         // structurally unreachable while attached.
         if let Some(session) = self.session.as_mut() {
             session.queue_selection_clear();
-            session.queue_selection_start(col, row);
+            session.queue_selection_start(col, row, side == SelectionSide::Right);
         }
         self.selecting = true;
         self.drag_position = None;
@@ -3348,8 +3404,8 @@ mod tests {
     use super::{
         attached_paint_frame, busy_dot, clamp_attached_offset, coalesce_runs, container_background,
         drag_scroll_lines, local_paint_frame, may_broadcast_locally, parse_wire_hex,
-        scroll_lines_from_delta, windowed_wire_rows, wire_paint_frame, CellLook, ContainerBg, Run,
-        COMPANION_BUSY_WINDOW,
+        scroll_lines_from_delta, selection_side, windowed_wire_rows, wire_paint_frame, CellLook,
+        ContainerBg, Run, SelectionSide, COMPANION_BUSY_WINDOW,
     };
     use crate::companion::wire::{WireCursor, WireRun, WireSnapshot};
     use crate::hosts::{ProfileId, Target};
@@ -4090,6 +4146,48 @@ mod tests {
         let wire = wire_snapshot_with_history(history, rows, "#123456");
         let attached = attached_paint_frame(&wire, 2);
         assert_eq!(row_labels(&attached.rows), vec!["h3", "h4", "r0"]);
+    }
+
+    #[test]
+    fn a_press_in_the_left_half_of_a_character_selects_that_character() {
+        // The ordinary case, and the one that already worked: press on or
+        // near a character's left edge and it is included.
+        assert_eq!(selection_side(0.0, 10.0), SelectionSide::Left);
+        assert_eq!(selection_side(4.9, 10.0), SelectionSide::Left);
+        // And the same position in a later cell, to prove it is the offset
+        // WITHIN the cell that decides, not the absolute x.
+        assert_eq!(selection_side(30.0, 10.0), SelectionSide::Left);
+        assert_eq!(selection_side(34.9, 10.0), SelectionSide::Left);
+    }
+
+    #[test]
+    fn a_press_in_the_right_half_of_a_character_does_not_select_it() {
+        // The reported bug. Pressing here means "start after this
+        // character", and anchoring Left regardless swallowed it — which
+        // reads as the highlight starting one character too far left.
+        assert_eq!(selection_side(5.0, 10.0), SelectionSide::Right);
+        assert_eq!(selection_side(9.9, 10.0), SelectionSide::Right);
+        assert_eq!(selection_side(35.0, 10.0), SelectionSide::Right);
+    }
+
+    #[test]
+    fn the_exact_midpoint_counts_as_the_right_half() {
+        // Stated rather than inherited: at exactly half a cell the pointer
+        // is nearer the following character's edge than the preceding
+        // one's.
+        assert_eq!(selection_side(5.0, 10.0), SelectionSide::Right);
+        assert_eq!(selection_side(4.999, 10.0), SelectionSide::Left);
+    }
+
+    #[test]
+    fn a_zero_cell_width_cannot_divide_by_zero() {
+        // `cell_width` is 0 before the first layout — the same hazard the
+        // scroll accumulator had. A press then anchors Left rather than
+        // producing NaN.
+        assert_eq!(selection_side(12.0, 0.0), SelectionSide::Left);
+        assert_eq!(selection_side(12.0, -4.0), SelectionSide::Left);
+        assert_eq!(selection_side(f32::NAN, 10.0), SelectionSide::Left);
+        assert_eq!(selection_side(f32::INFINITY, 10.0), SelectionSide::Left);
     }
 
     #[test]
