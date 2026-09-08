@@ -977,8 +977,29 @@ impl TerminalPane {
             .join("\n")
     }
 
+    /// Arm or clear this pane's repeating command.
+    ///
+    /// Refused outright on a pane that views another machine. Gating only the
+    /// TICK LOOP is not enough and an earlier version of this made exactly
+    /// that mistake: the first run fires HERE, immediately, so suppressing
+    /// every repeat still let one unattended command execute on someone
+    /// else's Mac the moment the overlay was submitted. The repeat guard in
+    /// the pump stays as well — two gates, because the consequence of a gap
+    /// is a command running on a machine nobody is looking at.
     pub fn set_auto_run(&mut self, config: Option<(String, u32, bool, u32)>) {
-        self.auto_run = config;
+        // Through `auto_run_for`, the same function the tick loop uses, so
+        // the two gates cannot drift apart in BEHAVIOUR. They already did
+        // once: the loop was gated and this was not, and because the first
+        // run fires below rather than on a tick, suppressing every repeat
+        // still let one command execute on another Mac.
+        //
+        // Honest about what is covered: `auto_run_for` has a test, but this
+        // CALL is entity-bound and no test reaches it — replacing this line
+        // with a bare assignment still compiles and still passes the whole
+        // suite. Verified by reading. If a third site ever needs the config,
+        // route it through the same function rather than re-deriving the
+        // check.
+        self.auto_run = auto_run_for(config, self.views_remote());
         self.auto_run_tick = 0;
         // First run fires immediately (old-app behavior); the tick loop
         // handles every repeat after this.
@@ -4452,6 +4473,12 @@ mod attached_input_tests {
         // A timer that types on its own is fine aimed at your own shell and
         // is not fine aimed at someone else's. This became reachable the
         // moment write_self learned to route to a peer.
+        //
+        // This guards BOTH sites, which is why they were made to share it:
+        // `set_auto_run` (whose first run fires immediately, on submit) and
+        // the pump's repeat loop. Gating only the loop left the immediate
+        // run live — one command on another Mac is not a smaller bug than
+        // many.
         let config = Some(("echo hi".to_string(), 5u64, false, 1u64));
         assert_eq!(
             super::auto_run_for(config.clone(), true),
