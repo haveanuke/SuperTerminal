@@ -2,7 +2,7 @@
 //! flyout, preview-folder plumbing), split from the workspace. Pure
 //! move — behavior identical.
 
-use gpui::{Context, MouseButton, SharedString, div, px, rgb};
+use gpui::{div, px, rgb, Context, MouseButton, SharedString};
 use std::sync::Arc;
 
 use super::*;

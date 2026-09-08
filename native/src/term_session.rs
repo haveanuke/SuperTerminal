@@ -1487,15 +1487,31 @@ mod agent_state_tests {
     }
 }
 
+/// PTY spawn/teardown uses process-global signal handling (signal-hook
+/// SIGCHLD registration inside alacritty's tty layer); concurrent
+/// registration/unregistration across test threads can deadlock teardown,
+/// and under contention a spawn can simply fail.
+///
+/// Crate-wide rather than per-module BECAUSE the hazard is process-global.
+/// `term_session`'s own tests took this lock from the start; the companion
+/// e2e suite spawns real PTYs too and did not, which is where the
+/// intermittent `session spawns: "Unknown error: -6"` came from. One lock,
+/// or the two suites serialize against themselves and race each other.
+///
+/// Every test that spawns a `TermSession` must take it.
+#[cfg(test)]
+pub(crate) static PTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`PTY_TEST_LOCK`], ignoring poisoning — a panicking test must not
+/// wedge every later PTY test behind it.
+#[cfg(test)]
+pub(crate) fn pty_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// PTY spawn/teardown uses process-global signal handling (signal-hook
-    /// SIGCHLD registration inside alacritty's tty layer); concurrent
-    /// registration/unregistration across test threads can deadlock teardown.
-    /// Serialize every PTY test.
-    static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_session(cols: usize, lines: usize, cwd: Option<PathBuf>) -> TermSession {
         TermSession::spawn_with_shell(
@@ -1534,7 +1550,7 @@ mod tests {
 
     #[test]
     fn round_trip_output_lands_in_snapshot() {
-        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, None);
         session.write(b"printf 'NATIVE_%s\\n' OK\r".to_vec());
         let snapshot = wait_for(&mut session, |s| grid_contains(s, "NATIVE_OK"), 15);
@@ -1554,7 +1570,7 @@ mod tests {
 
     #[test]
     fn exit_surfaces_event_and_snapshot_flag() {
-        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, None);
         session.write(b"exit 7\r".to_vec());
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -1578,7 +1594,7 @@ mod tests {
 
     #[test]
     fn resize_applies_on_sync() {
-        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, None);
         session.queue_resize(100, 30, 8, 16);
         let snapshot = session.sync_and_snapshot();
@@ -1595,7 +1611,7 @@ mod tests {
         // shell exits, and the process whose directory it would read is
         // gone — so a project closed by typing `exit`, the commonest way
         // there is, was captured with no directories and silently dropped.
-        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, Some(PathBuf::from("/private/tmp")));
         let _ = wait_for(
             &mut session,
@@ -1645,7 +1661,7 @@ mod tests {
 
     #[test]
     fn cwd_reports_working_directory() {
-        let _serial = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, Some(PathBuf::from("/private/tmp")));
         // Wait for the shell to actually start before asking for its cwd.
         let _ = wait_for(

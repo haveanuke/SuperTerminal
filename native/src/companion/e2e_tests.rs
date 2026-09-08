@@ -39,6 +39,8 @@ fn post_text(host: &str, id: &str, text: &str) -> String {
 
 #[test]
 fn phone_input_round_trips_to_sse_snapshot() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     let hub = Arc::new(Hub::new());
     hub.register("t1", "e2e", session.input_sender());
@@ -149,6 +151,8 @@ fn phone_input_round_trips_to_sse_snapshot() {
 
 #[test]
 fn phone_sessions_list_is_unaffected_by_peer_scoping() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     // Task 2 routes `/sessions` through `hub.sessions_for(&principal)`.
     // This is the end-to-end regression guard: the phone must still see
     // every registered session over the wire, not a peer-scoped subset —
@@ -203,6 +207,8 @@ fn phone_sessions_list_is_unaffected_by_peer_scoping() {
 
 #[test]
 fn the_peer_byte_sink_rejects_the_phone_token() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     // Route admission, not just authentication. The phone authenticates
     // fine; it must still be refused this route, because it has its own
     // symbolic endpoint. This is what proves Task 1's table is ENFORCED
@@ -260,6 +266,8 @@ fn the_peer_byte_sink_rejects_the_phone_token() {
 
 #[test]
 fn a_paired_peer_can_view_its_shared_session_but_not_manage_or_preview() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     // The composition proof: Task 1's admission table, Task 3's grants and
     // Task 2's scoping each have to independently agree for this to work.
     // A real peer secret, paired with `view` only, must be able to list
@@ -383,6 +391,8 @@ fn a_paired_peer_can_view_its_shared_session_but_not_manage_or_preview() {
 
 #[test]
 fn a_peer_without_the_view_grant_is_refused_the_session_list() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     // /sessions is admitted to a Peer by the route table alone (Task 1), so
     // a refusal here can ONLY come from the grant check (Task 3) — this is
     // the leg the composition test above cannot prove: with `view` granted,
@@ -451,6 +461,8 @@ fn a_peer_without_the_view_grant_is_refused_the_session_list() {
 
 #[test]
 fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     // A peer is authenticated but still untrusted input: an oversized
     // payload must be refused by the generic body cap before anything
     // tries to interpret it as a byte array.
@@ -508,6 +520,8 @@ fn the_peer_byte_sink_rejects_a_payload_over_max_body() {
 
 #[test]
 fn version_advertises_a_protocol_and_capabilities() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     let hub = Arc::new(Hub::new());
     hub.register("t1", "e2e", session.input_sender());
@@ -564,6 +578,8 @@ fn version_advertises_a_protocol_and_capabilities() {
 
 #[test]
 fn scrolled_back_host_still_publishes_the_live_screen() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     // 200 tagged lines so the viewport is deep in scrollback territory.
     session.write(b"printf 'L_%s\\n' $(seq 1 200)\r".to_vec());
@@ -622,6 +638,8 @@ fn scrolled_back_host_still_publishes_the_live_screen() {
 
 #[test]
 fn history_tail_rides_the_companion_snapshot() {
+    // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+    let _pty = crate::term_session::pty_test_guard();
     let mut session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
     // 200 tagged lines: ~176 land in scrollback above the 24-line viewport.
     session.write(b"printf 'L_%s\\n' $(seq 1 200)\r".to_vec());

@@ -298,6 +298,8 @@ mod tests {
 
     #[test]
     fn a_valid_get_returns_parseable_json() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "peer-client-one", session.input_sender());
@@ -344,6 +346,8 @@ mod tests {
 
     #[test]
     fn a_wrong_secret_returns_the_error_variant_not_a_panic_or_success() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "peer-client-two", session.input_sender());
@@ -384,6 +388,8 @@ mod tests {
 
     #[test]
     fn a_valid_post_succeeds() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "peer-client-three", session.input_sender());

@@ -359,6 +359,8 @@ mod tests {
 
     #[test]
     fn an_open_stream_survives_a_real_heartbeat_and_delivers_a_second_published_snapshot() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "peer-stream-one", session.input_sender());

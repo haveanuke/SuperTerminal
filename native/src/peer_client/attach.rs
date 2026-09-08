@@ -626,6 +626,8 @@ mod tests {
 
     #[test]
     fn attaching_to_a_shared_session_reaches_live_and_receives_a_snapshot() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "attach-live", session.input_sender());
@@ -682,6 +684,8 @@ mod tests {
 
     #[test]
     fn freshness_tracks_the_gap_since_the_last_frame_not_socket_health() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "attach-fresh", session.input_sender());
@@ -765,6 +769,8 @@ mod tests {
 
     #[test]
     fn a_clean_stream_end_reaches_gone_quickly_not_by_waiting_out_the_idle_gap() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         // The mirror of the freshness test above: THIS is "the socket
         // died" (well, cleanly ended), and it must be visible fast, via a
         // completely different mechanism than the elapsed-time gap check.
@@ -843,6 +849,8 @@ mod tests {
 
     #[test]
     fn attaching_to_an_unshared_session_reaches_refused_and_does_not_reconnect() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "attach-refused", session.input_sender());

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, MouseButton, MouseMoveEvent, MouseUpEvent,
-    Pixels, SharedString, Window, div, px, rgb,
+    div, px, rgb, App, Context, Entity, FocusHandle, Focusable, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, SharedString, Window,
 };
 
 use superterminal_core::activity::Activity;
@@ -22,7 +22,7 @@ use superterminal_core::session::SessionManager;
 use crate::buddy_pet::Companion;
 use crate::git_panel::GitPanel;
 use crate::layout::{
-    Layout, PaneNode, SplitDirection, Tab, collect_terminal_ids, insert_split, remove_terminal,
+    collect_terminal_ids, insert_split, remove_terminal, Layout, PaneNode, SplitDirection, Tab,
 };
 use crate::pane::{BroadcastHub, PaneEvent, TerminalPane};
 use crate::peer_client::sessions::SessionPoller as PeerSessionPoller;
@@ -782,29 +782,25 @@ impl Workspace {
             async {}
         })
         .detach();
-        cx.spawn(async move |ws, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(4)).await;
-                if ws
-                    .update(cx, |ws: &mut Workspace, cx| ws.buddy_tick(cx))
-                    .is_err()
-                {
-                    break;
-                }
+        cx.spawn(async move |ws, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            if ws
+                .update(cx, |ws: &mut Workspace, cx| ws.buddy_tick(cx))
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
-        cx.spawn(async move |ws, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(300))
-                    .await;
-                if ws
-                    .update(cx, |ws: &mut Workspace, cx| ws.pet_tick(cx))
-                    .is_err()
-                {
-                    break;
-                }
+        cx.spawn(async move |ws, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            if ws
+                .update(cx, |ws: &mut Workspace, cx| ws.pet_tick(cx))
+                .is_err()
+            {
+                break;
             }
         })
         .detach();
@@ -5654,8 +5650,8 @@ impl Render for Workspace {
 #[cfg(test)]
 mod peer_attach_tests {
     use super::{
-        PeerListing, SearchOffer, attached_tab_label, may_review_pane, may_share_terminal,
-        peer_listing, peer_pollers_needed, peer_target, remote_target_label, search_offer,
+        attached_tab_label, may_review_pane, may_share_terminal, peer_listing, peer_pollers_needed,
+        peer_target, remote_target_label, search_offer, PeerListing, SearchOffer,
     };
     use crate::companion::auth::PeerId;
     use crate::hosts::{HostOs, ProfileId, RemoteProfile, ShellKind, Target};

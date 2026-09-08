@@ -480,6 +480,8 @@ mod tests {
 
     #[test]
     fn the_poller_reads_a_real_peers_sessions_and_notices_one_ending() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         let session = TermSession::spawn(80, 24, 8, 16, None).expect("session spawns");
         let hub = Arc::new(Hub::new());
         hub.register("t1", "poller-live", session.input_sender());
@@ -587,6 +589,8 @@ mod tests {
 
     #[test]
     fn a_failed_poll_replaces_a_previous_list_rather_than_leaving_it_standing() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         // A list fetched before the peer went away cannot say what it has
         // now. This is the same rule the pane's stale-attachment check
         // enforces for frames, applied to the other signal.

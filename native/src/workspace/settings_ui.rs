@@ -2,7 +2,7 @@
 //! the workspace (same module tree: private Workspace fields stay
 //! reachable). Pure move — behavior identical.
 
-use gpui::{Context, MouseButton, SharedString, Window, div, px, rgb};
+use gpui::{div, px, rgb, Context, MouseButton, SharedString, Window};
 
 use super::*;
 use crate::companion::auth::PeerId;

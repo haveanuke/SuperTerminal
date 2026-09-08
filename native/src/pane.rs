@@ -5557,6 +5557,8 @@ mod attached_activity_tests {
     /// emit are the ones this rule was written for.
     #[test]
     fn the_two_real_signals_compose_the_way_the_rule_says_they_do() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         use crate::companion::auth::PeerId;
         use crate::companion::hub::tests::RegisterLocalPty;
         use crate::companion::hub::Hub;

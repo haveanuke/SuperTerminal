@@ -1865,6 +1865,8 @@ mod tab_memory_tests {
 
     #[test]
     fn reopening_a_project_with_a_missing_folder_does_not_fork_the_record() {
+        // PTY spawn/teardown is process-global; see `term_session::PTY_TEST_LOCK`.
+        let _pty = crate::term_session::pty_test_guard();
         // End to end over the decisions `open_project` and the capture use
         // between them: plan the reopen, seed the tab's memory the way
         // `open_project` does, let the fallback shell report `$HOME`, then
