@@ -83,6 +83,28 @@ wrong request: "reopen my project" should return the project, not a menu.
 directory and useless for four — "chat" is not derivable from those four paths.
 Default to the first directory's basename; keep whatever the user renames it to.
 
+## Stats a project carries
+
+Orca's "Welcome back" dashboard shows agent count and runtime hours per
+project, and that metadata is most of what makes a resume screen feel like it
+knows you. Two fields, added while the record's shape is still soft rather than
+retrofitted:
+
+- `terminals: usize` — how many terminals the project had when it was last
+  captured. Answers "how big is this thing" before you open it.
+- `active_secs: u64` — accumulated wall-clock time the project has been open,
+  summed across sessions. Answers "how much have I actually worked here",
+  which is what separates a real project from a folder visited once.
+
+Both are captured, never entered. `active_secs` accrues from when a tab is
+created (or reopened) to when it is captured; a session that never closes
+cleanly loses that increment rather than inventing one.
+
+A note on what NOT to copy: Orca counts agents because a task there IS an
+agent in a worktree. Here a terminal is the unit, so counting terminals is the
+honest analogue and counting "agents" would mean inferring which panes happen
+to be running one.
+
 ## Icons
 
 No emoji in this UI. `icons.rs` holds six hand-drawn SVGs and none of them

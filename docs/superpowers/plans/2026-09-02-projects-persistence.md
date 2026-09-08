@@ -91,7 +91,7 @@ remote panes yields nothing; duplicates collapse; order is stable.
 
 ---
 
-### Task 3: The list, and reopening
+### Task 3: The list, reopening, and what a project shows about itself
 
 **Files:**
 - Modify: `native/src/workspace/mod.rs`
@@ -99,6 +99,17 @@ remote panes yields nothing; duplicates collapse; order is stable.
 A pinned section, then a recent section, in the existing projects sidebar.
 Clicking either spawns one terminal per remembered directory in a new tab
 labelled with the project's label.
+
+**Each row also carries what the project is**, not just its name: its folder
+count, its terminal count, and how long it has been worked in. `Project` gains
+`terminals: usize` and `active_secs: u64` (see the spec's "Stats a project
+carries"), both captured rather than entered. `active_secs` accrues from tab
+creation or reopen until capture; a session that never closes cleanly loses
+that increment rather than inventing one.
+
+Format the numbers in a pure function and test it: zero, one and many for each;
+sub-minute durations reading as such rather than "0h"; and a project captured
+twice accumulating rather than overwriting its time.
 
 **A directory that no longer exists** spawns in `$HOME` with a visible note
 rather than failing silently or refusing the whole project — the other three
