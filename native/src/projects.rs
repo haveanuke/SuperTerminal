@@ -69,12 +69,31 @@ pub fn projects_path() -> PathBuf {
     crate::settings::settings_dir().join("projects.json")
 }
 
-/// Directory-set equality: same members, order irrelevant. Used to decide
-/// whether an incoming auto-capture is "the same project" as an existing
-/// unpinned, unrenamed record.
+/// The key a directory matches on: its path, lowercased.
+///
+/// A decision, not an oversight. macOS volumes are case-insensitive by
+/// default, so `/Users/me/Documents` and `/Users/me/documents` are ONE
+/// directory that a case-sensitive comparison would record as two separate
+/// projects — and both spellings genuinely occur, since a shell's `cd`
+/// preserves whatever the user typed.
+///
+/// Not `canonicalize`: that hits the filesystem, fails outright for a
+/// directory that has since been deleted (a case this feature must survive,
+/// since a remembered project outlives its folder), and resolves symlinks,
+/// which would silently merge two projects a user deliberately keeps apart.
+/// Lowercasing is wrong only on a case-SENSITIVE volume, where it can merge
+/// two directories differing only in case — rare, and a far smaller harm
+/// than splitting one project in two on the default configuration.
+fn dir_key(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase()
+}
+
+/// Directory-set equality: same members, order irrelevant, case-insensitive.
+/// Used to decide whether an incoming auto-capture is "the same project" as
+/// an existing record.
 fn same_dir_set(a: &[PathBuf], b: &[PathBuf]) -> bool {
-    let a: HashSet<&Path> = a.iter().map(PathBuf::as_path).collect();
-    let b: HashSet<&Path> = b.iter().map(PathBuf::as_path).collect();
+    let a: HashSet<String> = a.iter().map(|p| dir_key(p)).collect();
+    let b: HashSet<String> = b.iter().map(|p| dir_key(p)).collect();
     a == b
 }
 
@@ -118,31 +137,55 @@ impl ProjectStore {
     ///   and the incoming capture becomes its own new record instead;
     /// - recording evicts only the oldest UNPINNED project once the unpinned
     ///   count exceeds the cap.
-    pub fn record(&mut self, project: Project) {
+    pub fn record(&mut self, mut project: Project) {
+        // Deduped on the way in, not just for matching. Two panes in the
+        // same directory are one directory, and storing it twice would make
+        // reopening spawn two shells in the same place.
+        let mut seen = HashSet::new();
+        project.dirs.retain(|d| seen.insert(dir_key(d)));
         if project.dirs.is_empty() {
             return;
         }
-        let existing = self
+        // A pinned or renamed record still MATCHES — it just is not
+        // overwritten. Only its `last_opened` moves, which is what keeps the
+        // pinned list ordered by use and stops a second, unpinned copy of
+        // the same project accumulating in recents every time it is opened.
+        // The spec's rule is that such a record keeps its `id`, and it does.
+        if let Some(existing) = self
             .projects
             .iter_mut()
-            .find(|p| !p.pinned && !p.renamed && same_dir_set(&p.dirs, &project.dirs));
-        if let Some(existing) = existing {
+            .find(|p| same_dir_set(&p.dirs, &project.dirs))
+        {
             existing.last_opened = project.last_opened;
+            if !existing.pinned && !existing.renamed {
+                existing.label = project.label;
+                existing.dirs = project.dirs;
+                existing.icon = project.icon;
+            }
             return;
         }
         self.projects.push(project);
-        self.evict_past_cap();
+        let just_added = self.projects.len() - 1;
+        self.evict_past_cap(just_added);
     }
 
     /// Drop the oldest unpinned project(s) until the unpinned count is back
-    /// at or under `RECENT_CAP`. Pinned projects are never candidates.
-    fn evict_past_cap(&mut self) {
+    /// at or under `RECENT_CAP`. Pinned projects are never candidates, and
+    /// neither is `keep`.
+    ///
+    /// `keep` is the project just recorded, and excluding it is not a
+    /// nicety: `last_opened` comes from the system clock, so a store whose
+    /// entries carry future timestamps — clock skew, a restored backup, a
+    /// hand-edited file — would make every new capture the "oldest" and
+    /// silently discard it, permanently and invisibly. A capture the user
+    /// just made must survive the write that made it.
+    fn evict_past_cap(&mut self, keep: usize) {
         while self.projects.iter().filter(|p| !p.pinned).count() > RECENT_CAP {
             let oldest = self
                 .projects
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| !p.pinned)
+                .filter(|(i, p)| !p.pinned && *i != keep)
                 .min_by_key(|(_, p)| p.last_opened)
                 .map(|(i, _)| i);
             match oldest {
@@ -415,28 +458,129 @@ mod tests {
     }
 
     #[test]
-    fn record_does_not_merge_into_a_pinned_project() {
+    fn a_just_recorded_project_survives_even_against_future_timestamps() {
+        // `last_opened` comes from the system clock. A store carrying FUTURE
+        // timestamps — clock skew, a restored backup, a hand-edited file —
+        // would make every new capture the "oldest" and evict it the instant
+        // it was recorded, silently and permanently: the user would close a
+        // project and find it had never been remembered, forever.
+        let mut store = ProjectStore::default();
+        for i in 0..RECENT_CAP {
+            store.projects.push(project(
+                &format!("old-{i}"),
+                &[&format!("/p{i}")],
+                1_000 + i as u64,
+            ));
+        }
+        store.record(project("newcomer", &["/newcomer"], 5));
+        assert!(
+            store.projects.iter().any(|p| p.id == "newcomer"),
+            "the capture the user just made must not be the one evicted"
+        );
+        assert_eq!(
+            store.projects.iter().filter(|p| !p.pinned).count(),
+            RECENT_CAP,
+            "and the cap still holds"
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_one_directory_are_one_project() {
+        // macOS volumes are case-insensitive by default, and both spellings
+        // genuinely occur because a shell's `cd` keeps whatever was typed.
+        // Matching case-sensitively split one project into two records that
+        // the user would see as duplicates of the same thing.
+        let mut store = ProjectStore::default();
+        store.record(project("a", &["/Users/me/Documents/proj"], 100));
+        store.record(project("b", &["/Users/me/documents/proj"], 200));
+        assert_eq!(store.projects.len(), 1, "one directory, one project");
+        assert_eq!(store.projects[0].id, "a", "the first record keeps its id");
+        assert_eq!(store.projects[0].last_opened, 200);
+    }
+
+    #[test]
+    fn the_same_directory_twice_is_stored_once() {
+        // Two panes in one folder are one folder. Storing it twice would
+        // make reopening the project spawn two shells in the same place.
+        let mut store = ProjectStore::default();
+        store.record(project("a", &["/x", "/x", "/y"], 100));
+        assert_eq!(
+            store.projects[0].dirs,
+            vec![PathBuf::from("/x"), PathBuf::from("/y")],
+            "deduped, and in first-seen order"
+        );
+    }
+
+    #[test]
+    fn a_partial_file_fills_defaults_rather_than_being_discarded() {
+        // The sibling of the corrupt-file test, and the one that actually
+        // pins `#[serde(default)]`: a record written by an older build is
+        // missing fields a newer one expects, and must load with defaults
+        // rather than taking the whole list down with it.
+        let dir = std::env::temp_dir().join(format!("st-projects-partial-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("projects.json");
+        std::fs::write(
+            &path,
+            r#"{"projects":[{"id":"p1","label":"chat","dirs":["/chat"]}]}"#,
+        )
+        .unwrap();
+        let store = ProjectStore::load_from(&path);
+        assert_eq!(store.projects.len(), 1, "the record must survive");
+        assert_eq!(store.projects[0].id, "p1");
+        assert!(
+            !store.projects[0].pinned,
+            "absent `pinned` defaults to false"
+        );
+        assert!(
+            !store.projects[0].renamed,
+            "absent `renamed` defaults to false"
+        );
+        assert_eq!(store.projects[0].last_opened, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pinned_project_keeps_its_identity_but_still_tracks_when_it_was_used() {
+        // The rule is that a pinned record keeps what the user made
+        // theirs — its id, label and dirs — NOT that reopening it is
+        // invisible to the store.
+        //
+        // An earlier reading froze `last_opened` too, and a review showed
+        // what that costs: `pinned()` sorts on it, so the pinned list's
+        // order would be stuck at pin time forever, AND every reopen would
+        // leave a second, unpinned copy of the same project in recents.
         let mut store = ProjectStore::default();
         let mut original = project("pinned-1", &["/chat", "/board-kid"], 100);
         original.pinned = true;
+        original.label = "chat".to_string();
         store.projects.push(original);
 
         store.record(project("auto-2", &["/chat", "/board-kid"], 500));
 
         assert_eq!(store.pinned().len(), 1);
-        assert_eq!(store.pinned()[0].id, "pinned-1");
+        assert_eq!(store.pinned()[0].id, "pinned-1", "the id is the identity");
+        assert_eq!(
+            store.pinned()[0].label,
+            "chat",
+            "and the name the user gave it is not overwritten by a capture"
+        );
         assert_eq!(
             store.pinned()[0].last_opened,
-            100,
-            "the pinned record's own last_opened must not move"
+            500,
+            "but using it must move it up the pinned list"
         );
-        let recent = store.recent();
-        assert_eq!(recent.len(), 1, "the new capture becomes its own record");
-        assert_eq!(recent[0].id, "auto-2");
+        assert!(
+            store.recent().is_empty(),
+            "and it must NOT also appear as a duplicate in recents"
+        );
     }
 
     #[test]
-    fn record_does_not_merge_into_a_renamed_project() {
+    fn a_renamed_project_keeps_the_name_the_user_gave_it() {
+        // Same rule as pinned: the user's label survives a capture that
+        // would otherwise overwrite it with a folder basename, and the
+        // record is not duplicated — but reopening still counts as use.
         let mut store = ProjectStore::default();
         let mut original = project("renamed-1", &["/chat", "/board-kid"], 100);
         original.renamed = true;
@@ -446,14 +590,13 @@ mod tests {
         store.record(project("auto-2", &["/chat", "/board-kid"], 500));
 
         let recent = store.recent();
+        assert_eq!(recent.len(), 1, "no duplicate of the same project");
+        assert_eq!(recent[0].id, "renamed-1");
         assert_eq!(
-            recent.len(),
-            2,
-            "a renamed record is not merged into; both remain"
+            recent[0].label, "Chat stack",
+            "an auto-capture must never rename a project back"
         );
-        let renamed = recent.iter().find(|p| p.id == "renamed-1").unwrap();
-        assert_eq!(renamed.last_opened, 100, "renamed record is untouched");
-        assert_eq!(renamed.label, "Chat stack");
+        assert_eq!(recent[0].last_opened, 500, "but it did just get used");
     }
 
     #[test]

@@ -50,11 +50,30 @@ directory exists on ANOTHER machine, so reopening it here would silently spawn
 a local shell in a path that may not exist, or worse, may exist and be
 something else entirely.
 
-**Identity is the directory set, for auto-captured projects.** Opening
-`~/projects/foo` today, quitting, and opening it again tomorrow must UPDATE one
-recent entry rather than accumulate duplicates. A project the user has renamed
-or pinned keeps its `id` and is never merged into by this rule — once it is
-theirs, its identity is the id, not the paths.
+**Identity is the directory set.** Opening `~/projects/foo` today, quitting,
+and opening it again tomorrow must UPDATE one entry rather than accumulate
+duplicates.
+
+A pinned or renamed project keeps what the user made theirs — its `id`, its
+`label`, its `dirs` — and an auto-capture never overwrites those. It does move
+its `last_opened`, because that is what "you just used this" means, and an
+earlier draft that froze it was wrong twice over: `pinned()` sorts on
+`last_opened`, so the pinned list's order would be stuck at pin time forever,
+and every reopen would leave a second unpinned copy of the same project sitting
+in recents.
+
+**Directories match case-insensitively.** macOS volumes are case-insensitive by
+default and both spellings genuinely occur, since a shell's `cd` preserves
+whatever was typed — this session's own environment carries
+`/Users/…/Documents/…` and `/Users/…/documents/…` for one directory. Matching
+case-sensitively would record one project twice. Not `canonicalize`: it touches
+the filesystem, fails for a directory that has since been deleted (which a
+remembered project must outlive), and resolves symlinks, silently merging
+projects a user deliberately keeps apart.
+
+**A project's directories are deduped on capture.** Two panes in one folder are
+one folder; storing it twice would make reopening spawn two shells in the same
+place.
 
 **Reopening spawns the shells.** Four directories means four terminals,
 immediately. Listing them and spawning on demand is lighter but answers the
@@ -100,7 +119,10 @@ later without disturbing anything built here.
   so, rather than failing silently or refusing to open the project.
 - A project whose panes are all remote: `dirs` is empty. Do not persist it —
   there is nothing to reopen.
-- The cap evicts the oldest UNPINNED project only.
+- The cap evicts the oldest UNPINNED project only, and never the capture that
+  was just recorded: `last_opened` comes from the system clock, so a store
+  carrying future timestamps (skew, a restored backup, a hand-edited file) would
+  otherwise make every new capture the oldest and discard it permanently.
 - Pinning applies to a project whether it is currently open or sitting in
   recents.
 
