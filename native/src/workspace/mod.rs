@@ -1438,7 +1438,8 @@ impl Workspace {
                 // written by other paths (a capture, a quit). Re-read it on
                 // the poll, never during render.
                 self.projects_cache = crate::projects::ProjectStore::load();
-                // Which projects are OPEN decides what RECENT hides, and a
+                // Which projects are OPEN decides what both remembered
+                // sections hide, and a
                 // shell that has just `cd`ed can change that. Fold here for
                 // the same reason the cache is reloaded here: the render
                 // must not go asking panes anything.
@@ -3721,7 +3722,7 @@ impl Workspace {
         match view {
             // Opening the view must not wait for the next poll to show
             // what is in the store — nor to know which of those projects
-            // is already open, which is what RECENT hides.
+            // is already open, which is what BOTH remembered sections hide.
             SidebarView::Projects => {
                 self.projects_cache = crate::projects::ProjectStore::load();
                 self.remember_pane_dirs(cx);
