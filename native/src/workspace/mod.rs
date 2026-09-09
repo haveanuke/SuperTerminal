@@ -431,6 +431,54 @@ fn peer_activity_dot(activity: Activity, theme: &'static Theme) -> impl IntoElem
         .when(!hollow, |d| d.bg(rgb(color)))
 }
 
+/// The colour a project's generated mark sits on, resolved through the
+/// ACTIVE theme.
+///
+/// The palette is the theme's own six hues, never a fixed set of hex
+/// colours: a custom theme can be any palette at all, and a mark hard-coded
+/// to look right against Tokyo Night would clash with it — or vanish into
+/// it. The bright variants are deliberately left out; several presets
+/// define them equal to their base colour (Tokyo Night's `bright_red` IS
+/// its `red`), so including them would collapse twelve slots back into six
+/// while pretending to spread further.
+///
+/// `projects::MARK_SLOTS` is the count this palette owes; the modulo keeps
+/// a slot past the end wrapping rather than panicking a render.
+fn project_mark_color(theme: &Theme, slot: usize) -> u32 {
+    let palette = [
+        theme.blue,
+        theme.magenta,
+        theme.cyan,
+        theme.green,
+        theme.yellow,
+        theme.red,
+    ];
+    palette[slot % palette.len()]
+}
+
+/// One project's generated mark: its label's first character over its
+/// hashed colour. `projects::project_mark` makes both decisions; this only
+/// draws them.
+fn project_mark_badge(
+    mark: crate::projects::ProjectMark,
+    theme: &'static Theme,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(16.0))
+        .h(px(16.0))
+        .rounded(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(project_mark_color(theme, mark.slot)))
+        .text_size(px(9.0))
+        // The theme's own background, so the character reads against every
+        // hue in the palette without picking a contrast colour per slot.
+        .text_color(rgb(theme.ui_background))
+        .child(SharedString::from(mark.ch.to_string()))
+}
+
 /// The tab label for a freshly opened peer terminal: the peer, then the
 /// session it named itself. A session with no label still names its
 /// machine, never a bare id the user has no way to recognise.
@@ -2915,10 +2963,18 @@ impl Workspace {
             // gets no pin.
             let tab_dirs = self.tab_dirs(tab);
             let can_pin = crate::projects::worth_remembering(&tab_dirs);
-            let tab_pinned = self
-                .projects_cache
-                .matching(&tab_dirs)
-                .is_some_and(|record| record.pinned);
+            let record = self.projects_cache.matching(&tab_dirs);
+            let tab_pinned = record.is_some_and(|record| record.pinned);
+            // The same mark the remembered row below draws, so a project
+            // does not change its face the moment it is open. The stored
+            // record's `icon` when there is one — that field is what
+            // auto-detection will later write into — and the default
+            // otherwise, since a tab this store has never seen is still a
+            // project with a name.
+            let tab_mark = crate::projects::project_mark(
+                &tab.label,
+                record.map(|record| record.icon).unwrap_or_default(),
+            );
             let label_element = if let Some((_, field)) = self
                 .rename_field
                 .as_ref()
@@ -2927,6 +2983,12 @@ impl Workspace {
                 div().w(px(140.0)).child(field.clone()).into_any_element()
             } else {
                 div()
+                    // The row carries a mark and a pin now as well as the
+                    // + and x it always had; a long name gives way to them
+                    // rather than pushing them off the sidebar.
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
                     .text_color(rgb(if active_tab {
                         theme.ui_accent
                     } else {
@@ -2973,9 +3035,11 @@ impl Workspace {
                                 }),
                             ),
                     )
+                    .child(project_mark_badge(tab_mark, theme))
                     .child(label_element)
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(9.0))
                             .text_color(rgb(theme.ui_text_muted))
                             .child(SharedString::from(format!(
@@ -3406,6 +3470,7 @@ impl Workspace {
         );
         let pinned = project.pinned;
         let pin_id = project.id.clone();
+        let mark = crate::projects::project_mark(&project.label, project.icon);
         let to_open = project.clone();
         div()
             .id(SharedString::from(format!("project-open-{}", project.id)))
@@ -3417,6 +3482,7 @@ impl Workspace {
             .py(px(3.0))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(theme.ui_surface)))
+            .child(project_mark_badge(mark, theme))
             .child(
                 div()
                     .flex_grow()
@@ -6276,5 +6342,48 @@ mod tests {
         // hub) must never look shareable.
         assert!(!may_share_terminal(&Target::Remote(ProfileId("p1".into()))));
         assert!(may_share_terminal(&Target::Local));
+    }
+
+    #[test]
+    fn every_mark_slot_lands_on_a_colour_of_its_own() {
+        // `projects::project_mark` promises a slot below `MARK_SLOTS` and
+        // spreads labels across all of them; that promise is worth nothing
+        // if the palette here is shorter than the count, because the
+        // modulo would quietly fold two slots onto one colour and the
+        // spread the hash bought would be spent.
+        for theme in [crate::themes::TOKYO_NIGHT, crate::themes::DRACULA] {
+            let colors: Vec<u32> = (0..crate::projects::MARK_SLOTS)
+                .map(|slot| project_mark_color(&theme, slot))
+                .collect();
+            let mut distinct = colors.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                crate::projects::MARK_SLOTS,
+                "{} gives two slots the same colour: {colors:x?}",
+                theme.name
+            );
+            // A slot past the end wraps rather than panicking a render.
+            assert_eq!(
+                project_mark_color(&theme, crate::projects::MARK_SLOTS),
+                colors[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_marks_colour_is_the_themes_own_and_never_a_fixed_one() {
+        // The whole reason the palette is resolved through the theme: a
+        // custom theme can be any colours at all, and a mark hard-coded to
+        // look right against one preset would clash with — or vanish into
+        // — another.
+        let slot =
+            crate::projects::project_mark("chat", crate::projects::ProjectIcon::Generated).slot;
+        assert_ne!(
+            project_mark_color(&crate::themes::TOKYO_NIGHT, slot),
+            project_mark_color(&crate::themes::DRACULA, slot),
+            "two themes that share no palette must not paint one mark alike"
+        );
     }
 }

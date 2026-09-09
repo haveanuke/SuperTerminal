@@ -616,12 +616,79 @@ fn project_id(dirs: &[PathBuf]) -> String {
     let mut keys: Vec<String> = dirs.iter().map(|dir| dir_key(dir)).collect();
     keys.sort();
     keys.dedup();
+    format!("proj-{:016x}", fnv1a(keys.join("\u{0}").as_bytes()))
+}
+
+/// FNV-1a, 64-bit. Hand-rolled rather than `DefaultHasher`, whose output
+/// std does not promise to keep stable across releases: a project's id is
+/// PERSISTED, so it must not change under the app, and its mark's colour
+/// must not change under the user.
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in keys.join("\u{0}").bytes() {
-        hash ^= u64::from(byte);
+    for byte in bytes {
+        hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("proj-{hash:016x}")
+    hash
+}
+
+/// How many colours a generated mark can land on. The palette itself is
+/// the ACTIVE THEME's (see `workspace::project_mark_color`) — a fixed set
+/// of hex colours would clash with a custom theme, and this module has no
+/// business knowing what colour anything is.
+pub const MARK_SLOTS: usize = 6;
+
+/// What a project's row draws for itself: one character, and which slot of
+/// the theme's palette colours it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectMark {
+    /// Always a real character. A label that is empty or nothing but
+    /// whitespace — only a hand-edited file can produce one — still gets a
+    /// mark rather than a hole in the row.
+    pub ch: char,
+    /// Always less than [`MARK_SLOTS`].
+    pub slot: usize,
+}
+
+/// The mark a project shows, per its [`ProjectIcon`].
+///
+/// A `match` with one arm today, deliberately: `icon` is the field that
+/// auto-detection (`Cargo.toml` -> Rust) and a hand-picked set will later
+/// write into, and this is where those arms land. Nothing else in the app
+/// asks what a project looks like.
+pub fn project_mark(label: &str, icon: ProjectIcon) -> ProjectMark {
+    match icon {
+        ProjectIcon::Generated => generated_mark(label),
+    }
+}
+
+/// The label's first character over a colour hashed from the WHOLE label.
+///
+/// Hashing the whole label, not the character: half a user's projects
+/// start with the same letter, and colouring by the initial would collapse
+/// them onto one colour — which is the one thing a mark exists to prevent.
+///
+/// Trimmed and lowercased first, matching `dir_key`'s case-insensitivity,
+/// so `chat` and `Chat` are one project's mark rather than two. The
+/// character itself is upper-cased for legibility at 9px.
+///
+/// `chars().next()`, never `&label[..1]`: a label beginning with an
+/// accented letter or a CJK character is multi-byte, and slicing by byte
+/// would panic mid-character on exactly the labels a user is least likely
+/// to be able to work around.
+fn generated_mark(label: &str) -> ProjectMark {
+    let trimmed = label.trim();
+    let ch = trimmed
+        .chars()
+        .next()
+        .and_then(|first| first.to_uppercase().next())
+        // A label with no characters at all still gets a mark. Nothing
+        // writes one — a project is named for its anchor folder — but a
+        // hand-edited `projects.json` can, and a blank square reads as a
+        // failure to render rather than as a project.
+        .unwrap_or('?');
+    let slot = (fnv1a(trimmed.to_lowercase().as_bytes()) % MARK_SLOTS as u64) as usize;
+    ProjectMark { ch, slot }
 }
 
 impl ProjectStore {
@@ -2560,5 +2627,128 @@ mod pin_tests {
             "Chat stack",
             "a later auto-capture must not take the name back"
         );
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::*;
+
+    fn mark(label: &str) -> ProjectMark {
+        project_mark(label, ProjectIcon::Generated)
+    }
+
+    #[test]
+    fn one_label_always_marks_the_same_way_however_it_is_written() {
+        // The mark is the project's face in the sidebar, so it has to be
+        // the same face every launch — and the same face for two spellings
+        // of one name, matching the case-insensitivity every directory
+        // comparison in this module already uses.
+        let plain = mark("chat");
+        for variant in ["chat", "Chat", "CHAT", "  chat  ", "\tchat\n"] {
+            assert_eq!(
+                mark(variant),
+                plain,
+                "{variant:?} is the same project as \"chat\""
+            );
+        }
+        assert_eq!(plain.ch, 'C', "upper-cased for legibility at 9px");
+    }
+
+    #[test]
+    fn labels_spread_across_the_whole_palette() {
+        // A mark that lands on one colour for everything is a mark that
+        // tells the user nothing. Every slot has to be reachable.
+        let labels = [
+            "chat",
+            "board-kid",
+            "penpot",
+            "forgejo",
+            "native",
+            "superterminal",
+            "docs",
+            "notes",
+            "zed",
+            "dotfiles",
+            "scripts",
+            "website",
+            "api",
+            "infra",
+            "blog",
+            "sandbox",
+            "photos",
+            "music",
+            "games",
+            "tools",
+            "client-a",
+            "client-b",
+            "research",
+            "archive",
+        ];
+        let mut slots: Vec<usize> = labels.iter().map(|label| mark(label).slot).collect();
+        assert!(
+            slots.iter().all(|slot| *slot < MARK_SLOTS),
+            "a slot outside the palette has no colour to be"
+        );
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(
+            slots.len(),
+            MARK_SLOTS,
+            "two dozen real project names must reach every slot, not {}",
+            slots.len()
+        );
+    }
+
+    #[test]
+    fn projects_sharing_a_first_letter_do_not_share_a_colour() {
+        // The reason the WHOLE label is hashed rather than the character
+        // being drawn: a user's projects are not evenly spread over the
+        // alphabet, and colouring by the initial would put every C
+        // project on one colour — the collapse the mark exists to avoid.
+        let mut slots: Vec<usize> = ["chat", "chess", "client-a", "code"]
+            .iter()
+            .map(|label| mark(label).slot)
+            .collect();
+        assert!(
+            ["chat", "chess", "client-a", "code"]
+                .iter()
+                .all(|label| mark(label).ch == 'C'),
+            "same letter, by construction"
+        );
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 4, "and four different colours");
+    }
+
+    #[test]
+    fn a_label_with_nothing_in_it_still_gets_a_mark() {
+        // Only a hand-edited file can produce one, and a blank square in
+        // the row reads as a failure to render rather than as a project.
+        for empty in ["", " ", "\t\n  "] {
+            let mark = mark(empty);
+            assert!(
+                !mark.ch.is_whitespace(),
+                "{empty:?} must still draw something"
+            );
+            assert!(mark.slot < MARK_SLOTS, "and land on a real colour");
+        }
+    }
+
+    #[test]
+    fn a_multi_byte_first_character_is_drawn_whole_and_never_sliced() {
+        // `&label[..1]` panics mid-character on every one of these, and a
+        // panic in a sidebar row takes the window with it.
+        assert_eq!(mark("Émile").ch, 'É');
+        assert_eq!(mark("émile").ch, 'É', "and still upper-cased");
+        assert_eq!(mark("日本語").ch, '日');
+        assert_eq!(mark("ñoño").ch, 'Ñ');
+        // Four bytes, not just three: a CJK ideograph is three, and the
+        // supplementary planes are where a byte-slice goes wrong last and
+        // loudest.
+        assert_eq!(mark("\u{20000}-notes").ch, '\u{20000}');
+        for label in ["Émile", "日本語", "ñoño"] {
+            assert!(mark(label).slot < MARK_SLOTS);
+        }
     }
 }
