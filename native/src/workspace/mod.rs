@@ -3100,8 +3100,6 @@ impl Workspace {
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             let active_tab = tab_index == self.active_tab;
-            let terminal_ids = tab.all_terminal_ids();
-            let count = terminal_ids.len();
             let project_tab_id = tab.id.clone();
             let close_tab_id = tab.id.clone();
             let pin_tab_id = tab.id.clone();
@@ -3187,16 +3185,18 @@ impl Workspace {
                     )
                     .child(project_mark_badge(tab_mark, theme))
                     .child(label_element)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(9.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child(SharedString::from(format!(
-                                "{count} terminal{}",
-                                if count == 1 { "" } else { "s" }
-                            ))),
-                    )
+                    // No terminal count. It sat between the project's name
+                    // and its controls in a narrow sidebar, so the name
+                    // truncated to make room for it — "SuperTermin 1
+                    // terminal" — and the name is the only part anyone
+                    // scans for. The row already expands to list the
+                    // terminals themselves, which says the same thing
+                    // without spending the width.
+                    //
+                    // Its sibling in `project_summary` (the REMEMBERED
+                    // project rows) was removed first and this one was
+                    // missed, which is why the count appeared to survive
+                    // its own deletion.
                     .child(div().flex_grow())
                     .children(can_pin.then(|| {
                         div()
