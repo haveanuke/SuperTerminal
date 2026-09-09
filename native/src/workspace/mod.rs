@@ -2304,11 +2304,12 @@ impl Workspace {
     /// three are pure and tested. This function is the wiring.
     /// Open a project, or select the tab it is ALREADY open in.
     ///
-    /// The pinned section keeps showing a project while it is open, which
-    /// is the point of pinning. Reopening it on every click spawned a
-    /// second copy of every terminal it had, and a third on the next click,
-    /// without limit — the row looked like a launcher when for an open
-    /// project it is a switcher.
+    /// A guard against a STALE render rather than an everyday path:
+    /// `sidebar_sections` now hides an open project from both sections, so
+    /// no freshly drawn row can be clicked while its project is open. A row
+    /// built while it was CLOSED can be, and without this that click
+    /// spawned a second copy of every terminal the project had, and a third
+    /// on the next click, without limit.
     fn open_or_switch_to_project(
         &mut self,
         project: &crate::projects::Project,

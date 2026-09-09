@@ -1282,11 +1282,15 @@ mod tests {
 
     #[test]
     fn a_project_that_is_already_open_resolves_to_its_tab() {
-        // The million-terminals bug. The pinned section keeps showing a
-        // project while it is open — that is what pinning is for — and the
-        // row unconditionally REOPENED it, spawning a second copy of every
-        // terminal it had, then a third, without limit. For an open
-        // project the row is a switcher, not a launcher.
+        // The million-terminals bug. A row clicked while its project is
+        // open must resolve to that project's TAB; clicking used to reopen
+        // unconditionally, spawning a second copy of every terminal it had,
+        // then a third, without limit.
+        //
+        // `sidebar_sections` now hides an open project from both sections,
+        // so this covers the stale-render case rather than the steady-state
+        // UI: a row drawn while the project was closed, clicked after it
+        // opened. The lookup still has to be right for that to be safe.
         let mut project = project("chat", &["/chat", "/board-kid"], 100);
         project.anchor = Some(PathBuf::from("/chat"));
         let open = vec![

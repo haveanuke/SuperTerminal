@@ -166,10 +166,15 @@ knows you. Two fields, added while the record's shape is still soft rather than
 retrofitted:
 
 - `terminals: usize` — how many terminals the project had when it was last
-  captured. Answers "how big is this thing" before you open it. Every pane the
-  tab ever had, not the ones still alive when it died — see "A project is the
-  union of its panes" below, which is the same population its `dirs` come from,
-  so the two halves of a row cannot disagree.
+  captured. Every pane the tab ever had, not the ones still alive when it died
+  — see "A project is the union of its panes" below, which is the same
+  population its `dirs` come from.
+
+  **Persisted but not currently rendered.** It was in the row summary and
+  truncated the project's NAME in a narrow sidebar, which cost more than it
+  told anyone. Kept in the record because it comes for free from the pane map
+  `dirs` already needs, and dropping a persisted field to save nothing would
+  only have to be added back.
 - `active_secs: u64` — accumulated wall-clock time the project has been open,
   summed across sessions. Answers "how much have I actually worked here",
   which is what separates a real project from a folder visited once.
