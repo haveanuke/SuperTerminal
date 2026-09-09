@@ -26,7 +26,56 @@ pub enum Icon {
     Pin { filled: bool },
 }
 
-pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
+/// Icons that ship as real SVG assets rather than being drawn by hand.
+///
+/// Everything in this file started as quads and strokes, which is fine for
+/// a coffee cup and wrong for anything with a recognised silhouette: the
+/// hand-drawn pin read as a nail, because "a rectangle on a stalk" is what
+/// you get when you approximate a shape instead of using it. These come
+/// from Lucide (see `assets/LICENSE-lucide.txt`).
+///
+/// Embedded with `include_bytes!` rather than shipped as loose files, so
+/// there is nothing for `bundle.sh` to copy and nothing to go missing from
+/// an installed `.app`.
+pub struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let bytes: &'static [u8] = match path {
+            "icons/pin.svg" => include_bytes!("../assets/icons/pin.svg"),
+            "icons/pin-filled.svg" => include_bytes!("../assets/icons/pin-filled.svg"),
+            _ => return Ok(None),
+        };
+        Ok(Some(std::borrow::Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        Ok(vec!["icons/pin.svg".into(), "icons/pin-filled.svg".into()])
+    }
+}
+
+pub fn icon(kind: Icon, color: u32) -> gpui::AnyElement {
+    // An SVG asset is a different ELEMENT from the hand-drawn canvas, so
+    // it branches before the canvas is built rather than inside the match.
+    if let Icon::Pin { filled } = kind {
+        return gpui::svg()
+            .path(if filled {
+                "icons/pin-filled.svg"
+            } else {
+                "icons/pin.svg"
+            })
+            .w(px(16.0))
+            .h(px(16.0))
+            // `svg()` paints the asset as a mask in the TEXT colour, so
+            // the file's own stroke and fill decide coverage and this
+            // decides the colour.
+            .text_color(gpui::rgb(color))
+            .into_any_element();
+    }
+    icon_canvas(kind, color).into_any_element()
+}
+
+fn icon_canvas(kind: Icon, color: u32) -> impl IntoElement {
     gpui::canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -112,52 +161,10 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                     line(window, 4.0, 8.5, 6.0, 9.75);
                     line(window, 6.0, 9.75, 4.0, 11.0);
                 }
-                Icon::Pin { filled } => {
-                    // A THUMBTACK seen head-on, which is the shape every
-                    // other app uses for this and the one a user reads
-                    // instantly: flat cap, narrower barrel, a wide flange
-                    // under it, then the needle.
-                    //
-                    // The first attempt drew a plain rectangle on a stalk,
-                    // which at 16px reads as a nail or a plug — the outline
-                    // of a pin without the silhouette that identifies one.
-                    // The flange is what does the identifying; drop it and
-                    // it stops looking like a thumbtack immediately.
-                    //
-                    // Traced as ONE closed polygon rather than stacked
-                    // quads so the silhouette is continuous, and so the
-                    // hollow state is the same outline stroked instead of a
-                    // different drawing that has to be kept in sync.
-                    let pin: [(f32, f32); 10] = [
-                        (5.0, 2.0),  // cap, top-left
-                        (11.0, 2.0), // cap, top-right
-                        (11.0, 3.6), // cap underside
-                        (9.7, 3.6),  // barrel, right
-                        (9.7, 8.2),
-                        (12.4, 9.6), // flange, right tip
-                        (12.4, 10.6),
-                        (3.6, 10.6), // flange, left
-                        (3.6, 9.6),
-                        (6.3, 8.2), // barrel, left
-                    ];
-                    let mut builder = if filled {
-                        gpui::PathBuilder::fill()
-                    } else {
-                        gpui::PathBuilder::stroke(px(1.2))
-                    };
-                    builder.move_to(gpui::point(px(x + pin[0].0), px(y + pin[0].1)));
-                    for (px_, py_) in pin.iter().skip(1) {
-                        builder.line_to(gpui::point(px(x + px_), px(y + py_)));
-                    }
-                    builder.close();
-                    if let Ok(path) = builder.build() {
-                        window.paint_path(path, color);
-                    }
-                    // The needle, always stroked: on a filled tack it is
-                    // the part that is genuinely thin, and on a hollow one
-                    // it keeps the outline from reading as an empty badge.
-                    line(window, 8.0, 10.6, 8.0, 14.4);
-                }
+                // Unreachable: `icon` routes Pin to its SVG asset before
+                // building this canvas. Kept as an arm rather than deleted
+                // so adding a variant still fails to compile here.
+                Icon::Pin { .. } => {}
                 Icon::Share { active } => {
                     // Two edges from the left node out to the two right
                     // nodes, drawn node-center to node-center so they land
@@ -180,4 +187,47 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
     )
     .w(px(16.0))
     .h(px(16.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AssetSource;
+
+    #[test]
+    fn every_icon_asset_the_ui_asks_for_actually_loads() {
+        // The failure this catches is silent: `svg()` given a path that
+        // resolves to nothing paints NOTHING, so a typo or a renamed file
+        // is an invisible control rather than a crash. The names are
+        // asserted here because the call sites cannot be.
+        for path in ["icons/pin.svg", "icons/pin-filled.svg"] {
+            let bytes = Assets
+                .load(path)
+                .expect("loading must not error")
+                .unwrap_or_else(|| panic!("{path} is missing from the binary"));
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("<svg"), "{path} is not an svg: {text:?}");
+            assert!(text.contains("<path"), "{path} has no path to draw");
+        }
+    }
+
+    #[test]
+    fn the_two_pin_states_are_different_drawings() {
+        // Filled and hollow have to actually differ, or "pinned" looks
+        // identical to "not pinned" and the control silently stops
+        // reporting anything.
+        let hollow = Assets.load("icons/pin.svg").unwrap().unwrap();
+        let filled = Assets.load("icons/pin-filled.svg").unwrap().unwrap();
+        assert_ne!(hollow, filled);
+        assert!(String::from_utf8_lossy(&hollow).contains(r#"fill="none""#));
+        assert!(String::from_utf8_lossy(&filled).contains(r#"fill="#));
+    }
+
+    #[test]
+    fn an_unknown_asset_is_absent_rather_than_an_error() {
+        // `AssetSource` distinguishes "no such asset" from "loading
+        // failed", and conflating them would turn a missing icon into a
+        // startup error.
+        assert!(Assets.load("icons/nope.svg").unwrap().is_none());
+    }
 }

@@ -2345,12 +2345,11 @@ impl Workspace {
         let mut terminal_ids: Vec<String> = Vec::with_capacity(plan.spawns.len());
         // The tab's memory of its own panes, seeded as they are spawned.
         let mut remembered = crate::projects::TabPaneDirs::default();
-        for (i, (cwd, wanted)) in plan.spawns.iter().zip(project.dirs.iter()).enumerate() {
+        for (cwd, wanted) in plan.spawns.iter().zip(project.dirs.iter()) {
             let terminal_id = self.fresh_id();
-            // `i` IS the dir_index the key was written under: this loop
-            // walks `project.dirs` in order, and so did the capture that
-            // saved. The folder goes in beside it so a reordered `dirs`
-            // misses rather than restoring its neighbour's text.
+            // Keyed on the FOLDER, not its position: a project's `dirs`
+            // can reorder between the save and the reopen, and a pinned
+            // record keeps its own list while later captures move on.
             let restore_key = project
                 .anchor
                 .as_deref()
