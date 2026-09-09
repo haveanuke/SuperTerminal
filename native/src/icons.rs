@@ -4,7 +4,7 @@
 use gpui::prelude::*;
 use gpui::px;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum Icon {
     /// Stacked rows — the projects/tabs list.
     Projects,
@@ -37,6 +37,24 @@ pub enum Icon {
 /// Embedded with `include_bytes!` rather than shipped as loose files, so
 /// there is nothing for `bundle.sh` to copy and nothing to go missing from
 /// an installed `.app`.
+/// Every asset the UI can ask for. One list, so the `load` table, `list`
+/// and the tests cannot drift apart — a path in the code and not here
+/// paints nothing, silently.
+pub const ASSET_PATHS: &[&str] = &[
+    "icons/pin.svg",
+    "icons/pin-filled.svg",
+    "icons/projects.svg",
+    "icons/git-branch.svg",
+    "icons/files.svg",
+    "icons/coffee.svg",
+    "icons/coffee-filled.svg",
+    "icons/phone.svg",
+    "icons/phone-filled.svg",
+    "icons/share.svg",
+    "icons/share-active.svg",
+    "icons/peers.svg",
+];
+
 pub struct Assets;
 
 impl gpui::AssetSource for Assets {
@@ -44,149 +62,61 @@ impl gpui::AssetSource for Assets {
         let bytes: &'static [u8] = match path {
             "icons/pin.svg" => include_bytes!("../assets/icons/pin.svg"),
             "icons/pin-filled.svg" => include_bytes!("../assets/icons/pin-filled.svg"),
+            "icons/projects.svg" => include_bytes!("../assets/icons/projects.svg"),
+            "icons/git-branch.svg" => include_bytes!("../assets/icons/git-branch.svg"),
+            "icons/files.svg" => include_bytes!("../assets/icons/files.svg"),
+            "icons/coffee.svg" => include_bytes!("../assets/icons/coffee.svg"),
+            "icons/coffee-filled.svg" => include_bytes!("../assets/icons/coffee-filled.svg"),
+            "icons/phone.svg" => include_bytes!("../assets/icons/phone.svg"),
+            "icons/phone-filled.svg" => include_bytes!("../assets/icons/phone-filled.svg"),
+            "icons/share.svg" => include_bytes!("../assets/icons/share.svg"),
+            "icons/share-active.svg" => include_bytes!("../assets/icons/share-active.svg"),
+            "icons/peers.svg" => include_bytes!("../assets/icons/peers.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))
     }
 
     fn list(&self, _path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
-        Ok(vec!["icons/pin.svg".into(), "icons/pin-filled.svg".into()])
+        Ok(ASSET_PATHS.iter().map(|p| (*p).into()).collect())
+    }
+}
+
+/// The asset each icon draws from. A `filled`/`active` variant is its own
+/// file rather than a fill applied at paint time, because `svg()` renders
+/// the asset as a MASK — the file decides what is solid, the caller only
+/// decides the colour.
+fn asset_for(kind: Icon) -> &'static str {
+    match kind {
+        Icon::Projects => "icons/projects.svg",
+        Icon::GitBranch => "icons/git-branch.svg",
+        Icon::Files => "icons/files.svg",
+        Icon::Coffee { filled: true } => "icons/coffee-filled.svg",
+        Icon::Coffee { filled: false } => "icons/coffee.svg",
+        Icon::Phone { filled: true } => "icons/phone-filled.svg",
+        Icon::Phone { filled: false } => "icons/phone.svg",
+        Icon::Share { active: true } => "icons/share-active.svg",
+        Icon::Share { active: false } => "icons/share.svg",
+        // Two overlapping panels, which is what the hand-drawn one drew
+        // and what this needs to say: another Mac's terminals, seen from
+        // here. Outline only — unlike Coffee/Phone/Share it carries no
+        // on/off state, so a filled variant would imply one.
+        Icon::Peers => "icons/peers.svg",
+        Icon::Pin { filled: true } => "icons/pin-filled.svg",
+        Icon::Pin { filled: false } => "icons/pin.svg",
     }
 }
 
 pub fn icon(kind: Icon, color: u32) -> gpui::AnyElement {
-    // An SVG asset is a different ELEMENT from the hand-drawn canvas, so
-    // it branches before the canvas is built rather than inside the match.
-    if let Icon::Pin { filled } = kind {
-        return gpui::svg()
-            .path(if filled {
-                "icons/pin-filled.svg"
-            } else {
-                "icons/pin.svg"
-            })
-            .w(px(16.0))
-            .h(px(16.0))
-            // `svg()` paints the asset as a mask in the TEXT colour, so
-            // the file's own stroke and fill decide coverage and this
-            // decides the colour.
-            .text_color(gpui::rgb(color))
-            .into_any_element();
-    }
-    icon_canvas(kind, color).into_any_element()
-}
-
-fn icon_canvas(kind: Icon, color: u32) -> impl IntoElement {
-    gpui::canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let x = f32::from(bounds.origin.x);
-            let y = f32::from(bounds.origin.y);
-            let color = gpui::rgb(color);
-            let quad = |window: &mut gpui::Window, qx: f32, qy: f32, w: f32, h: f32| {
-                window.paint_quad(gpui::fill(
-                    gpui::Bounds {
-                        origin: gpui::point(px(x + qx), px(y + qy)),
-                        size: gpui::size(px(w), px(h)),
-                    },
-                    color,
-                ));
-            };
-            let line = |window: &mut gpui::Window, x0: f32, y0: f32, x1: f32, y1: f32| {
-                let mut builder = gpui::PathBuilder::stroke(px(1.5));
-                builder.move_to(gpui::point(px(x + x0), px(y + y0)));
-                builder.line_to(gpui::point(px(x + x1), px(y + y1)));
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
-                }
-            };
-            match kind {
-                Icon::Projects => {
-                    quad(window, 2.0, 3.0, 12.0, 2.5);
-                    quad(window, 2.0, 6.75, 12.0, 2.5);
-                    quad(window, 2.0, 10.5, 12.0, 2.5);
-                }
-                Icon::GitBranch => {
-                    line(window, 5.0, 4.5, 5.0, 12.0);
-                    line(window, 5.0, 9.5, 10.5, 6.0);
-                    quad(window, 3.5, 2.0, 3.0, 3.0);
-                    quad(window, 3.5, 11.5, 3.0, 3.0);
-                    quad(window, 9.5, 3.5, 3.0, 3.0);
-                }
-                Icon::Files => {
-                    quad(window, 2.0, 4.0, 6.0, 2.0);
-                    quad(window, 2.0, 6.0, 12.0, 7.0);
-                }
-                Icon::Coffee { filled } => {
-                    // Steam.
-                    line(window, 5.5, 1.5, 5.5, 4.0);
-                    line(window, 8.5, 1.5, 8.5, 4.0);
-                    // Cup body: outline strokes, or a solid fill when held.
-                    if filled {
-                        quad(window, 3.0, 6.0, 8.0, 7.5);
-                    } else {
-                        line(window, 3.0, 6.0, 3.0, 13.5);
-                        line(window, 3.0, 13.5, 11.0, 13.5);
-                        line(window, 11.0, 6.0, 11.0, 13.5);
-                        line(window, 3.0, 6.0, 11.0, 6.0);
-                    }
-                    // Handle loop on the right.
-                    line(window, 11.0, 7.5, 13.5, 8.25);
-                    line(window, 13.5, 8.25, 13.5, 10.75);
-                    line(window, 13.5, 10.75, 11.0, 11.5);
-                }
-                Icon::Phone { filled } => {
-                    if filled {
-                        quad(window, 4.0, 2.0, 8.0, 12.0);
-                    } else {
-                        line(window, 4.0, 2.0, 4.0, 14.0);
-                        line(window, 12.0, 2.0, 12.0, 14.0);
-                        line(window, 4.0, 2.0, 12.0, 2.0);
-                        line(window, 4.0, 14.0, 12.0, 14.0);
-                        // Home strip near the bottom edge.
-                        line(window, 6.5, 12.0, 9.5, 12.0);
-                    }
-                }
-                Icon::Peers => {
-                    // Back screen, offset up and right; front screen over
-                    // it. Outline only: unlike Coffee/Phone/Share this icon
-                    // has no on/off state to carry, so a filled variant
-                    // would read as one.
-                    line(window, 6.0, 2.0, 14.0, 2.0);
-                    line(window, 14.0, 2.0, 14.0, 8.0);
-                    line(window, 2.0, 6.0, 10.0, 6.0);
-                    line(window, 10.0, 6.0, 10.0, 13.0);
-                    line(window, 10.0, 13.0, 2.0, 13.0);
-                    line(window, 2.0, 13.0, 2.0, 6.0);
-                    // Prompt mark inside the front screen.
-                    line(window, 4.0, 8.5, 6.0, 9.75);
-                    line(window, 6.0, 9.75, 4.0, 11.0);
-                }
-                // Unreachable: `icon` routes Pin to its SVG asset before
-                // building this canvas. Kept as an arm rather than deleted
-                // so adding a variant still fails to compile here.
-                Icon::Pin { .. } => {}
-                Icon::Share { active } => {
-                    // Two edges from the left node out to the two right
-                    // nodes, drawn node-center to node-center so they land
-                    // exactly at each node's middle regardless of fill.
-                    line(window, 4.3, 7.3, 10.7, 4.2);
-                    line(window, 4.3, 8.7, 10.7, 11.8);
-                    for (nx, ny) in [(3.0_f32, 8.0_f32), (12.0, 3.5), (12.0, 12.5)] {
-                        if active {
-                            quad(window, nx - 1.6, ny - 1.6, 3.2, 3.2);
-                        } else {
-                            line(window, nx - 1.6, ny - 1.6, nx + 1.6, ny - 1.6);
-                            line(window, nx + 1.6, ny - 1.6, nx + 1.6, ny + 1.6);
-                            line(window, nx + 1.6, ny + 1.6, nx - 1.6, ny + 1.6);
-                            line(window, nx - 1.6, ny + 1.6, nx - 1.6, ny - 1.6);
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .w(px(16.0))
-    .h(px(16.0))
+    gpui::svg()
+        .path(asset_for(kind))
+        .w(px(16.0))
+        .h(px(16.0))
+        // `svg()` paints the asset as a mask in the TEXT colour, so the
+        // file's own stroke and fill decide coverage and this decides the
+        // colour.
+        .text_color(gpui::rgb(color))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -194,12 +124,80 @@ mod tests {
     use super::*;
     use gpui::AssetSource;
 
+    /// Every `Icon` there is, so the asset check below covers the whole
+    /// enum rather than whichever variants someone remembered.
+    const EVERY_ICON: &[Icon] = &[
+        Icon::Projects,
+        Icon::GitBranch,
+        Icon::Files,
+        Icon::Coffee { filled: true },
+        Icon::Coffee { filled: false },
+        Icon::Phone { filled: true },
+        Icon::Phone { filled: false },
+        Icon::Share { active: true },
+        Icon::Share { active: false },
+        Icon::Peers,
+        Icon::Pin { filled: true },
+        Icon::Pin { filled: false },
+    ];
+
     #[test]
-    fn every_icon_asset_the_ui_asks_for_actually_loads() {
+    fn every_icon_resolves_to_an_asset_that_exists() {
         // The failure this catches is silent: `svg()` given a path that
         // resolves to nothing paints NOTHING, so a typo or a renamed file
-        // is an invisible control rather than a crash. The names are
-        // asserted here because the call sites cannot be.
+        // is an invisible control rather than a crash. Driven off the enum
+        // so a new variant with no asset fails here.
+        for kind in EVERY_ICON {
+            let path = asset_for(*kind);
+            let bytes = Assets
+                .load(path)
+                .expect("loading must not error")
+                .unwrap_or_else(|| panic!("{kind:?} points at {path}, which is not embedded"));
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("<svg"), "{path} is not an svg");
+        }
+    }
+
+    #[test]
+    fn a_state_carrying_icon_actually_looks_different_in_each_state() {
+        // Filled and hollow have to differ, or the control silently stops
+        // reporting anything it is there to report.
+        for (on, off) in [
+            (
+                Icon::Coffee { filled: true },
+                Icon::Coffee { filled: false },
+            ),
+            (Icon::Phone { filled: true }, Icon::Phone { filled: false }),
+            (Icon::Share { active: true }, Icon::Share { active: false }),
+            (Icon::Pin { filled: true }, Icon::Pin { filled: false }),
+        ] {
+            let a = Assets.load(asset_for(on)).unwrap().unwrap();
+            let b = Assets.load(asset_for(off)).unwrap().unwrap();
+            assert_ne!(a, b, "{on:?} and {off:?} draw the same thing");
+        }
+    }
+
+    #[test]
+    fn the_asset_list_and_the_load_table_agree() {
+        // `list` and `load` are two places one set of paths is written;
+        // a path in one and not the other is a resource that either
+        // cannot be enumerated or cannot be read.
+        for path in ASSET_PATHS {
+            assert!(
+                Assets.load(path).unwrap().is_some(),
+                "{path} is listed but not embedded"
+            );
+        }
+        for kind in EVERY_ICON {
+            assert!(
+                ASSET_PATHS.contains(&asset_for(*kind)),
+                "{kind:?} uses an asset missing from ASSET_PATHS"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pin_assets_still_load() {
         for path in ["icons/pin.svg", "icons/pin-filled.svg"] {
             let bytes = Assets
                 .load(path)
@@ -209,18 +207,6 @@ mod tests {
             assert!(text.contains("<svg"), "{path} is not an svg: {text:?}");
             assert!(text.contains("<path"), "{path} has no path to draw");
         }
-    }
-
-    #[test]
-    fn the_two_pin_states_are_different_drawings() {
-        // Filled and hollow have to actually differ, or "pinned" looks
-        // identical to "not pinned" and the control silently stops
-        // reporting anything.
-        let hollow = Assets.load("icons/pin.svg").unwrap().unwrap();
-        let filled = Assets.load("icons/pin-filled.svg").unwrap().unwrap();
-        assert_ne!(hollow, filled);
-        assert!(String::from_utf8_lossy(&hollow).contains(r#"fill="none""#));
-        assert!(String::from_utf8_lossy(&filled).contains(r#"fill="#));
     }
 
     #[test]
