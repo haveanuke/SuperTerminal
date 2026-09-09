@@ -978,6 +978,23 @@ pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> S
     }
 }
 
+/// Which already-open tab IS this project, if any.
+///
+/// The pinned section deliberately keeps showing a project that is open —
+/// that is what pinning is for, and hiding it would make the pin look
+/// broken. But the row then has to SWITCH to that tab rather than reopen
+/// it: clicking a pinned project that was already open spawned a second
+/// copy of every one of its terminals, and clicking again spawned another,
+/// without limit.
+///
+/// Matched on the stored anchor, the same rule `record` and
+/// `sidebar_sections` use, so "the same project" means one thing
+/// everywhere.
+pub fn open_tab_for(project: &Project, open: &[Vec<PathBuf>]) -> Option<usize> {
+    open.iter()
+        .position(|dirs| capture_has_anchor_of(dirs, project))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1233,6 +1250,49 @@ mod tests {
         assert_eq!(recent.len(), 1, "the folders beside the anchor are free");
         assert_eq!(recent[0].id, "orig");
         assert_eq!(recent[0].last_opened, 500);
+    }
+
+    #[test]
+    fn a_project_that_is_already_open_resolves_to_its_tab() {
+        // The million-terminals bug. The pinned section keeps showing a
+        // project while it is open — that is what pinning is for — and the
+        // row unconditionally REOPENED it, spawning a second copy of every
+        // terminal it had, then a third, without limit. For an open
+        // project the row is a switcher, not a launcher.
+        let mut project = project("chat", &["/chat", "/board-kid"], 100);
+        project.anchor = Some(PathBuf::from("/chat"));
+        let open = vec![
+            vec![PathBuf::from("/other")],
+            vec![PathBuf::from("/chat"), PathBuf::from("/board-kid")],
+        ];
+        assert_eq!(open_tab_for(&project, &open), Some(1));
+    }
+
+    #[test]
+    fn an_open_tab_that_picked_up_another_folder_is_still_the_same_project() {
+        // Matched on the ANCHOR, so the tab counts as open even after a
+        // `cd` or an extra terminal in ~ — otherwise the row would decide
+        // the project was closed and reopen a duplicate anyway, which is
+        // the same bug wearing a different hat.
+        let mut project = project("chat", &["/chat"], 100);
+        project.anchor = Some(PathBuf::from("/chat"));
+        let open = vec![vec![
+            PathBuf::from("/chat"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/Users/tomas"),
+        ]];
+        assert_eq!(open_tab_for(&project, &open), Some(0));
+    }
+
+    #[test]
+    fn a_project_that_is_not_open_resolves_to_no_tab() {
+        // And the other half: a genuinely closed project must still open,
+        // or the fix would trade a duplicate for a dead row.
+        let mut project = project("chat", &["/chat"], 100);
+        project.anchor = Some(PathBuf::from("/chat"));
+        let open = vec![vec![PathBuf::from("/other"), PathBuf::from("/elsewhere")]];
+        assert_eq!(open_tab_for(&project, &open), None);
+        assert_eq!(open_tab_for(&project, &[]), None);
     }
 
     #[test]

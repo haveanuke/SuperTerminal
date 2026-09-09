@@ -113,24 +113,50 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                     line(window, 6.0, 9.75, 4.0, 11.0);
                 }
                 Icon::Pin { filled } => {
-                    // The needle is drawn either way: it is the stroke
-                    // that reads as "pin" at 16px, and losing it would
-                    // make the hollow state look like an empty box.
-                    line(window, 8.0, 10.0, 8.0, 14.5);
-                    if filled {
-                        quad(window, 3.5, 2.0, 9.0, 2.5);
-                        quad(window, 6.0, 4.5, 4.0, 5.5);
+                    // A THUMBTACK seen head-on, which is the shape every
+                    // other app uses for this and the one a user reads
+                    // instantly: flat cap, narrower barrel, a wide flange
+                    // under it, then the needle.
+                    //
+                    // The first attempt drew a plain rectangle on a stalk,
+                    // which at 16px reads as a nail or a plug — the outline
+                    // of a pin without the silhouette that identifies one.
+                    // The flange is what does the identifying; drop it and
+                    // it stops looking like a thumbtack immediately.
+                    //
+                    // Traced as ONE closed polygon rather than stacked
+                    // quads so the silhouette is continuous, and so the
+                    // hollow state is the same outline stroked instead of a
+                    // different drawing that has to be kept in sync.
+                    let pin: [(f32, f32); 10] = [
+                        (5.0, 2.0),  // cap, top-left
+                        (11.0, 2.0), // cap, top-right
+                        (11.0, 3.6), // cap underside
+                        (9.7, 3.6),  // barrel, right
+                        (9.7, 8.2),
+                        (12.4, 9.6), // flange, right tip
+                        (12.4, 10.6),
+                        (3.6, 10.6), // flange, left
+                        (3.6, 9.6),
+                        (6.3, 8.2), // barrel, left
+                    ];
+                    let mut builder = if filled {
+                        gpui::PathBuilder::fill()
                     } else {
-                        // Head.
-                        line(window, 3.5, 2.0, 12.5, 2.0);
-                        line(window, 12.5, 2.0, 12.5, 4.5);
-                        line(window, 12.5, 4.5, 3.5, 4.5);
-                        line(window, 3.5, 4.5, 3.5, 2.0);
-                        // Shaft down to the needle.
-                        line(window, 6.0, 4.5, 6.0, 10.0);
-                        line(window, 10.0, 4.5, 10.0, 10.0);
-                        line(window, 6.0, 10.0, 10.0, 10.0);
+                        gpui::PathBuilder::stroke(px(1.2))
+                    };
+                    builder.move_to(gpui::point(px(x + pin[0].0), px(y + pin[0].1)));
+                    for (px_, py_) in pin.iter().skip(1) {
+                        builder.line_to(gpui::point(px(x + px_), px(y + py_)));
                     }
+                    builder.close();
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, color);
+                    }
+                    // The needle, always stroked: on a filled tack it is
+                    // the part that is genuinely thin, and on a hollow one
+                    // it keeps the outline from reading as an empty badge.
+                    line(window, 8.0, 10.6, 8.0, 14.4);
                 }
                 Icon::Share { active } => {
                     // Two edges from the left node out to the two right

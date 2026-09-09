@@ -2302,6 +2302,41 @@ impl Workspace {
     /// (where each shell lands), `projects::missing_dirs_note` (what the
     /// user is told) and `layout::grid_of` (the shape of the tab); all
     /// three are pure and tested. This function is the wiring.
+    /// Open a project, or select the tab it is ALREADY open in.
+    ///
+    /// The pinned section keeps showing a project while it is open, which
+    /// is the point of pinning. Reopening it on every click spawned a
+    /// second copy of every terminal it had, and a third on the next click,
+    /// without limit — the row looked like a launcher when for an open
+    /// project it is a switcher.
+    fn open_or_switch_to_project(
+        &mut self,
+        project: &crate::projects::Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open_now: Vec<Vec<PathBuf>> = self
+            .tabs
+            .iter()
+            .map(|tab| self.tab_dirs(tab))
+            .filter(|dirs| !dirs.is_empty())
+            .collect();
+        // `open_now` skips tabs with no directories, so its indices are not
+        // `self.tabs`' indices — resolve back through the same predicate
+        // rather than indexing with the wrong one.
+        if crate::projects::open_tab_for(project, &open_now).is_some() {
+            if let Some(index) = self.tabs.iter().position(|tab| {
+                crate::projects::open_tab_for(project, &[self.tab_dirs(tab)]).is_some()
+            }) {
+                self.select_tab(index, cx);
+                self.focus_active_pane(window, cx);
+                return;
+            }
+        }
+        self.open_project(project, cx);
+        self.focus_active_pane(window, cx);
+    }
+
     fn open_project(&mut self, project: &crate::projects::Project, cx: &mut Context<Self>) {
         if project.dirs.is_empty() {
             return; // nothing to reopen; the store should never hold one
@@ -3650,8 +3685,7 @@ impl Workspace {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |ws, _, window, cx| {
-                    ws.open_project(&to_open, cx);
-                    ws.focus_active_pane(window, cx);
+                    ws.open_or_switch_to_project(&to_open, window, cx);
                 }),
             )
             .into_any_element()
@@ -4973,6 +5007,9 @@ impl Workspace {
         match self.overlay {
             Overlay::None => None,
             Overlay::SettingsSheet => {
+                // The sheet sizes itself against the window rather than a
+                // fixed pixel budget; see `settings-content`'s `max_h`.
+                let vh = f32::from(window.viewport_size().height);
                 let current = self.settings.theme.clone();
                 // Built only while the themes section is active — hidden
                 // sections must not pay for the whole chip grid per render.
@@ -5162,7 +5199,18 @@ impl Workspace {
                                     div()
                                         .id("settings-content")
                                         .flex_grow()
-                                        .max_h(px(280.0))
+                                        // Capped against the ACTUAL window, not a
+                                        // fixed guess. 280px was under half the
+                                        // height on a large window and well over it
+                                        // on a small one, so the sheet could swallow
+                                        // the terminal it is meant to be sitting
+                                        // over. A third of the viewport leaves the
+                                        // sheet's own chrome — nav column, heading,
+                                        // padding — inside a half-height budget.
+                                        //
+                                        // Floored so a very short window still shows
+                                        // something scrollable rather than a sliver.
+                                        .max_h(px((vh / 3.0).max(160.0)))
                                         .overflow_y_scroll()
                                         .flex()
                                         .flex_col()
