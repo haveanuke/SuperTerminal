@@ -100,6 +100,74 @@ fn file_name(id: &str) -> Option<String> {
     (name.len() <= MAX_NAME_BYTES).then_some(name)
 }
 
+/// The key one terminal's scrollback is stored under.
+///
+/// **Terminal ids cannot be used and this is the whole reason this
+/// function exists.** `Workspace::fresh_id` mints `term-{n}` from a counter
+/// that restarts at 1 every launch, so today's `term-1` and last session's
+/// `term-1` are different terminals wearing one name — a restore keyed on
+/// that would hand a pane ANOTHER terminal's output and present it as its
+/// own. That is worse than restoring nothing, so the key is built from the
+/// two things that do survive a quit:
+///
+/// * **the project's `anchor`** — chosen at first capture and never moved
+///   after (`projects::Project::anchor`), which is also what
+///   `ProjectStore::record` matches a capture to its record by; and
+/// * **the terminal's index in the project's `dirs`**, which is the order
+///   `open_project` spawns them in and the order `TabPaneDirs::dirs`
+///   captures them in.
+///
+/// Hashed rather than spelled out, so the key is short and safe whatever
+/// the path holds — spaces, `/`, `..`, unicode, or four thousand
+/// characters of it. FNV-1a over the LOWERCASED path, matching
+/// `projects::dir_key`'s rule that two spellings of one directory on a
+/// case-insensitive volume are one directory; hand-rolled for the same
+/// reason `projects::project_id` is, that `DefaultHasher`'s output is not
+/// promised to be stable across std releases and a persisted key must not
+/// change under the app.
+pub fn terminal_key(anchor: &Path, dir_index: usize) -> String {
+    format!("sb-{:016x}-{dir_index}", path_hash(anchor))
+}
+
+/// Every key a project with `dir_count` folders can hold, which is what
+/// [`reap`] has to be told to KEEP. A project contributes exactly its own
+/// keys: nothing else in the store can mint them, because no other anchor
+/// hashes here (see the tests).
+pub fn project_keys(anchor: &Path, dir_count: usize) -> Vec<String> {
+    (0..dir_count).map(|i| terminal_key(anchor, i)).collect()
+}
+
+/// Which of a project's `dirs` a pane sitting in `cwd` belongs to, or
+/// `None` when it is in none of them.
+///
+/// The save side needs this and the restore side does not: a reopen walks
+/// `dirs` and so knows each terminal's index by construction, while a
+/// capture starts from panes and has to find each one's place in the list.
+/// Offered here rather than left to the caller so both sides compare
+/// directories the ONE way — case-insensitively, `projects::dir_key`'s
+/// rule — instead of two spellings of the rule drifting apart.
+pub fn dir_index_of(dirs: &[PathBuf], cwd: &Path) -> Option<usize> {
+    let wanted = path_key(cwd);
+    dirs.iter().position(|dir| path_key(dir) == wanted)
+}
+
+/// A path as it is compared: lossy UTF-8, lowercased. Mirrors
+/// `projects::dir_key`, which is private to that module.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// FNV-1a over [`path_key`]. Stable across processes and releases by
+/// construction — it is spelled out here rather than borrowed.
+fn path_hash(path: &Path) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path_key(path).bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// What a terminal said, ready to paint: rows oldest-first, each exactly
 /// `cols` cells wide, at most [`HISTORY_TAIL`] of them.
 #[derive(Debug, Clone)]
@@ -878,6 +946,129 @@ mod tests {
             crate::projects::projects_path().parent(),
             "scrollback sits under the same app-support directory"
         );
+    }
+
+    // --- the key a restore is allowed to trust ----------------------------
+
+    #[test]
+    fn a_key_is_the_same_in_every_process_that_ever_derives_it() {
+        // Pinned to a LITERAL, which is the whole claim: the key is not
+        // whatever this build's hasher happens to produce, it is this
+        // string, in every process, in every release. A run-to-run
+        // comparison inside one process would prove nothing — `term-1`
+        // passes that too, and `term-1` is the bug this replaces.
+        assert_eq!(
+            terminal_key(Path::new("/Users/tomas/repo"), 0),
+            "sb-464d47d65b2a4d86-0"
+        );
+        assert_eq!(
+            terminal_key(Path::new("/Users/tomas/repo"), 3),
+            "sb-464d47d65b2a4d86-3"
+        );
+        // The same directory in the case a shell's `cd` happened to leave
+        // it in is the same directory — `projects::dir_key`'s rule.
+        assert_eq!(
+            terminal_key(Path::new("/users/TOMAS/Repo"), 0),
+            terminal_key(Path::new("/Users/tomas/repo"), 0)
+        );
+    }
+
+    #[test]
+    fn two_projects_can_never_share_a_terminals_key() {
+        let anchors = [
+            "/Users/tomas/repo",
+            "/Users/tomas/other",
+            "/Users/tomas/repo/native",
+            "/Users/tomas/rep",
+            "/Users/tomas/repo ",
+            "/",
+            "/Users/tomas/\u{4f60}\u{597d}",
+        ];
+        let mut seen: HashSet<String> = HashSet::new();
+        for anchor in anchors {
+            for index in 0..4 {
+                let key = terminal_key(Path::new(anchor), index);
+                assert!(
+                    seen.insert(key.clone()),
+                    "{anchor} #{index} collided: {key}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), anchors.len() * 4);
+    }
+
+    #[test]
+    fn a_key_names_a_file_whatever_the_path_holds() {
+        let dir = dir("keys");
+        let hostile = [
+            "/Users/tomas/two words/a-b",
+            "/Users/tomas/../../etc",
+            "/Users/tomas/\u{1f600}/\u{4f60}\u{597d}/\u{e9}t\u{e9}",
+            "/Users/tomas/quote\"and'apostrophe",
+            "/Users/tomas/new\nline",
+            "relative/not/absolute",
+        ];
+        let long = format!("/Users/tomas/{}", "deep/".repeat(1000));
+        for anchor in hostile
+            .iter()
+            .copied()
+            .chain(std::iter::once(long.as_str()))
+        {
+            let key = terminal_key(Path::new(anchor), 7);
+            assert!(
+                key.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{anchor} minted an unsafe key: {key}"
+            );
+            // The store's own escaping must have nothing left to do, and
+            // the name must fit: `file_name` refuses one that does not.
+            let path = path_for(&dir, &key).expect("a key always names a file");
+            assert_eq!(path.parent(), Some(dir.as_path()));
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(format!("{key}.json").as_str()),
+                "a key must need no escaping"
+            );
+            save_in(&dir, &key, &snapshot(4, vec![text_row("hi", 4)])).unwrap();
+            assert!(load_in(&dir, &key).is_some(), "{anchor} round trips");
+        }
+    }
+
+    #[test]
+    fn a_pane_finds_its_own_folder_in_the_projects_dirs() {
+        let dirs = vec![
+            PathBuf::from("/Users/tomas/repo"),
+            PathBuf::from("/Users/tomas/other"),
+        ];
+        assert_eq!(dir_index_of(&dirs, Path::new("/Users/tomas/repo")), Some(0));
+        assert_eq!(
+            dir_index_of(&dirs, Path::new("/Users/tomas/other")),
+            Some(1)
+        );
+        // Same case rule as the key itself, or a pane whose shell reports
+        // a different spelling would save under a key nothing restores.
+        assert_eq!(dir_index_of(&dirs, Path::new("/USERS/TOMAS/REPO")), Some(0));
+        assert_eq!(dir_index_of(&dirs, Path::new("/Users/tomas")), None);
+        assert_eq!(dir_index_of(&[], Path::new("/Users/tomas/repo")), None);
+    }
+
+    #[test]
+    fn a_projects_keys_are_kept_by_the_reaper_and_every_other_is_taken() {
+        let dir = dir("project_keys");
+        let mine = Path::new("/Users/tomas/repo");
+        let theirs = Path::new("/Users/tomas/other");
+        for key in project_keys(mine, 2).iter().chain(&project_keys(theirs, 2)) {
+            save_in(&dir, key, &snapshot(4, vec![text_row("hi", 4)])).unwrap();
+        }
+        let referenced: HashSet<String> = project_keys(mine, 2).into_iter().collect();
+        assert_eq!(referenced.len(), 2, "one key per folder, and no more");
+        assert_eq!(reap_in(&dir, &referenced), 2, "the other project goes");
+        for key in project_keys(mine, 2) {
+            assert!(load_in(&dir, &key).is_some(), "{key} survives");
+        }
+        for key in project_keys(theirs, 2) {
+            assert!(load_in(&dir, &key).is_none(), "{key} was evicted");
+        }
     }
 
     #[test]

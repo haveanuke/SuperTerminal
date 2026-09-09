@@ -191,6 +191,17 @@ pub struct TerminalPane {
     /// (origin_x, origin_y, width, height) written during prepaint by the
     /// measuring canvas; applied outside the render pass.
     pending_bounds: std::sync::Arc<std::sync::Mutex<Option<MeasuredBounds>>>,
+    /// Text loaded back from the scrollback store, for a pane that has NO
+    /// shell (see [`TerminalPane::restore_scrollback`]). `None` for every
+    /// pane with a session and for every local pane whose spawn merely
+    /// failed, which is what keeps a live terminal byte-identical: every
+    /// branch this field opens is gated on it being `Some`.
+    ///
+    /// Held in full — up to `HISTORY_TAIL` rows — rather than only as the
+    /// screenful currently painted, because "how many rows fit" is not
+    /// known until the pane has been measured and changes whenever the
+    /// window does. See [`TerminalPane::show_restored_tail`].
+    restored: Option<crate::scrollback::RestoredScrollback>,
     /// Resize debounce: the size waiting to be applied and when it last
     /// changed, plus when/what was last delivered to the PTY.
     resize_candidate: Option<(Pixels, Pixels, std::time::Instant)>,
@@ -555,6 +566,7 @@ impl TerminalPane {
             snapshot_fresh: false,
             origin: (px(0.0), px(0.0)),
             pending_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            restored: None,
             resize_candidate: None,
             last_resize_applied: std::time::Instant::now(),
             last_applied_size: None,
@@ -745,6 +757,90 @@ impl TerminalPane {
         // per peer. The workspace holds the other clone and prunes it.
         self.peer_sessions = None;
         self.session.take().map(TermSession::shutdown)
+    }
+
+    /// Store this pane's text, WITH its scrollback, under `key`.
+    ///
+    /// The one call the save side makes. It deliberately does NOT reuse
+    /// `self.snapshot`: that snapshot comes from
+    /// [`TermSession::sync_and_snapshot`], which passes `with_history =
+    /// false`, so saving from it would store the visible screen and
+    /// silently drop the scrollback this whole feature exists to bring
+    /// back. The capture here is the history-bearing one, and the half of
+    /// it that is stored is the LIVE screen — see [`split_capture`].
+    ///
+    /// `key` must come from [`crate::scrollback::terminal_key`]. A pane's
+    /// own `id` must never be used: it restarts at `term-1` every launch,
+    /// so it names a different terminal in every process.
+    ///
+    /// Returns whether anything was written. A pane with no shell writes
+    /// NOTHING and that is deliberate: a restored pane's text is already on
+    /// disk under this very key, and "saving" its empty capture over the
+    /// top would delete it (`scrollback::save_in` clears the file of a
+    /// terminal that said nothing) — so reopening a project and quitting
+    /// without typing would erase the scrollback it just showed you.
+    // The tab-close and quit hooks that call this land with the workspace
+    // wiring; the decisions it is made of are tested in `restored_pane_tests`.
+    #[allow(dead_code)]
+    pub fn save_scrollback(&mut self, key: &str) -> bool {
+        if !may_save_scrollback(self.views_remote(), self.session.is_some()) {
+            return false;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        let (display, live) = session.sync_and_snapshot_with_live();
+        let (paint, stored) = split_capture(display, live);
+        // The capture drained the session's queued ops, so render must not
+        // be left believing its cached snapshot is still the current one.
+        // Same bookkeeping the companion publish does, for the same reason.
+        self.snapshot = paint;
+        self.snapshot_stale = false;
+        self.advance_scan_pending = true;
+        crate::scrollback::save(key, &stored).is_ok()
+    }
+
+    /// Fill a pane that has NO shell with the text stored under `key`.
+    ///
+    /// The one call the restore side makes, on a pane built through
+    /// [`TerminalPane::dead`]. Returns whether anything was restored:
+    /// a missing, corrupt or foreign file loads nothing and the pane stays
+    /// empty, which is the store's rule and this feature's — losing
+    /// scrollback must never be worse than not having it.
+    ///
+    /// **It refuses a pane that has a session**, and that refusal is the
+    /// point rather than a guard against a caller mistake: painting stored
+    /// text into a live terminal would put a picture where a shell is, and
+    /// the user would type into it and believe what they saw.
+    // Called by the project reopen that lands with the workspace wiring.
+    #[allow(dead_code)]
+    pub fn restore_scrollback(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        if !may_restore_scrollback(self.views_remote(), self.session.is_some()) {
+            return false;
+        }
+        let Some(restored) = crate::scrollback::load(key) else {
+            return false;
+        };
+        self.snapshot = restored_snapshot(&restored, self.snapshot.lines);
+        self.restored = Some(restored);
+        self.snapshot_stale = false;
+        self.advance_scan_pending = true;
+        cx.notify();
+        true
+    }
+
+    /// Re-window a restored pane onto the `lines` rows it can now show.
+    ///
+    /// A no-op for every pane that has not been restored, which is every
+    /// pane there was before this feature: a live terminal reflows in the
+    /// PTY, and a pane whose spawn merely failed has nothing to window.
+    fn show_restored_tail(&mut self, lines: usize) {
+        let Some(restored) = self.restored.take() else {
+            return;
+        };
+        self.snapshot = restored_snapshot(&restored, lines);
+        self.restored = Some(restored);
+        self.advance_scan_pending = true;
     }
 
     /// Point this pane at a terminal on another machine: frames start
@@ -2294,6 +2390,112 @@ fn exit_message(notice: ExitNotice) -> Option<&'static str> {
     }
 }
 
+/// Whether a pane has text of its OWN worth storing.
+///
+/// A pane that views another machine does not: its rows arrived over the
+/// wire from a terminal this Mac does not own, and its `self.snapshot` is
+/// the empty placeholder `from_parts` built, so a save would store either
+/// someone else's output under this project's key or nothing at all.
+///
+/// A pane with no session does not either, and that arm is the load-bearing
+/// one — see [`TerminalPane::save_scrollback`] for why writing an empty
+/// capture would DELETE the very text a restored pane is showing.
+fn may_save_scrollback(views_remote: bool, has_session: bool) -> bool {
+    !views_remote && has_session
+}
+
+/// Whether stored text may be painted into this pane.
+///
+/// **Never over a live shell.** The spec's worst outcome is a restored pane
+/// that looks live — the user types a command, watches it echo into a grid
+/// that is a picture, and believes it ran — and a pane that still has a
+/// session is exactly that, with a real shell underneath whose own output
+/// the picture would be hiding.
+///
+/// Never into a pane that views another machine either: those rows are
+/// painted from `attached_frame`, so restored text would sit under a live
+/// remote frame and claim to be it.
+fn may_restore_scrollback(views_remote: bool, has_session: bool) -> bool {
+    !views_remote && !has_session
+}
+
+/// Split a history-bearing capture into the half to KEEP PAINTING and the
+/// half to STORE.
+///
+/// `TermSession::sync_and_snapshot_with_live` returns the display snapshot
+/// plus, when the pane is scrolled back, the LIVE screen — and it hangs the
+/// scrollback tail on whichever of the two the phone would publish, i.e.
+/// the live one when there is one. So the stored half is the live half:
+/// taking the display instead would store the rows the user happens to have
+/// scrolled to AND lose the history that was on the other snapshot, which
+/// is the whole point of capturing with history.
+fn split_capture(
+    display: RenderableSnapshot,
+    live: Option<RenderableSnapshot>,
+) -> (RenderableSnapshot, RenderableSnapshot) {
+    match live {
+        Some(live) => (display, live),
+        // Not scrolled back: one snapshot is both, and it is the one the
+        // tail was hung on.
+        None => (display.clone(), display),
+    }
+}
+
+/// Where a pane `lines` rows tall starts painting a restored tail of
+/// `total` rows: at the END of it.
+///
+/// A restored pane has no PTY, so it has no scrollback to scroll — the rows
+/// it does not show are rows the user cannot reach. Starting at the top
+/// would therefore show the OLDEST screenful of a 150-row tail and hide
+/// everything after it, which is the opposite of "what this terminal last
+/// said".
+fn restored_window_start(total: usize, lines: usize) -> usize {
+    total.saturating_sub(lines)
+}
+
+/// The snapshot a pane paints once its text has been RESTORED from disk.
+///
+/// Every field here is set so the pane cannot be mistaken for a live one:
+///
+/// * `exited` is `Some`, so [`exit_notice`] answers `LocalProcessExited`
+///   and the pane wears the treatment this codebase already has for a dead
+///   terminal — the overlay, and any key closing it — rather than a second,
+///   quieter one nobody would recognise. The CODE is a placeholder: no
+///   process ran, and nothing reads it beyond `is_some` (`exit_notice`).
+/// * The cursor is hidden and has no row, so [`local_paint_frame`] draws
+///   none. A blinking cursor is the strongest "this is live" signal a
+///   terminal has, and this grid is a picture.
+/// * Selection, search and scroll offset are empty: transient view state
+///   belonging to a session that no longer exists.
+fn restored_snapshot(
+    restored: &crate::scrollback::RestoredScrollback,
+    lines: usize,
+) -> RenderableSnapshot {
+    let start = restored_window_start(restored.rows.len(), lines);
+    let rows: Vec<Vec<crate::term_session::SnapshotCell>> = restored.rows[start..].to_vec();
+    RenderableSnapshot {
+        cols: restored.cols,
+        lines: rows.len(),
+        rows,
+        cursor: crate::term_session::SnapshotCursor {
+            col: 0,
+            row: None,
+            style: CursorStyle::Hidden,
+        },
+        display_offset: 0,
+        selection: Vec::new(),
+        app_cursor_mode: false,
+        bracketed_paste: false,
+        mouse_tracking: false,
+        alt_screen: false,
+        focused_title: None,
+        exited: Some(0),
+        selection_text: None,
+        search_matches: Vec::new(),
+        history_rows: Vec::new(),
+    }
+}
+
 /// The colour to draw the cursor overlay in.
 ///
 /// The cursor sits on the BROADCASTER's canvas, so it has to be legible
@@ -3298,7 +3500,14 @@ impl TerminalPane {
                 f32::from(self.cell_width) as u16,
                 f32::from(self.line_height) as u16,
             );
+            return;
         }
+        // No PTY to resize. For a RESTORED pane that is not the end of it:
+        // what resizing means there is how much of the stored tail fits, so
+        // the window moves and the newest rows stay at the bottom. Inert,
+        // as before, for every other session-less pane — `restored` is
+        // `None` for all of them.
+        self.show_restored_tail(lines);
     }
 
     /// URL spanning the given cell, if any.
@@ -6209,5 +6418,217 @@ mod attached_ui_tests {
         assert_eq!(url_in_row("(https://a.dev/b)", 3), None);
         assert_eq!(url_in_row("     ", 2), None);
         assert_eq!(url_in_row("plain words", 3), None);
+    }
+}
+
+/// Restoring a terminal's text into a pane that has no shell.
+///
+/// Everything here is the DECISION, extracted so it can be tested: there is
+/// no gpui harness in this crate, so `restore_scrollback`,
+/// `save_scrollback` and `show_restored_tail` are three lines of glue each
+/// around functions these tests drive directly.
+#[cfg(test)]
+mod restored_pane_tests {
+    use super::{
+        exit_message, exit_notice, local_paint_frame, may_restore_scrollback, may_save_scrollback,
+        restored_snapshot, restored_window_start, split_capture, CellLook, ExitNotice,
+    };
+    use crate::scrollback::RestoredScrollback;
+    use crate::term_session::{
+        CellColor, CellStyle, CursorStyle, RenderableSnapshot, SnapshotCell, SnapshotCursor,
+    };
+
+    fn style() -> CellStyle {
+        CellStyle {
+            fg: CellColor::Default,
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            dim: false,
+            underline: false,
+            inverse: false,
+            hidden: false,
+        }
+    }
+
+    fn row(text: &str) -> Vec<SnapshotCell> {
+        text.chars()
+            .map(|ch| SnapshotCell {
+                ch,
+                style: style(),
+                wide_spacer: false,
+            })
+            .collect()
+    }
+
+    fn restored(lines: &[&str]) -> RestoredScrollback {
+        RestoredScrollback {
+            cols: lines.iter().map(|l| l.chars().count()).max().unwrap_or(0),
+            rows: lines.iter().map(|l| row(l)).collect(),
+        }
+    }
+
+    fn text_of(snapshot: &RenderableSnapshot) -> Vec<String> {
+        snapshot
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.ch).collect())
+            .collect()
+    }
+
+    fn live_snapshot(rows: Vec<Vec<SnapshotCell>>) -> RenderableSnapshot {
+        RenderableSnapshot {
+            cols: rows.first().map(|r| r.len()).unwrap_or(0),
+            lines: rows.len(),
+            rows,
+            cursor: SnapshotCursor {
+                col: 0,
+                row: Some(0),
+                style: CursorStyle::Block,
+            },
+            display_offset: 0,
+            selection: Vec::new(),
+            app_cursor_mode: false,
+            bracketed_paste: false,
+            mouse_tracking: false,
+            alt_screen: false,
+            focused_title: None,
+            exited: None,
+            selection_text: None,
+            search_matches: Vec::new(),
+            history_rows: Vec::new(),
+        }
+    }
+
+    fn always_safe(_: char, _: usize, _: &CellLook) -> bool {
+        true
+    }
+
+    // --- a restored pane must never look live ------------------------------
+
+    #[test]
+    fn a_restored_pane_paints_no_cursor() {
+        // The spec's worst outcome is a restored pane that looks live, and
+        // a blinking cursor is the strongest live signal a terminal has.
+        // Asserted through the REAL painter, not on the snapshot's fields,
+        // because the painter is what decides whether a cursor is drawn.
+        let snapshot = restored_snapshot(&restored(&["hello", "world"]), 24);
+        let frame = local_paint_frame(&snapshot, crate::themes::default_theme(), &always_safe);
+        assert_eq!(
+            frame.cursor, None,
+            "a picture must not blink a cursor at you"
+        );
+        assert_eq!(frame.cursor_style, CursorStyle::Hidden);
+        assert_eq!(frame.rows.len(), 2, "the text itself is still painted");
+    }
+
+    #[test]
+    fn a_restored_pane_wears_the_existing_dead_treatment() {
+        // Not a new, quieter notice of its own: the same one a local shell
+        // that exited gets, so the overlay says so and any key closes it.
+        let snapshot = restored_snapshot(&restored(&["hello"]), 24);
+        let notice = exit_notice(false, snapshot.exited.is_some(), false);
+        assert_eq!(notice, ExitNotice::LocalProcessExited);
+        assert_eq!(
+            exit_message(notice),
+            Some("[process exited - press any key to close]")
+        );
+    }
+
+    #[test]
+    fn stored_text_is_never_painted_over_a_live_shell() {
+        // The refusal that matters: with a session behind it, restored text
+        // would be a picture laid over a running terminal — the user types,
+        // sees the picture, and believes the command ran.
+        assert!(
+            !may_restore_scrollback(false, true),
+            "a local pane with a shell must keep painting its shell"
+        );
+        assert!(
+            !may_restore_scrollback(true, false),
+            "a pane viewing another machine paints frames from the wire"
+        );
+        assert!(!may_restore_scrollback(true, true));
+        assert!(
+            may_restore_scrollback(false, false),
+            "a local pane with no shell is the only one there is to restore"
+        );
+    }
+
+    #[test]
+    fn only_a_local_pane_with_a_shell_has_text_of_its_own_to_store() {
+        assert!(may_save_scrollback(false, true));
+        assert!(
+            !may_save_scrollback(true, true),
+            "a remote pane's rows belong to another machine"
+        );
+        assert!(
+            !may_save_scrollback(false, false),
+            "a pane with no shell must not write an empty capture over the \
+             file a restored pane is showing"
+        );
+        assert!(!may_save_scrollback(true, false));
+    }
+
+    // --- which rows a restored pane shows ----------------------------------
+
+    #[test]
+    fn a_restored_pane_shows_the_newest_rows_not_the_oldest() {
+        // It has no PTY, so it has no scrollback to scroll: rows it does
+        // not paint are rows the user cannot reach. Showing the top of a
+        // 150-row tail would hide everything the terminal last said.
+        let lines: Vec<String> = (0..150).map(|i| format!("row{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        let snapshot = restored_snapshot(&restored(&refs), 24);
+        let painted = text_of(&snapshot);
+        assert_eq!(painted.len(), 24);
+        assert_eq!(painted.first().map(String::as_str), Some("row126"));
+        assert_eq!(painted.last().map(String::as_str), Some("row149"));
+        assert_eq!(snapshot.lines, 24, "`lines` describes what is painted");
+    }
+
+    #[test]
+    fn a_short_scrollback_is_shown_whole_rather_than_padded() {
+        let snapshot = restored_snapshot(&restored(&["one", "two"]), 24);
+        assert_eq!(text_of(&snapshot), vec!["one", "two"]);
+        assert_eq!(restored_window_start(2, 24), 0);
+        assert_eq!(restored_window_start(0, 24), 0);
+        assert_eq!(restored_window_start(150, 24), 126);
+        assert_eq!(restored_window_start(150, 150), 0);
+    }
+
+    // --- what a save actually captures -------------------------------------
+
+    #[test]
+    fn the_stored_half_of_a_capture_is_the_one_carrying_the_scrollback() {
+        // `sync_and_snapshot_with_live` hangs the history tail on whichever
+        // snapshot the phone would publish — the LIVE screen when the pane
+        // is scrolled back. Storing the display instead would save the rows
+        // the user happens to be looking at and lose the history entirely,
+        // which is the bug this whole entry point exists to avoid.
+        let mut display = live_snapshot(vec![row("scrolled-back-view")]);
+        display.display_offset = 40;
+        let mut live = live_snapshot(vec![row("live-screen")]);
+        live.history_rows = vec![row("older"), row("newer")];
+
+        let (paint, stored) = split_capture(display, Some(live));
+        assert_eq!(text_of(&paint), vec!["scrolled-back-view"]);
+        assert_eq!(
+            text_of(&stored),
+            vec!["live-screen"],
+            "the stored half is the live screen"
+        );
+        assert_eq!(
+            stored.history_rows.len(),
+            2,
+            "and it is the half the scrollback rode in on"
+        );
+
+        // Not scrolled back: one snapshot is both, and it still has the tail.
+        let mut only = live_snapshot(vec![row("live-screen")]);
+        only.history_rows = vec![row("older")];
+        let (paint, stored) = split_capture(only, None);
+        assert_eq!(text_of(&paint), text_of(&stored));
+        assert_eq!(stored.history_rows.len(), 1);
     }
 }

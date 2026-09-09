@@ -1569,6 +1569,77 @@ mod tests {
     }
 
     #[test]
+    fn only_the_history_bearing_capture_carries_the_scrollback() {
+        // The reason the scrollback save cannot reuse a pane's cached
+        // snapshot. `sync_and_snapshot` passes `with_history = false`, so
+        // everything that has scrolled off the ten visible rows is simply
+        // absent from it — a save taken from there would store the visible
+        // screen and silently drop the scrollback the feature exists for.
+        let _serial = super::pty_test_guard();
+        let mut session = test_session(80, 10, None);
+        session.write(b"i=1; while [ $i -le 60 ]; do echo LINE$i; i=$((i+1)); done\r".to_vec());
+        let visible = wait_for(&mut session, |s| grid_contains(s, "LINE60"), 20);
+        assert!(grid_contains(&visible, "LINE60"), "the run finished");
+        assert!(
+            visible.history_rows.is_empty(),
+            "the render capture never pays for history"
+        );
+        assert!(
+            !grid_contains(&visible, "LINE5 "),
+            "an early line has scrolled off the ten visible rows"
+        );
+
+        let (display, live) = session.sync_and_snapshot_with_live();
+        assert!(
+            live.is_none(),
+            "not scrolled back, so there is one snapshot"
+        );
+        assert!(
+            !display.history_rows.is_empty(),
+            "the history-bearing capture carries the rows that scrolled off"
+        );
+        let recovered: String = display
+            .history_rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            recovered.contains("LINE5 ") || recovered.contains("LINE5\n"),
+            "a line the visible screen has lost is in the history:\n{recovered}"
+        );
+
+        // End to end through the store: the same two captures, saved and
+        // loaded back, differ by exactly the scrollback.
+        let dir = std::env::temp_dir().join(format!("st-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::scrollback::save_in(&dir, "visible", &visible).unwrap();
+        crate::scrollback::save_in(&dir, "withhistory", &display).unwrap();
+        let thin = crate::scrollback::load_in(&dir, "visible").expect("saved");
+        let full = crate::scrollback::load_in(&dir, "withhistory").expect("saved");
+        assert!(
+            full.rows.len() > thin.rows.len(),
+            "the history-bearing save must store more rows: {} vs {}",
+            full.rows.len(),
+            thin.rows.len()
+        );
+        let stored: String = full
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            stored.contains("LINE5 ") || stored.contains("LINE5\n"),
+            "the scrollback reached the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
+    }
+
+    #[test]
     fn exit_surfaces_event_and_snapshot_flag() {
         let _serial = super::pty_test_guard();
         let mut session = test_session(80, 24, None);
