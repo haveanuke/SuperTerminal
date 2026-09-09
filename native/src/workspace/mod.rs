@@ -5004,6 +5004,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let theme = self.theme;
+        // One cap for every sheet this function can open, so they cannot
+        // drift to different heights.
+        let sheet_max = Self::sheet_max_height(window);
         match self.overlay {
             Overlay::None => None,
             Overlay::SettingsSheet => {
@@ -5151,7 +5154,7 @@ impl Workspace {
                 };
 
                 Some(
-                    self.sheet("settings", "esc closes", cx)
+                    self.sheet("settings", "esc closes", sheet_max, cx)
                         .child(
                             div()
                                 .flex()
@@ -5199,18 +5202,25 @@ impl Workspace {
                                     div()
                                         .id("settings-content")
                                         .flex_grow()
-                                        // Capped against the ACTUAL window, not a
-                                        // fixed guess. 280px was under half the
-                                        // height on a large window and well over it
-                                        // on a small one, so the sheet could swallow
-                                        // the terminal it is meant to be sitting
-                                        // over. A third of the viewport leaves the
-                                        // sheet's own chrome — nav column, heading,
-                                        // padding — inside a half-height budget.
+                                        // Sized against the ACTUAL window rather than
+                                        // a fixed guess. It was 280px, which is a
+                                        // different fraction of every window, and
+                                        // then briefly a THIRD of the height — which
+                                        // was reading the request backwards. The
+                                        // sheet is allowed to be big: it is a
+                                        // settings panel the user opened on purpose,
+                                        // not something covering work they were
+                                        // doing.
+                                        //
+                                        // 60% of the viewport for the CONTENT, so
+                                        // the sheet with its chrome sits a little
+                                        // above two thirds and still reads as a
+                                        // panel over the terminal rather than a
+                                        // screen of its own.
                                         //
                                         // Floored so a very short window still shows
                                         // something scrollable rather than a sliver.
-                                        .max_h(px((vh / 3.0).max(160.0)))
+                                        .max_h(px((vh * 0.6).max(220.0)))
                                         .overflow_y_scroll()
                                         .flex()
                                         .flex_col()
@@ -5234,7 +5244,7 @@ impl Workspace {
                         .map(|pane| pane.read(cx).owns_grid()),
                 ) {
                     return Some(
-                        self.sheet("search", "esc closes", cx)
+                        self.sheet("search", "esc closes", sheet_max, cx)
                             .child(
                                 div()
                                     .text_size(px(11.0))
@@ -5288,17 +5298,22 @@ impl Workspace {
                     });
                 }
                 Some(
-                    self.sheet("search", "enter jumps to older matches - esc clears", cx)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(div().text_color(rgb(theme.ui_accent)).child("find >"))
-                                .child(div().flex_grow().child(field)),
-                        )
-                        .into_any_element(),
+                    self.sheet(
+                        "search",
+                        "enter jumps to older matches - esc clears",
+                        sheet_max,
+                        cx,
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().text_color(rgb(theme.ui_accent)).child("find >"))
+                            .child(div().flex_grow().child(field)),
+                    )
+                    .into_any_element(),
                 )
             }
             Overlay::AutoRun => {
@@ -5333,7 +5348,7 @@ impl Workspace {
                     .and_then(|id| self.panes.get(id))
                     .is_some_and(|pane| pane.read(cx).auto_run.is_some());
                 Some(
-                    self.sheet("auto-run", "enter starts - esc closes", cx)
+                    self.sheet("auto-run", "enter starts - esc closes", sheet_max, cx)
                         .child(
                             div()
                                 .flex()
@@ -5485,32 +5500,41 @@ impl Workspace {
                     .collect();
                 let empty = rows.is_empty();
                 Some(
-                    self.sheet("sessions", "enter saves - click loads - esc closes", cx)
-                        .child(
-                            // Prompt-style save line.
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(div().text_color(rgb(theme.ui_accent)).child("save as >"))
-                                .child(div().flex_grow().child(field)),
-                        )
-                        .child(div().flex().flex_col().gap(px(1.0)).children(rows))
-                        .children(empty.then(|| {
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(rgb(theme.ui_text_muted))
-                                .child("no saved sessions yet - type a name and press enter")
-                        }))
-                        .into_any_element(),
+                    self.sheet(
+                        "sessions",
+                        "enter saves - click loads - esc closes",
+                        sheet_max,
+                        cx,
+                    )
+                    .child(
+                        // Prompt-style save line.
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().text_color(rgb(theme.ui_accent)).child("save as >"))
+                            .child(div().flex_grow().child(field)),
+                    )
+                    .child(div().flex().flex_col().gap(px(1.0)).children(rows))
+                    .children(empty.then(|| {
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("no saved sessions yet - type a name and press enter")
+                    }))
+                    .into_any_element(),
                 )
             }
-            Overlay::PetCard => Some(self.render_pet_card(cx)),
+            Overlay::PetCard => Some(self.render_pet_card(sheet_max, cx)),
         }
     }
 
-    fn render_pet_card(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_pet_card(
+        &mut self,
+        sheet_max: gpui::Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = self.theme;
         let color = self.companion.rarity_color();
         let art = self.companion.art_frame(0, false);
@@ -5561,7 +5585,7 @@ impl Workspace {
         let reroll_armed = self.pet_reroll_armed;
         let pet_visible = self.settings.buddy_pet_visible;
 
-        self.sheet("buddy", "enter saves name - esc closes", cx)
+        self.sheet("buddy", "enter saves name - esc closes", sheet_max, cx)
             .child(
                 div()
                     .flex()
@@ -5695,10 +5719,28 @@ impl Workspace {
 
     /// Bottom sheet anchored above the bar: panels read as extensions of the
     /// tmux bar, not floating dialogs.
+    /// How tall a bottom sheet may get: most of the window, not a fixed
+    /// 360px.
+    ///
+    /// 360 was the same absolute height whatever the window, so on anything
+    /// tall it left the sheet squeezed into the bottom fifth while the
+    /// terminal above it sat empty. A sheet is something the user opened on
+    /// purpose; it can have the room.
+    ///
+    /// Floored so a very short window still gets a usable panel rather than
+    /// a sliver, and capped below the full height so it always reads as a
+    /// panel OVER the terminal rather than a screen of its own.
+    fn sheet_max_height(window: &Window) -> gpui::Pixels {
+        px((f32::from(window.viewport_size().height) * 0.72).max(260.0))
+    }
+
+    /// A bottom sheet. `max_height` is the WINDOW-relative cap the caller
+    /// computed; see [`Self::sheet_max_height`].
     fn sheet(
         &self,
         title: &'static str,
         hint: &'static str,
+        max_height: gpui::Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
@@ -5708,7 +5750,7 @@ impl Workspace {
             .bottom_0()
             .left_0()
             .right_0()
-            .max_h(px(360.0))
+            .max_h(max_height)
             .bg(rgb(theme.ui_background))
             .border_t_2()
             .border_color(rgb(theme.ui_accent))
