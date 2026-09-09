@@ -70,10 +70,15 @@ pub struct Project {
     /// merge into it (see `ProjectStore::record`) — the record is the
     /// user's now, identified by `id`, not by its paths.
     pub renamed: bool,
-    /// How many terminals the project had when it was LAST captured —
-    /// "how big is this thing" before you open it. Latest capture wins:
-    /// unlike the label, this is a measurement, not something the user
-    /// made theirs, so a pinned record's count still moves.
+    /// How many terminals the project had when it was LAST captured.
+    /// Latest capture wins: unlike the label, this is a measurement, not
+    /// something the user made theirs, so a pinned record's count moves.
+    ///
+    /// Still recorded, no longer SHOWN. It was in the row summary and
+    /// truncated the project's NAME in a narrow sidebar, which cost more
+    /// than it told anyone. Kept in the record because it comes for free
+    /// from the same pane map the directories do, and dropping a persisted
+    /// field to save nothing would only have to be added back.
     pub terminals: usize,
     /// Wall-clock seconds this project has been open, SUMMED across every
     /// session. On the way into [`ProjectStore::record`] the field carries
@@ -958,13 +963,14 @@ pub struct SidebarSections<'a> {
 /// of the projects that are open RIGHT NOW.
 ///
 /// A project that is open is already listed above as a live tab, so
-/// repeating it under RECENT shows the user the same thing twice and
+/// repeating it in either section shows the user the same thing twice and
 /// invites them to "reopen" what they are looking at.
 ///
-/// PINNED is deliberately NOT filtered. Pinning is a promise that the
-/// project is always in that list; making it vanish the moment it is
-/// opened would look like pinning had broken, exactly when the user is
-/// using it.
+/// PINNED is filtered too, which reverses an earlier decision. That
+/// version argued pinning is a promise the project is always in the list,
+/// so hiding it would look broken. In use the duplicate was the thing that
+/// looked broken. Pinning promises the project is there when you come
+/// BACK; it returns the moment the tab closes.
 ///
 /// Matched on the project's stored ANCHOR, the same way `record` decides
 /// two captures are one project — so a tab that has picked up an extra
@@ -1001,11 +1007,12 @@ pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> S
 
 /// Which already-open tab IS this project, if any.
 ///
-/// The pinned section deliberately keeps showing a project that is open —
-/// that is what pinning is for, and hiding it would make the pin look
-/// broken. But the row then has to SWITCH to that tab rather than reopen
-/// it: clicking a pinned project that was already open spawned a second
-/// copy of every one of its terminals, and clicking again spawned another,
+/// Now that `sidebar_sections` hides an open project from both sections,
+/// no steady-state row can be clicked while its project is open — so this
+/// is a guard against a STALE render rather than the everyday path it was
+/// written as. A row built while the project was closed can be clicked
+/// after it has opened, and without this that click would spawn a second
+/// copy of every one of its terminals, and another on the next click,
 /// without limit.
 ///
 /// Matched on the stored anchor, the same rule `record` and

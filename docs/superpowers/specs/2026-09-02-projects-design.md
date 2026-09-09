@@ -246,13 +246,16 @@ later without disturbing anything built here.
   entry is REPLACED when its cwd changes, so a shell that `cd`s around all day
   contributes one directory rather than every directory it ever visited. The
   map dies with its tab, alongside the tab's other per-tab state.
-- **A project that is open is not also listed in RECENT.** It is the live tab
-  above; listing it twice invites the user to "reopen" what they are looking
-  at. It IS still listed in PINNED when pinned — pinning is a promise that the
-  project is always in that list, and hiding it the moment it is opened would
-  look like pinning had broken. "Open" is decided by the same anchor rule
-  identity uses, so a tab that has since picked up an extra terminal somewhere
-  still counts as the project it is.
+- **A project that is open is listed ONCE, as the live tab.** Neither RECENT
+  nor PINNED repeats it. An earlier draft kept it in PINNED, arguing that
+  pinning promises the project is always in that list and hiding it would look
+  broken. Using it settled the argument the other way: the project appears in
+  the live tab list AND under PINNED, and the second copy reads as a duplicate
+  nobody can account for. Pinning promises the project is there when you come
+  BACK — it reappears the moment the tab closes, which is what makes hiding it
+  safe. "Open" is decided by the same anchor rule identity uses, so a tab that
+  has since picked up an extra terminal somewhere still counts as the project
+  it is.
 - The cap evicts the oldest UNPINNED project only, and never the capture that
   was just recorded: `last_opened` comes from the system clock, so a store
   carrying future timestamps (skew, a restored backup, a hand-edited file) would

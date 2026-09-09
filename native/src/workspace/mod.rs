@@ -3487,8 +3487,8 @@ impl Workspace {
         // stale the moment a tab closes and so is always re-resolved).
         //
         // A project that is open right now is the live tab above, so it is
-        // filtered out of RECENT and left in PINNED — `sidebar_sections`
-        // says why. The open sets come from `tab_pane_dirs`, which is
+        // filtered out of BOTH sections — `sidebar_sections` says why.
+        // The open sets come from `tab_pane_dirs`, which is
         // plain data this workspace already holds: no pane is read and no
         // process is queried to render a frame.
         let open_now: Vec<Vec<PathBuf>> = self
@@ -3602,8 +3602,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// One remembered project: its name, and what it IS — folder count,
-    /// terminal count and time worked, from `projects::project_summary`.
+    /// One remembered project: its name, and what it IS — folder count and
+    /// time worked, from `projects::project_summary`. The terminal count
+    /// was there and was dropped: in a narrow sidebar it truncated the
+    /// name, which is the only part anyone scans for.
+    ///
     /// Clicking reopens it; clicking its pin keeps it (or lets it go).
     fn render_project_row(
         &self,
