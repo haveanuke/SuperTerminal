@@ -21,6 +21,9 @@ pub enum Icon {
     Share { active: bool },
     /// Two overlapping screens — another Mac's terminals, seen from here.
     Peers,
+    /// Pushpin — a project kept out of the recents cap; filled head = it
+    /// is pinned right now, hollow = it is not.
+    Pin { filled: bool },
 }
 
 pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
@@ -108,6 +111,26 @@ pub fn icon(kind: Icon, color: u32) -> impl IntoElement {
                     // Prompt mark inside the front screen.
                     line(window, 4.0, 8.5, 6.0, 9.75);
                     line(window, 6.0, 9.75, 4.0, 11.0);
+                }
+                Icon::Pin { filled } => {
+                    // The needle is drawn either way: it is the stroke
+                    // that reads as "pin" at 16px, and losing it would
+                    // make the hollow state look like an empty box.
+                    line(window, 8.0, 10.0, 8.0, 14.5);
+                    if filled {
+                        quad(window, 3.5, 2.0, 9.0, 2.5);
+                        quad(window, 6.0, 4.5, 4.0, 5.5);
+                    } else {
+                        // Head.
+                        line(window, 3.5, 2.0, 12.5, 2.0);
+                        line(window, 12.5, 2.0, 12.5, 4.5);
+                        line(window, 12.5, 4.5, 3.5, 4.5);
+                        line(window, 3.5, 4.5, 3.5, 2.0);
+                        // Shaft down to the needle.
+                        line(window, 6.0, 4.5, 6.0, 10.0);
+                        line(window, 10.0, 4.5, 10.0, 10.0);
+                        line(window, 6.0, 10.0, 10.0, 10.0);
+                    }
                 }
                 Icon::Share { active } => {
                     // Two edges from the left node out to the two right

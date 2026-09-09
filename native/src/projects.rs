@@ -708,7 +708,7 @@ impl ProjectStore {
         // pinned list ordered by use and stops a second, unpinned copy of
         // the same project accumulating in recents every time it is opened.
         // The spec's rule is that such a record keeps its `id`, and it does.
-        if let Some(index) = self.match_index(&project) {
+        if let Some(index) = self.match_index(&project.dirs) {
             let existing = &mut self.projects[index];
             existing.last_opened = project.last_opened;
             // Both stats move even for a pinned or renamed record. What
@@ -723,8 +723,8 @@ impl ProjectStore {
             // incoming value is one session's increment.
             existing.active_secs = existing.active_secs.saturating_add(project.active_secs);
             if !existing.pinned && !existing.renamed {
-                existing.label = project.label;
-                existing.dirs = project.dirs;
+                existing.label = project.label.clone();
+                existing.dirs = std::mem::take(&mut project.dirs);
                 existing.icon = project.icon;
                 // `anchor` is deliberately NOT among them, pinned or not.
                 // The folders a project has move all the time; which one it
@@ -732,6 +732,20 @@ impl ProjectStore {
                 // that re-derived it would silently make this record answer
                 // to a different folder — after which the plain project,
                 // captured tomorrow, would no longer find it.
+            }
+            // A capture the user has NAMED speaks for the user, so its
+            // label goes through whatever the record already says — and
+            // marks the record theirs from here on.
+            //
+            // Without this the flag would never reach the store at all,
+            // and would protect nothing: an auto-capture labels a project
+            // from its anchor folder's basename, so the very next close
+            // would quietly take the user's name back off it. Only the
+            // NAME crosses; the record's folders stay its own, exactly as
+            // they do for a record already marked.
+            if project.renamed {
+                existing.label = project.label;
+                existing.renamed = true;
             }
             return;
         }
@@ -749,12 +763,17 @@ impl ProjectStore {
     /// project: the record anchored at the capture's OWN derived anchor
     /// first (the folder this capture is most plausibly rooted in), then by
     /// the same rank `anchor_dir` chooses with, then by position.
-    fn match_index(&self, project: &Project) -> Option<usize> {
-        let derived = anchor_dir(&project.dirs).map(|dir| dir_key(dir));
+    ///
+    /// Takes the DIRECTORIES rather than a whole `Project` because a live
+    /// tab is not a record and has none: [`ProjectStore::matching`] asks
+    /// this same question on behalf of a row the user is looking at, and
+    /// the two must never drift into answering it differently.
+    fn match_index(&self, dirs: &[PathBuf]) -> Option<usize> {
+        let derived = anchor_dir(dirs).map(|dir| dir_key(dir));
         self.projects
             .iter()
             .enumerate()
-            .filter(|(_, candidate)| capture_has_anchor_of(&project.dirs, candidate))
+            .filter(|(_, candidate)| capture_has_anchor_of(dirs, candidate))
             .min_by_key(|(index, candidate)| {
                 let anchor = project_anchor(candidate).expect("a match has an anchor");
                 let (depth, key) = anchor_rank(anchor);
@@ -763,6 +782,42 @@ impl ProjectStore {
                 (derived.as_deref() != Some(key.as_str()), depth, key, *index)
             })
             .map(|(index, _)| index)
+    }
+
+    /// The stored record a LIVE tab's folders belong to, if any.
+    ///
+    /// The same question `record` asks — is the record's own anchor folder
+    /// still one this tab has open — asked on behalf of a row the user is
+    /// looking at. A live tab is not a record, so pinning one has to find
+    /// the record it stands for first, and a tab that has since opened a
+    /// scratch terminal elsewhere must still find itself.
+    pub fn matching(&self, dirs: &[PathBuf]) -> Option<&Project> {
+        self.match_index(dirs).map(|index| &self.projects[index])
+    }
+
+    /// Pin or unpin the record with `id`; `false` when there is no such
+    /// record, so nothing changed.
+    ///
+    /// `last_opened` is deliberately left alone in BOTH directions. A pin
+    /// is a statement about keeping a project, never a use of it: bumping
+    /// the timestamp on unpin would drop a project the user has just let
+    /// go of at the TOP of recents, above everything they have actually
+    /// worked in since; bumping it on pin would reshuffle the pinned list
+    /// (`pinned()` sorts on it) on a click that said nothing about what
+    /// the user is working on.
+    ///
+    /// Unpinning past the cap evicts nothing here. The record stays,
+    /// `recent()` shows the newest `RECENT_CAP` of them, and the next
+    /// capture that adds a project trims the rest — unpinning must not be
+    /// a way to delete something.
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) -> bool {
+        match self.projects.iter_mut().find(|p| p.id == id) {
+            Some(project) => {
+                project.pinned = pinned;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drop the oldest unpinned project(s) until the unpinned count is back
@@ -2359,5 +2414,151 @@ mod anchor_tests {
         let sections = sidebar_sections(&store, &[vec![PathBuf::from(&home)]]);
         assert_eq!(sections.recent.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn dirs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// A capture of `paths` under a known id, so the assertions can name
+    /// the record they mean rather than the hash it happens to get.
+    fn capture(id: &str, paths: &[&str], last_opened: u64) -> Project {
+        let mut project = project_for_dirs(dirs(paths), last_opened).expect("dirs present");
+        project.id = id.to_string();
+        project
+    }
+
+    #[test]
+    fn pinning_moves_a_project_out_of_recents_and_into_pinned() {
+        let mut store = ProjectStore::default();
+        store.record(capture("chat", &["/chat"], 100));
+        store.record(capture("other", &["/other"], 200));
+
+        assert!(store.set_pinned("chat", true), "the record was there");
+
+        let pinned: Vec<&str> = store.pinned().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(pinned, vec!["chat"]);
+        let recent: Vec<&str> = store.recent().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(recent, vec!["other"], "pinned is no longer also recent");
+    }
+
+    #[test]
+    fn unpinning_returns_a_project_to_recents_where_its_last_use_puts_it() {
+        // The one thing unpinning must NOT do is look like a use. Bumping
+        // `last_opened` would drop a project the user just let go of at the
+        // TOP of recents, above everything they have actually worked in
+        // since — and pinning must not reorder the pinned list either.
+        let mut store = ProjectStore::default();
+        store.record(capture("old", &["/old"], 100));
+        store.record(capture("new", &["/new"], 300));
+
+        store.set_pinned("old", true);
+        assert!(store.set_pinned("old", false), "and back again");
+
+        let recent: Vec<&str> = store.recent().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            recent,
+            vec!["new", "old"],
+            "unpinned goes back where its last use puts it, not on top"
+        );
+        assert_eq!(
+            store.recent()[1].last_opened,
+            100,
+            "and the timestamp itself is untouched"
+        );
+    }
+
+    #[test]
+    fn a_pinned_project_survives_the_cap_that_evicts_the_recents_around_it() {
+        // The cap is what pinning buys you an exemption from: the oldest
+        // project in the store is the first thing evicted, and pinning it
+        // has to take it out of that queue permanently.
+        let mut store = ProjectStore::default();
+        for n in 1..=RECENT_CAP {
+            store.record(capture(&format!("p{n}"), &[&format!("/p{n}")], n as u64));
+        }
+        assert!(store.set_pinned("p1", true), "the oldest of them all");
+
+        // Three more captures push the UNPINNED count past the cap three
+        // times over; each one evicts the oldest unpinned project.
+        for n in 90..=92 {
+            store.record(capture(&format!("p{n}"), &[&format!("/p{n}")], n as u64));
+        }
+
+        let ids: Vec<&str> = store
+            .pinned()
+            .iter()
+            .chain(store.recent().iter())
+            .map(|p| p.id.as_str())
+            .collect();
+        assert!(ids.contains(&"p1"), "the pinned one is exempt: {ids:?}");
+        assert!(!ids.contains(&"p2"), "the oldest UNPINNED went instead");
+        assert!(!ids.contains(&"p3"), "and then the next oldest");
+        assert!(ids.contains(&"p4"), "eviction stopped at the cap: {ids:?}");
+    }
+
+    #[test]
+    fn setting_a_pin_on_an_id_the_store_has_not_got_changes_nothing() {
+        let mut store = ProjectStore::default();
+        store.record(capture("chat", &["/chat"], 100));
+        assert!(!store.set_pinned("ghost", true), "nothing to pin");
+        assert!(
+            store.pinned().is_empty(),
+            "and no innocent bystander was pinned in its place"
+        );
+    }
+
+    #[test]
+    fn a_live_tabs_folders_find_the_record_they_stand_for() {
+        // A live tab is not a record, so pinning one has to find the record
+        // it belongs to — by the same anchor rule `record` matches on, so a
+        // tab that has since opened a scratch terminal somewhere still
+        // finds itself.
+        let mut store = ProjectStore::default();
+        store.record(capture("chat", &["/chat", "/penpot"], 100));
+        store.record(capture("other", &["/other"], 200));
+
+        assert_eq!(
+            store
+                .matching(&dirs(&["/chat", "/tmp"]))
+                .map(|p| p.id.as_str()),
+            Some("chat"),
+            "the anchor folder is still open, so it is still that project"
+        );
+        assert!(
+            store.matching(&dirs(&["/nowhere"])).is_none(),
+            "and a tab rooted somewhere else belongs to no record"
+        );
+    }
+
+    #[test]
+    fn a_capture_the_user_named_writes_its_name_through_and_keeps_it() {
+        // The rename flag has to REACH the store, or it protects nothing:
+        // an auto-capture labels a project from its anchor's basename, so
+        // the very next close would take the user's name back off it.
+        let mut store = ProjectStore::default();
+        store.record(capture("chat", &["/chat"], 100));
+        assert_eq!(store.recent()[0].label, "chat", "the folder basename");
+
+        let mut named = capture("ignored", &["/chat"], 200);
+        named.label = "Chat stack".to_string();
+        named.renamed = true;
+        store.record(named);
+
+        assert_eq!(store.recent()[0].id, "chat", "still the same record");
+        assert_eq!(store.recent()[0].label, "Chat stack");
+        assert!(store.recent()[0].renamed, "and it is the user's now");
+
+        store.record(capture("ignored", &["/chat"], 300));
+        assert_eq!(
+            store.recent()[0].label,
+            "Chat stack",
+            "a later auto-capture must not take the name back"
+        );
     }
 }

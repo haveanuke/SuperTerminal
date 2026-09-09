@@ -490,6 +490,20 @@ pub struct Workspace {
     sidebar_status_cache: HashMap<String, (String, Activity)>,
     /// Projects collapsed in the sidebar (by tab id).
     collapsed_projects: std::collections::HashSet<String>,
+    /// Tabs the user has NAMED (by tab id), from any of the three places a
+    /// rename can land: the inline field's Enter, the same field's
+    /// click-away commit, and a rename asked for from the phone.
+    ///
+    /// A capture of one of these carries the user's own label and sets
+    /// `Project::renamed`, which is the only thing that makes that flag
+    /// mean anything: an auto-capture labels a project from its anchor
+    /// folder's basename, so without this the very next close would
+    /// quietly take the name back off it.
+    ///
+    /// Keyed by tab id and pruned in `prune_closed_tab_state` alongside
+    /// `collapsed_projects`, so a future tab that reuses an id does not
+    /// inherit someone else's rename.
+    renamed_tabs: std::collections::HashSet<String>,
     /// When each open tab started accruing `active_secs` (unix seconds, by
     /// tab id): its creation, its reopen, or its last capture. Reset on
     /// capture rather than cleared, so a tab that is captured twice — the
@@ -707,6 +721,7 @@ impl Workspace {
             sidebar_view: SidebarView::Projects,
             sidebar_status_cache: HashMap::new(),
             collapsed_projects: std::collections::HashSet::new(),
+            renamed_tabs: std::collections::HashSet::new(),
             tab_opened_at: HashMap::new(),
             tab_pane_dirs: HashMap::new(),
             // Read once at startup: the sidebar opens on the projects view,
@@ -1284,13 +1299,20 @@ impl Workspace {
             // Mac's inline rename edits); the metadata sweep below
             // republishes it to the phone.
             for (terminal_id, label) in hub.take_renames() {
+                // Rename site 3 of 3 (from the phone). The tab id is
+                // collected rather than marked in place: `self.tabs` is
+                // borrowed mutably here, and a name given from the phone
+                // is no less the user's than one typed on the Mac.
+                let mut named = None;
                 for tab in &mut self.tabs {
                     if tab.all_terminal_ids().iter().any(|id| *id == terminal_id) {
                         tab.label = label;
+                        named = Some(tab.id.clone());
                         cx.notify();
                         break;
                     }
                 }
+                self.renamed_tabs.extend(named);
             }
             // Phone-requested closes: tearing down a PTY is main-thread work,
             // so it goes through the same path as closing from the Mac.
@@ -1854,15 +1876,17 @@ impl Workspace {
     }
 
     /// Drop per-tab state for projects that no longer exist: the sidebar's
-    /// collapsed set, the `active_secs` marks and each tab's memory of its
-    /// own panes alike. All three are keyed by tab id, so all three would
-    /// otherwise hand a future tab that reused the id someone else's state
-    /// — a collapsed row, an uptime measured from a project that closed
-    /// hours ago, or another project's folders.
+    /// collapsed set, the set of tabs the user has renamed, the
+    /// `active_secs` marks and each tab's memory of its own panes alike.
+    /// All four are keyed by tab id, so all four would otherwise hand a
+    /// future tab that reused the id someone else's state — a collapsed
+    /// row, a name the user never gave it, an uptime measured from a
+    /// project that closed hours ago, or another project's folders.
     fn prune_closed_tab_state(&mut self) {
         let live: std::collections::HashSet<String> =
             self.tabs.iter().map(|tab| tab.id.clone()).collect();
         self.collapsed_projects.retain(|id| live.contains(id));
+        self.renamed_tabs.retain(|id| live.contains(id));
         self.tab_opened_at.retain(|id, _| live.contains(id));
         self.tab_pane_dirs.retain(|id, _| live.contains(id));
     }
@@ -2015,6 +2039,15 @@ impl Workspace {
             let (terminals, active_secs) = self.tab_stats(tab, now);
             project.terminals = terminals;
             project.active_secs = active_secs;
+            // A tab the user NAMED carries that name into the store, and
+            // says so. `project_for_dirs` labels from the anchor folder's
+            // basename, which is the right default and the wrong answer
+            // for a project the user has already named — see
+            // `renamed_tabs` and `ProjectStore::record`.
+            if self.renamed_tabs.contains(&tab.id) {
+                project.label = tab.label.clone();
+                project.renamed = true;
+            }
             captured.push(project);
         }
         // Reset rather than clear: a tab captured twice (the window closing
@@ -2048,6 +2081,62 @@ impl Workspace {
     fn record_open_projects(&mut self, cx: &App) {
         let all: Vec<usize> = (0..self.tabs.len()).collect();
         self.record_projects(&all, cx);
+    }
+
+    // --- projects: pinning ---
+
+    /// The folders the tab at `index` has had, or none for an index that
+    /// no longer names a tab. The rows resolve a tab by INDEX at render
+    /// time and by id at click time, so both need this.
+    fn tab_dirs_at(&self, index: usize) -> Vec<PathBuf> {
+        self.tabs
+            .get(index)
+            .map(|tab| self.tab_dirs(tab))
+            .unwrap_or_default()
+    }
+
+    /// Pin or unpin the stored record with `id`.
+    ///
+    /// Reloaded from disk rather than mutated in the cache, the same way
+    /// `open_project` and `record_projects` write: `projects_cache` is a
+    /// render-time copy that another window may already have moved past,
+    /// and a pin must not carry a stale list back over it.
+    fn set_project_pinned(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
+        let mut store = crate::projects::ProjectStore::load();
+        if store.set_pinned(id, pinned) {
+            // A failed write is an inconvenience, never a reason to
+            // interrupt anything — `settings.rs`'s discipline throughout.
+            let _ = store.save();
+        }
+        self.projects_cache = store;
+        cx.notify();
+    }
+
+    /// Pin or unpin a LIVE tab — the project the user is looking at rather
+    /// than one sitting in recents.
+    ///
+    /// A live tab is not a record, and until it closes it has none, so
+    /// pinning one records it first: pinning is a promise that the project
+    /// will be in that list, and a promise about something the store has
+    /// never heard of is not one. A tab with nothing worth remembering
+    /// (the bare `$HOME` starter tab) is refused outright rather than
+    /// captured — its row draws no pin at all.
+    fn toggle_tab_pin(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if !crate::projects::worth_remembering(&self.tab_dirs_at(tab_index)) {
+            return;
+        }
+        if self
+            .projects_cache
+            .matching(&self.tab_dirs_at(tab_index))
+            .is_none()
+        {
+            self.record_project_at(tab_index, cx);
+        }
+        let Some(project) = self.projects_cache.matching(&self.tab_dirs_at(tab_index)) else {
+            return; // the capture found nothing to keep; nothing to pin
+        };
+        let (id, pinned) = (project.id.clone(), project.pinned);
+        self.set_project_pinned(&id, !pinned, cx);
     }
 
     /// Reopen a remembered project: one terminal per remembered directory,
@@ -2285,12 +2374,19 @@ impl Workspace {
             move |ws, _field, event: &TextFieldEvent, cx| match event {
                 TextFieldEvent::Submitted(name) => {
                     if let Some((idx, _)) = ws.rename_field.take() {
+                        // Rename site 1 of 3 (Enter). Every one of them
+                        // has to mark the tab, or a capture takes the
+                        // user's name straight back off the project —
+                        // see `renamed_tabs`.
+                        let mut named = None;
                         if let Some(tab) = ws.tabs.get_mut(idx) {
                             let trimmed = name.trim();
                             if !trimmed.is_empty() {
                                 tab.label = trimmed.to_string();
+                                named = Some(tab.id.clone());
                             }
                         }
+                        ws.renamed_tabs.extend(named);
                     }
                     cx.notify();
                 }
@@ -2810,6 +2906,19 @@ impl Workspace {
             let count = terminal_ids.len();
             let project_tab_id = tab.id.clone();
             let close_tab_id = tab.id.clone();
+            let pin_tab_id = tab.id.clone();
+            // A live tab's pin state lives in the STORE, not on the tab —
+            // a tab is a window on a project, and pinning is something
+            // the project carries across quits. `matching` finds the
+            // record this tab stands for by the same anchor rule capture
+            // uses; a tab with nothing worth remembering has no record and
+            // gets no pin.
+            let tab_dirs = self.tab_dirs(tab);
+            let can_pin = crate::projects::worth_remembering(&tab_dirs);
+            let tab_pinned = self
+                .projects_cache
+                .matching(&tab_dirs)
+                .is_some_and(|record| record.pinned);
             let label_element = if let Some((_, field)) = self
                 .rename_field
                 .as_ref()
@@ -2875,6 +2984,37 @@ impl Workspace {
                             ))),
                     )
                     .child(div().flex_grow())
+                    .children(can_pin.then(|| {
+                        div()
+                            .id(SharedString::from(format!("project-pin-{}", tab.id)))
+                            .flex_none()
+                            .cursor_pointer()
+                            .px(px(2.0))
+                            .opacity(if tab_pinned { 1.0 } else { 0.45 })
+                            .hover(|style| style.opacity(1.0))
+                            .child(crate::icons::icon(
+                                crate::icons::Icon::Pin { filled: tab_pinned },
+                                if tab_pinned {
+                                    theme.ui_accent
+                                } else {
+                                    theme.ui_text_muted
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |ws, _, _, cx| {
+                                    cx.stop_propagation();
+                                    // The STABLE id, resolved at click
+                                    // time: a captured index goes stale
+                                    // the moment another tab closes.
+                                    if let Some(index) =
+                                        ws.tabs.iter().position(|t| t.id == pin_tab_id)
+                                    {
+                                        ws.toggle_tab_pin(index, cx);
+                                    }
+                                }),
+                            )
+                    }))
                     .child(
                         div()
                             .id(SharedString::from(format!("project-new-win-{}", tab.id)))
@@ -3252,7 +3392,7 @@ impl Workspace {
 
     /// One remembered project: its name, and what it IS — folder count,
     /// terminal count and time worked, from `projects::project_summary`.
-    /// Clicking reopens it.
+    /// Clicking reopens it; clicking its pin keeps it (or lets it go).
     fn render_project_row(
         &self,
         project: &crate::projects::Project,
@@ -3264,28 +3404,68 @@ impl Workspace {
             project.terminals,
             project.active_secs,
         );
+        let pinned = project.pinned;
+        let pin_id = project.id.clone();
         let to_open = project.clone();
         div()
             .id(SharedString::from(format!("project-open-{}", project.id)))
             .flex()
-            .flex_col()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
             .px(px(8.0))
             .py(px(3.0))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(theme.ui_surface)))
             .child(
                 div()
+                    .flex_grow()
                     .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_color(rgb(theme.ui_text))
-                    .child(SharedString::from(project.label.clone())),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(rgb(theme.ui_text))
+                            .child(SharedString::from(project.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(SharedString::from(summary)),
+                    ),
             )
             .child(
                 div()
-                    .text_size(px(9.0))
-                    .text_color(rgb(theme.ui_text_muted))
-                    .child(SharedString::from(summary)),
+                    .id(SharedString::from(format!(
+                        "project-pin-row-{}",
+                        project.id
+                    )))
+                    .flex_none()
+                    .cursor_pointer()
+                    .px(px(2.0))
+                    .opacity(if pinned { 1.0 } else { 0.45 })
+                    .hover(|style| style.opacity(1.0))
+                    .child(crate::icons::icon(
+                        crate::icons::Icon::Pin { filled: pinned },
+                        if pinned {
+                            theme.ui_accent
+                        } else {
+                            theme.ui_text_muted
+                        },
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |ws, _, _, cx| {
+                            // Never also reopen the project: the pin is a
+                            // control ON the row, not the row.
+                            cx.stop_propagation();
+                            ws.set_project_pinned(&pin_id, !pinned, cx);
+                        }),
+                    ),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -5411,11 +5591,17 @@ impl Render for Workspace {
             } else if self.rename_blur_armed {
                 // Observed focus was lost: commit (old app's blur behavior).
                 let name = field.read(cx).value.trim().to_string();
+                // Rename site 2 of 3 (click-away). Marked exactly as the
+                // Enter path is — a flag set at one site and not its
+                // siblings protects nothing.
+                let mut named = None;
                 if !name.is_empty() {
                     if let Some(tab) = self.tabs.get_mut(index) {
                         tab.label = name;
+                        named = Some(tab.id.clone());
                     }
                 }
+                self.renamed_tabs.extend(named);
                 self.rename_field = None;
             } else {
                 // Focus never arrived (something stole it at creation): wait
