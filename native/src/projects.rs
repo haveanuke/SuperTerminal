@@ -922,6 +922,18 @@ impl ProjectStore {
         v
     }
 
+    /// Every record the store holds, in storage order.
+    ///
+    /// NOT `pinned()` + `recent()`: `recent()` shows the newest
+    /// `RECENT_CAP` of the unpinned ones, and unpinning past the cap
+    /// deliberately evicts nothing — so a store can hold records those two
+    /// together do not name. A caller reaping files against "what the store
+    /// still claims" has to see all of them, or unpinning an eleventh
+    /// project would silently delete its terminals' text.
+    pub fn all(&self) -> &[Project] {
+        &self.projects
+    }
+
     /// Unpinned projects, newest first, capped at `RECENT_CAP`.
     pub fn recent(&self) -> Vec<&Project> {
         let mut v: Vec<&Project> = self.projects.iter().filter(|p| !p.pinned).collect();

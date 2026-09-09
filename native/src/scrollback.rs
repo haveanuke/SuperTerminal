@@ -22,11 +22,6 @@
 //! read at every launch, and inlining tens of kilobytes of grid per terminal
 //! would make listing projects pay for text nobody has asked to see yet.
 
-// The save/load/reap entry points are called by the tab-close and restore
-// wiring that lands next; nothing outside this module calls them yet, and
-// the tests drive the `*_in` halves so they never touch the real store.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -125,16 +120,35 @@ fn file_name(id: &str) -> Option<String> {
 /// reason `projects::project_id` is, that `DefaultHasher`'s output is not
 /// promised to be stable across std releases and a persisted key must not
 /// change under the app.
-pub fn terminal_key(anchor: &Path, dir_index: usize) -> String {
-    format!("sb-{:016x}-{dir_index}", path_hash(anchor))
+///
+/// The FOLDER is in the key as well as its index, and that is not
+/// belt-and-braces. A project's `dirs` can be reordered between the save
+/// and the restore — a pane closed and reopened elsewhere drops a
+/// directory out of the middle, and a pinned record keeps its own folder
+/// list while the capture's moves on. Keyed on the index alone, position
+/// *i* would then name a DIFFERENT folder and that folder's terminal would
+/// be handed its sibling's output: the user shown text that was never in
+/// that directory, presented as if it were. With the folder folded in,
+/// the same drift produces a key nothing has ever written, so the restore
+/// misses and the pane opens on a plain prompt. A miss is recoverable;
+/// wrong text is not.
+pub fn terminal_key(anchor: &Path, dir_index: usize, dir: &Path) -> String {
+    format!(
+        "sb-{:016x}-{dir_index}-{:016x}",
+        path_hash(anchor),
+        path_hash(dir)
+    )
 }
 
-/// Every key a project with `dir_count` folders can hold, which is what
-/// [`reap`] has to be told to KEEP. A project contributes exactly its own
-/// keys: nothing else in the store can mint them, because no other anchor
-/// hashes here (see the tests).
-pub fn project_keys(anchor: &Path, dir_count: usize) -> Vec<String> {
-    (0..dir_count).map(|i| terminal_key(anchor, i)).collect()
+/// Every key a project holding `dirs` can hold, which is what [`reap`] has
+/// to be told to KEEP. A project contributes exactly its own keys: nothing
+/// else in the store can mint them, because no other anchor hashes here
+/// (see the tests).
+pub fn project_keys(anchor: &Path, dirs: &[PathBuf]) -> Vec<String> {
+    dirs.iter()
+        .enumerate()
+        .map(|(i, dir)| terminal_key(anchor, i, dir))
+        .collect()
 }
 
 /// Which of a project's `dirs` a pane sitting in `cwd` belongs to, or
@@ -455,6 +469,173 @@ fn decode_row(runs: &[SavedRun], cols: usize) -> Vec<SnapshotCell> {
     }
     cells.resize_with(cols, blank_cell);
     cells
+}
+
+// --- putting the text back into a LIVE terminal ---------------------------
+
+/// SGR that clears every attribute and returns both colours to the theme's.
+const SGR_RESET: &str = "\x1b[0m";
+
+/// The rule drawn between restored history and the live shell's first
+/// prompt. Everything ABOVE it came out of a file; everything below it is
+/// this session. One dim line, drawn with a box-drawing rule, because this
+/// is a terminal — the boundary has to be legible at a glance without
+/// becoming a banner.
+///
+/// It says the TEXT was restored, never that the session was: the shell
+/// below the rule is a new shell, and the spec's worst outcome is a user
+/// who believes otherwise. And it stays true where it ENDS UP — a rule
+/// drawn today is captured by tomorrow's save and comes back inside
+/// tomorrow's history, where "the end of the restored scrollback" would be
+/// a lie but "restored from a previous session" is still exactly what
+/// happened at that line.
+const SEPARATOR_LABEL: &str = "──── restored from a previous session ";
+
+/// The bytes that put stored text into a terminal that is about to get a
+/// live shell.
+///
+/// **The whole feature turns on this function.** The spec's restore paints
+/// a dead pane, and a reopened project full of dead panes would make the
+/// user revive every terminal before working — so a reopened project gets
+/// a WORKING SHELL with its previous scrollback sitting above the first
+/// prompt, which is what tmux does and what the product this chases does.
+/// The only way to get text into a terminal's scrollback is to have the
+/// terminal print it, so the saved cells are re-encoded as the ANSI that
+/// would have produced them and fed to the terminal's own parser before
+/// the shell says anything.
+///
+/// Three properties this has to have, each of which is a test:
+///
+/// * **Every attribute survives** — fg, bg, bold, italic, underline,
+///   inverse, dim, hidden — because a scrollback that comes back
+///   monochrome is not the scrollback.
+/// * **Nothing leaks.** Each row is opened AND closed with a full reset,
+///   so the live shell's first byte lands on a terminal in its default
+///   state whatever the last stored cell was wearing.
+/// * **A file can never inject an escape sequence.** Cell characters are
+///   the only attacker-controlled bytes here, and one of them holding
+///   `\x1b` would let a corrupt or hand-edited file drive the cursor,
+///   clear the screen, or set the title of a live terminal. Every control
+///   character is replaced by a space (see [`seed_char`]) — the file
+///   contributes TEXT and nothing else.
+///
+/// Colours stay UNRESOLVED all the way through: an indexed colour is
+/// re-encoded as an indexed colour, so the grid holds the index and the
+/// painter resolves it through the ACTIVE theme at paint time
+/// (`pane::resolve_fg`). A theme changed since the save is therefore
+/// honoured, which is the reason [`CellColor`] is stored the way it is.
+///
+/// `cols` is the width of the terminal being seeded, and only sizes the
+/// separator rule.
+pub fn ansi_seed(restored: &RestoredScrollback, cols: usize) -> Vec<u8> {
+    if restored.rows.is_empty() {
+        // Nothing was restored, so there is no boundary to mark: the pane
+        // must be indistinguishable from one that never had a file.
+        return Vec::new();
+    }
+    let mut out = String::new();
+    for row in &restored.rows {
+        seed_row(row, &mut out);
+        out.push_str(SGR_RESET);
+        out.push_str("\r\n");
+    }
+    out.push_str("\x1b[2m");
+    out.push_str(&separator_line(cols));
+    out.push_str(SGR_RESET);
+    out.push_str("\r\n");
+    out.into_bytes()
+}
+
+/// One row's cells as ANSI, with no trailing reset (the caller adds it).
+///
+/// Trailing blank cells are dropped rather than printed: a restored row
+/// padded out to the full width would carry its background colour to the
+/// edge of a terminal that may now be a different width, and printing the
+/// last column is also what puts a terminal into its pending-wrap state.
+fn seed_row(row: &[SnapshotCell], out: &mut String) {
+    let mut end = row.len();
+    while end > 0 && is_blank(&row[end - 1]) {
+        end -= 1;
+    }
+    let mut current: Option<CellStyle> = None;
+    for cell in &row[..end] {
+        // The spacer half of a wide glyph is NOT printed: the terminal
+        // creates it itself when the wide character before it is printed,
+        // and printing a second character would shift the rest of the row
+        // one column left per wide glyph.
+        if cell.wide_spacer {
+            continue;
+        }
+        if current != Some(cell.style) {
+            out.push_str(&sgr_for(&cell.style));
+            current = Some(cell.style);
+        }
+        out.push(seed_char(cell.ch));
+    }
+}
+
+/// A cell's character as it may be fed to a parser.
+///
+/// Anything that is not printable text becomes a space. A stored cell holds
+/// what a grid held, so in practice this only ever rewrites the NUL of an
+/// untouched cell — but the bytes here are going into a LIVE terminal, and
+/// a file is the one thing in this path that a user (or a corruption) can
+/// hand-edit. An `\x1b` that survived would be a stored file driving the
+/// cursor of a running shell's terminal.
+fn seed_char(ch: char) -> char {
+    match ch {
+        // C0 and DEL.
+        '\0'..='\u{1f}' | '\u{7f}' => ' ',
+        // C1: an 8-bit control set that a parser also acts on.
+        '\u{80}'..='\u{9f}' => ' ',
+        other => other,
+    }
+}
+
+/// The full SGR for `style`, always starting from a reset.
+///
+/// Absolute rather than a diff against what came before: the sequence
+/// describes the style completely, so no earlier attribute can survive
+/// into it however the rows were ordered or truncated.
+fn sgr_for(style: &CellStyle) -> String {
+    let mut params = String::from("0");
+    for (set, code) in [
+        (style.bold, "1"),
+        (style.dim, "2"),
+        (style.italic, "3"),
+        (style.underline, "4"),
+        (style.inverse, "7"),
+        (style.hidden, "8"),
+    ] {
+        if set {
+            params.push(';');
+            params.push_str(code);
+        }
+    }
+    // 38/48 rather than 30-37/90-97: an INDEX has to come back as an index
+    // so the painter can resolve it through the active theme, and the
+    // 30-37 range parses back as a named colour instead.
+    for (color, base) in [(style.fg, 38), (style.bg, 48)] {
+        match color {
+            // Left unsaid: the reset above already restored the theme's
+            // own foreground and background.
+            CellColor::Default => {}
+            CellColor::Indexed(index) => params.push_str(&format!(";{base};5;{index}")),
+            CellColor::Rgb(r, g, b) => params.push_str(&format!(";{base};2;{r};{g};{b}")),
+        }
+    }
+    format!("\x1b[{params}m")
+}
+
+/// The rule itself, sized to the terminal it is going into.
+fn separator_line(cols: usize) -> String {
+    let label: Vec<char> = SEPARATOR_LABEL.chars().collect();
+    // A rule wider than the terminal would wrap onto a second line and stop
+    // reading as one boundary, so a narrow pane gets the label alone.
+    let fill = cols.saturating_sub(label.len());
+    let mut line = String::from(SEPARATOR_LABEL);
+    line.push_str(&"─".repeat(fill));
+    line
 }
 
 /// Delete every stored terminal whose id is no longer referenced, plus any
@@ -957,20 +1138,109 @@ mod tests {
         // string, in every process, in every release. A run-to-run
         // comparison inside one process would prove nothing — `term-1`
         // passes that too, and `term-1` is the bug this replaces.
+        let anchor = Path::new("/Users/tomas/repo");
+        let native = Path::new("/Users/tomas/repo/native");
         assert_eq!(
-            terminal_key(Path::new("/Users/tomas/repo"), 0),
-            "sb-464d47d65b2a4d86-0"
+            terminal_key(anchor, 0, anchor),
+            "sb-464d47d65b2a4d86-0-464d47d65b2a4d86"
         );
         assert_eq!(
-            terminal_key(Path::new("/Users/tomas/repo"), 3),
-            "sb-464d47d65b2a4d86-3"
+            terminal_key(anchor, 3, native),
+            "sb-464d47d65b2a4d86-3-6a0fa3acf4760d88"
         );
         // The same directory in the case a shell's `cd` happened to leave
-        // it in is the same directory — `projects::dir_key`'s rule.
+        // it in is the same directory — `projects::dir_key`'s rule, and it
+        // has to hold for BOTH halves of the key.
         assert_eq!(
-            terminal_key(Path::new("/users/TOMAS/Repo"), 0),
-            terminal_key(Path::new("/Users/tomas/repo"), 0)
+            terminal_key(
+                Path::new("/users/TOMAS/Repo"),
+                0,
+                Path::new("/USERS/tomas/repo")
+            ),
+            terminal_key(anchor, 0, anchor)
         );
+    }
+
+    #[test]
+    fn a_key_moves_when_the_folder_at_its_index_does() {
+        // The drift this exists to defeat: one project, one anchor, one
+        // index — and a `dirs` list that reordered between the save and the
+        // reopen. Keyed on the index alone, position 0 would find position
+        // 0's file and paint the OTHER folder's terminal output into this
+        // one. The folder in the key makes that a key nothing has written.
+        let anchor = Path::new("/Users/tomas/repo");
+        let dirs = [
+            PathBuf::from("/Users/tomas/repo"),
+            PathBuf::from("/Users/tomas/repo/native"),
+        ];
+        let reordered = [dirs[1].clone(), dirs[0].clone()];
+        let saved = project_keys(anchor, &dirs);
+        let reopened = project_keys(anchor, &reordered);
+        for key in &reopened {
+            assert!(
+                !saved.contains(key),
+                "{key} would restore a sibling folder's text"
+            );
+        }
+        // And the same folder at the same index is still the same key, or
+        // nothing would ever restore at all.
+        assert_eq!(saved, project_keys(anchor, &dirs));
+    }
+
+    #[test]
+    fn a_reordered_project_restores_nothing_rather_than_the_wrong_folder() {
+        // The same drift, all the way through the store: what a reopen
+        // actually gets back when the folder list moved under it. Nothing —
+        // not the neighbour's terminal output dressed as this folder's.
+        let store = dir("reorder");
+        let anchor = Path::new("/Users/tomas/repo");
+        let dirs = [
+            PathBuf::from("/Users/tomas/repo"),
+            PathBuf::from("/Users/tomas/repo/native"),
+        ];
+        for (i, key) in project_keys(anchor, &dirs).iter().enumerate() {
+            save_in(
+                &store,
+                key,
+                &snapshot(8, vec![text_row(&format!("dir{i}"), 8)]),
+            )
+            .unwrap();
+        }
+        let reordered = [dirs[1].clone(), dirs[0].clone()];
+        for key in project_keys(anchor, &reordered) {
+            assert!(
+                load_in(&store, &key).is_none(),
+                "{key} restored text from a folder that never had it"
+            );
+        }
+        // Unmoved, it still comes back — the miss above is drift, not the
+        // feature quietly never working.
+        let back = load_in(&store, &project_keys(anchor, &dirs)[1]).expect("unmoved restores");
+        let text: String = back.rows[0].iter().map(|c| c.ch).collect();
+        assert!(text.starts_with("dir1"), "{text:?}");
+    }
+
+    #[test]
+    fn an_indexed_colour_is_seeded_as_an_index_so_the_active_theme_resolves_it() {
+        // The reason `CellColor` is stored unresolved in the first place.
+        // Re-encoded as an index, the grid holds an index and the painter
+        // resolves it through the theme that is active NOW
+        // (`pane::resolve_fg`), so a theme changed since the save is
+        // honoured. Baked to the saved palette's channels here, a restored
+        // pane would keep painting last month's colours forever.
+        let mut style = plain();
+        style.fg = CellColor::Indexed(4);
+        style.bg = CellColor::Indexed(11);
+        let sgr = sgr_for(&style);
+        assert_eq!(sgr, "\x1b[0;38;5;4;48;5;11m", "{sgr}");
+        // A colour the terminal gave as channels stays channels: there is
+        // no palette entry for it to be resolved through.
+        let mut rgb = plain();
+        rgb.fg = CellColor::Rgb(1, 2, 3);
+        assert_eq!(sgr_for(&rgb), "\x1b[0;38;2;1;2;3m");
+        // Default says nothing at all: the leading reset already put both
+        // colours back to the theme's own.
+        assert_eq!(sgr_for(&plain()), "\x1b[0m");
     }
 
     #[test]
@@ -987,14 +1257,16 @@ mod tests {
         let mut seen: HashSet<String> = HashSet::new();
         for anchor in anchors {
             for index in 0..4 {
-                let key = terminal_key(Path::new(anchor), index);
-                assert!(
-                    seen.insert(key.clone()),
-                    "{anchor} #{index} collided: {key}"
-                );
+                for dir in anchors {
+                    let key = terminal_key(Path::new(anchor), index, Path::new(dir));
+                    assert!(
+                        seen.insert(key.clone()),
+                        "{anchor} #{index} in {dir} collided: {key}"
+                    );
+                }
             }
         }
-        assert_eq!(seen.len(), anchors.len() * 4);
+        assert_eq!(seen.len(), anchors.len() * 4 * anchors.len());
     }
 
     #[test]
@@ -1014,7 +1286,7 @@ mod tests {
             .copied()
             .chain(std::iter::once(long.as_str()))
         {
-            let key = terminal_key(Path::new(anchor), 7);
+            let key = terminal_key(Path::new(anchor), 7, Path::new(anchor));
             assert!(
                 key.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
@@ -1057,18 +1329,147 @@ mod tests {
         let dir = dir("project_keys");
         let mine = Path::new("/Users/tomas/repo");
         let theirs = Path::new("/Users/tomas/other");
-        for key in project_keys(mine, 2).iter().chain(&project_keys(theirs, 2)) {
+        let my_dirs = [
+            PathBuf::from("/Users/tomas/repo"),
+            PathBuf::from("/Users/tomas/repo/native"),
+        ];
+        let their_dirs = [
+            PathBuf::from("/Users/tomas/other"),
+            PathBuf::from("/Users/tomas/other/core"),
+        ];
+        for key in project_keys(mine, &my_dirs)
+            .iter()
+            .chain(&project_keys(theirs, &their_dirs))
+        {
             save_in(&dir, key, &snapshot(4, vec![text_row("hi", 4)])).unwrap();
         }
-        let referenced: HashSet<String> = project_keys(mine, 2).into_iter().collect();
+        let referenced: HashSet<String> = project_keys(mine, &my_dirs).into_iter().collect();
         assert_eq!(referenced.len(), 2, "one key per folder, and no more");
         assert_eq!(reap_in(&dir, &referenced), 2, "the other project goes");
-        for key in project_keys(mine, 2) {
+        for key in project_keys(mine, &my_dirs) {
             assert!(load_in(&dir, &key).is_some(), "{key} survives");
         }
-        for key in project_keys(theirs, 2) {
+        for key in project_keys(theirs, &their_dirs) {
             assert!(load_in(&dir, &key).is_none(), "{key} was evicted");
         }
+        // A project that LOSES a folder stops referencing its key, which is
+        // what stops the directory growing for the life of the install.
+        let shrunk: HashSet<String> = project_keys(mine, &my_dirs[..1]).into_iter().collect();
+        assert_eq!(reap_in(&dir, &shrunk), 1, "the dropped folder's file goes");
+        assert!(load_in(&dir, &project_keys(mine, &my_dirs)[0]).is_some());
+        assert!(load_in(&dir, &project_keys(mine, &my_dirs)[1]).is_none());
+    }
+
+    // --- the ANSI a restored terminal is seeded with -----------------------
+
+    fn restored(cols: usize, rows: Vec<Vec<SnapshotCell>>) -> RestoredScrollback {
+        RestoredScrollback { cols, rows }
+    }
+
+    fn seed_text(restored: &RestoredScrollback, cols: usize) -> String {
+        String::from_utf8(ansi_seed(restored, cols)).expect("the seed is text")
+    }
+
+    #[test]
+    fn a_scrollback_with_no_rows_seeds_nothing_at_all() {
+        // The empty and the unreadable file arrive here the same way — one
+        // as no rows, the other as a `load` that returned `None` — and both
+        // must leave a terminal that is indistinguishable from one that
+        // never had a file. Not even the rule: a boundary drawn above a
+        // prompt with nothing above it is a lie about what happened.
+        assert!(ansi_seed(&restored(80, Vec::new()), 80).is_empty());
+    }
+
+    #[test]
+    fn every_seeded_row_is_closed_before_the_next_line_begins() {
+        // The live shell's first byte lands on the terminal this seed left
+        // behind. A row that set a background and did not clear it would
+        // paint the prompt — and everything the user typed after it.
+        let mut styled = plain();
+        styled.bg = CellColor::Indexed(1);
+        styled.bold = true;
+        let rows = vec![
+            vec![cell('a', styled), cell('b', styled)],
+            vec![cell('c', styled)],
+        ];
+        let text = seed_text(&restored(4, rows), 40);
+        for line in text.split("\r\n") {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(
+                line.ends_with(SGR_RESET),
+                "a line left styling behind: {line:?}"
+            );
+        }
+        assert!(
+            text.ends_with(&format!("{SGR_RESET}\r\n")),
+            "the seed itself must end reset: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_boundary_is_one_rule_and_it_comes_last() {
+        // One line, at the bottom, so everything ABOVE it is the restored
+        // history and everything below it is this session. Anything more
+        // than one line and a terminal starts looking like a chat app.
+        let rows = vec![text_row("one", 8), text_row("two", 8)];
+        let text = seed_text(&restored(8, rows), 40);
+        let lines: Vec<&str> = text.trim_end_matches("\r\n").split("\r\n").collect();
+        assert_eq!(lines.len(), 3, "two rows and the rule: {lines:?}");
+        assert_eq!(text.matches(SEPARATOR_LABEL).count(), 1);
+        assert!(lines[2].contains(SEPARATOR_LABEL), "{:?}", lines[2]);
+        // Dim, so it reads as a mark on the terminal rather than as output.
+        assert!(lines[2].starts_with("\x1b[2m"), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn the_rule_fits_the_terminal_it_is_going_into() {
+        // Wider than the pane and it wraps onto a second line, which stops
+        // it reading as one boundary.
+        let visible = |cols: usize| separator_line(cols).chars().count();
+        assert_eq!(visible(80), 80);
+        assert_eq!(visible(40), 40);
+        // Narrower than the label itself: the label alone, never truncated
+        // into something that does not say what it is.
+        assert_eq!(visible(4), SEPARATOR_LABEL.chars().count());
+        assert!(separator_line(10).starts_with(SEPARATOR_LABEL));
+    }
+
+    #[test]
+    fn a_stored_character_can_never_become_an_escape_sequence() {
+        // Cell text is the only attacker-controlled thing in the seed, and
+        // it is going into a LIVE terminal. An `\x1b` that survived would
+        // let a hand-edited file move the cursor, clear the screen or set
+        // the window title of a running shell's terminal.
+        for ch in ['\u{1b}', '\u{7}', '\r', '\n', '\0', '\u{7f}', '\u{9b}'] {
+            assert_eq!(seed_char(ch), ' ', "{ch:?} survived");
+        }
+        assert_eq!(seed_char('a'), 'a');
+        assert_eq!(seed_char('\u{4f60}'), '\u{4f60}');
+        let hostile = vec![vec![
+            cell('\u{1b}', plain()),
+            cell('[', plain()),
+            cell('2', plain()),
+            cell('J', plain()),
+        ]];
+        let text = seed_text(&restored(8, hostile), 40);
+        assert!(!text.contains("\x1b[2J"), "the file drove the terminal");
+    }
+
+    #[test]
+    fn the_spacer_half_of_a_wide_glyph_is_left_to_the_terminal() {
+        // The terminal creates the spacer itself when it prints the wide
+        // character. Printing a second one would shift the rest of the row
+        // one column left per wide glyph.
+        let rows = vec![vec![
+            cell('\u{4f60}', plain()),
+            spacer(),
+            cell('!', plain()),
+        ]];
+        let text = seed_text(&restored(8, rows), 40);
+        let first = text.split("\r\n").next().unwrap();
+        assert!(first.ends_with("\u{4f60}!\x1b[0m"), "{first:?}");
     }
 
     #[test]

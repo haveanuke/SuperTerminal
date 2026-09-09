@@ -262,7 +262,7 @@ pub enum CellColor {
     Rgb(u8, u8, u8),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellStyle {
     pub fg: CellColor,
     pub bg: CellColor,
@@ -465,6 +465,30 @@ impl TermSession {
         cell_height: u16,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::spawn_seeded(cols, lines, cell_width, cell_height, working_directory, &[])
+    }
+
+    /// Spawn a shell on a terminal that already SAYS something.
+    ///
+    /// `seed` is fed to the terminal's own parser — never to the child —
+    /// before the io thread exists, so the shell's first byte lands under
+    /// it and the stored text ends up in scrollback exactly as if it had
+    /// been printed. That ordering is the point: seeding after the loop
+    /// started would race the prompt and could interleave halfway through
+    /// an escape sequence, and writing the bytes to the PTY instead would
+    /// hand them to the shell as INPUT, which would run them.
+    ///
+    /// An empty `seed` is precisely [`TermSession::spawn`]: no parser is
+    /// built and nothing is advanced, so a terminal opened normally is
+    /// byte-for-byte the terminal it was before this existed.
+    pub fn spawn_seeded(
+        cols: usize,
+        lines: usize,
+        cell_width: u16,
+        cell_height: u16,
+        working_directory: Option<PathBuf>,
+        seed: &[u8],
+    ) -> Result<Self, String> {
         // $SHELL explicitly (not the /usr/bin/login route): login can block in
         // headless contexts, and $SHELL matches the previous app's behavior.
         let shell = std::env::var("SHELL")
@@ -477,6 +501,7 @@ impl TermSession {
             cell_height,
             working_directory,
             shell,
+            seed,
         )
     }
 
@@ -487,6 +512,7 @@ impl TermSession {
         cell_height: u16,
         working_directory: Option<PathBuf>,
         shell: Option<tty::Shell>,
+        seed: &[u8],
     ) -> Result<Self, String> {
         let dirty = Arc::new(AtomicBool::new(false));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -577,6 +603,20 @@ impl TermSession {
             EventLoop::new(term.clone(), proxy, pty, true, false).map_err(|e| e.to_string())?;
         let sender = event_loop.channel();
         *writer.lock().unwrap() = Some(sender.clone());
+        // BEFORE the io thread: until `spawn()` below there is no other
+        // writer to the grid at all, so the seed cannot interleave with the
+        // shell's output and needs no coordination beyond existing here.
+        // These bytes reach the PARSER; the child never sees them.
+        if !seed.is_empty() {
+            let mut parser = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            parser.advance(&mut *term.lock(), seed);
+            // The io thread flips this after every read; nothing has read
+            // yet, and the first frame must paint what was just seeded
+            // rather than wait for the shell to say something.
+            dirty.store(true, Ordering::Release);
+        }
         let io_thread = Some(event_loop.spawn());
 
         Ok(Self {
@@ -1521,6 +1561,7 @@ mod tests {
             16,
             cwd,
             Some(tty::Shell::new("/bin/sh".to_string(), Vec::new())),
+            &[],
         )
         .expect("spawn")
     }
@@ -1546,6 +1587,355 @@ mod tests {
 
     fn grid_contains(snapshot: &RenderableSnapshot, needle: &str) -> bool {
         (0..snapshot.lines).any(|r| row_text(snapshot, r).contains(needle))
+    }
+
+    fn seeded_session(cols: usize, lines: usize, seed: &[u8]) -> TermSession {
+        TermSession::spawn_with_shell(
+            cols,
+            lines,
+            8,
+            16,
+            None,
+            Some(tty::Shell::new("/bin/sh".to_string(), Vec::new())),
+            seed,
+        )
+        .expect("spawn")
+    }
+
+    /// A terminal with no PTY behind it at all, so the ANSI a seed is made
+    /// of can be checked against the grid it produces without a shell in
+    /// the way.
+    #[derive(Clone)]
+    struct Silent;
+    impl EventListener for Silent {
+        fn send_event(&self, _: AlacEvent) {}
+    }
+
+    fn parse_into_grid(cols: usize, lines: usize, bytes: &[u8]) -> Vec<Vec<SnapshotCell>> {
+        let size = TermSize::new(cols, lines);
+        let mut term = Term::new(TermConfig::default(), &size, Silent);
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        parser.advance(&mut term, bytes);
+        let grid = term.grid();
+        (0..lines)
+            .map(|line| {
+                (0..cols)
+                    .map(|col| snapshot_cell(&grid[Line(line as i32)][Column(col)]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn styled(
+        ch: char,
+        fg: CellColor,
+        bg: CellColor,
+        flags: [bool; 6],
+    ) -> crate::term_session::SnapshotCell {
+        SnapshotCell {
+            ch,
+            style: CellStyle {
+                fg,
+                bg,
+                bold: flags[0],
+                italic: flags[1],
+                dim: flags[2],
+                underline: flags[3],
+                inverse: flags[4],
+                hidden: flags[5],
+            },
+            wide_spacer: false,
+        }
+    }
+
+    #[test]
+    fn a_seed_round_trips_every_attribute_through_a_real_parser() {
+        // The claim the whole restore rests on: what was saved is what the
+        // terminal ends up holding. Not "the text came back" — the STYLE
+        // came back, through the same parser a shell's output goes through,
+        // because a scrollback that returns monochrome is not the
+        // scrollback the user left.
+        let off = [false; 6];
+        let cells = vec![
+            styled('p', CellColor::Default, CellColor::Default, off),
+            styled('i', CellColor::Indexed(4), CellColor::Indexed(11), off),
+            styled(
+                'r',
+                CellColor::Rgb(1, 2, 3),
+                CellColor::Rgb(250, 251, 252),
+                off,
+            ),
+            styled(
+                'B',
+                CellColor::Indexed(1),
+                CellColor::Default,
+                [true, false, false, false, false, false],
+            ),
+            styled(
+                'I',
+                CellColor::Default,
+                CellColor::Default,
+                [false, true, false, false, false, false],
+            ),
+            styled(
+                'D',
+                CellColor::Default,
+                CellColor::Default,
+                [false, false, true, false, false, false],
+            ),
+            styled(
+                'U',
+                CellColor::Default,
+                CellColor::Default,
+                [false, false, false, true, false, false],
+            ),
+            styled(
+                'V',
+                CellColor::Default,
+                CellColor::Default,
+                [false, false, false, false, true, false],
+            ),
+            styled(
+                'H',
+                CellColor::Default,
+                CellColor::Default,
+                [false, false, false, false, false, true],
+            ),
+            styled(
+                'A',
+                CellColor::Rgb(9, 8, 7),
+                CellColor::Indexed(200),
+                [true; 6],
+            ),
+        ];
+        let restored = crate::scrollback::RestoredScrollback {
+            cols: 40,
+            rows: vec![cells.clone(), cells.clone()],
+        };
+        let seed = crate::scrollback::ansi_seed(&restored, 40);
+        let grid = parse_into_grid(40, 8, &seed);
+        for (row_index, row) in [0usize, 1].into_iter().enumerate() {
+            for (col, want) in cells.iter().enumerate() {
+                let got = &grid[row][col];
+                assert_eq!(got.ch, want.ch, "row {row_index} col {col} character");
+                assert_eq!(got.style, want.style, "row {row_index} col {col} style");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_a_seed_wore_survives_into_the_shells_own_output() {
+        // The live shell's very first byte is printed onto the terminal the
+        // seed left behind. If the last stored cell's inverse video or red
+        // background were still on the cursor template, the prompt and
+        // everything the user typed after it would wear them.
+        let loud = vec![styled(
+            'X',
+            CellColor::Indexed(9),
+            CellColor::Indexed(2),
+            [true; 6],
+        )];
+        let restored = crate::scrollback::RestoredScrollback {
+            cols: 40,
+            rows: vec![loud],
+        };
+        let mut seed = crate::scrollback::ansi_seed(&restored, 40);
+        // What a shell prints next, appended to the same byte stream.
+        seed.extend_from_slice(b"$ ");
+        let grid = parse_into_grid(40, 8, &seed);
+        // Row 0 is the stored row, row 1 the rule, row 2 the "prompt".
+        let prompt = &grid[2][0];
+        assert_eq!(prompt.ch, '$');
+        assert_eq!(
+            prompt.style,
+            CellStyle {
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                italic: false,
+                dim: false,
+                underline: false,
+                inverse: false,
+                hidden: false,
+            },
+            "the shell's first output inherited the seed's styling"
+        );
+    }
+
+    #[test]
+    fn a_seeded_terminal_never_hands_the_child_process_a_single_byte() {
+        // The failure this rules out is not cosmetic. These bytes describe a
+        // terminal's SCREEN, and the same bytes written to the PTY would be
+        // INPUT — a shell would run every restored line as a command. So the
+        // child here is `cat > file`, which writes down everything it is
+        // ever given, and the test reads back exactly what the child
+        // received rather than inferring it from the screen.
+        let _serial = super::pty_test_guard();
+        let sink = std::env::temp_dir().join(format!("st-seed-sink-{}", std::process::id()));
+        let _ = std::fs::remove_file(&sink);
+        let marker = "SEEDONLY_MARKER";
+        let row: Vec<SnapshotCell> = marker
+            .chars()
+            .map(|ch| styled(ch, CellColor::Default, CellColor::Default, [false; 6]))
+            .collect();
+        let restored = crate::scrollback::RestoredScrollback {
+            cols: 80,
+            rows: vec![row],
+        };
+        let seed = crate::scrollback::ansi_seed(&restored, 80);
+        let mut session = TermSession::spawn_with_shell(
+            80,
+            24,
+            8,
+            16,
+            None,
+            Some(tty::Shell::new(
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), format!("cat > {}", sink.display())],
+            )),
+            &seed,
+        )
+        .expect("spawn");
+        // A probe the child is genuinely handed, so "the seed is not in the
+        // file" is an answer about a child that is reading, not about one
+        // that never started.
+        session.write(b"PROBE_REACHED_THE_CHILD\n".to_vec());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut received = String::new();
+        while Instant::now() < deadline {
+            let _ = session.sync_and_snapshot();
+            received = std::fs::read_to_string(&sink).unwrap_or_default();
+            if received.contains("PROBE_REACHED_THE_CHILD") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(
+            received.contains("PROBE_REACHED_THE_CHILD"),
+            "the child never read its input, so this proves nothing: {received:?}"
+        );
+        assert!(
+            !received.contains(marker),
+            "a stored row was handed to the child process: {received:?}"
+        );
+        assert!(
+            !received.contains("restored from a previous session"),
+            "even the boundary reached the child: {received:?}"
+        );
+        // And it did reach the TERMINAL, or nothing was seeded at all and
+        // the absence above would be meaningless.
+        let snapshot = session.sync_and_snapshot();
+        assert!(
+            grid_contains(&snapshot, marker),
+            "the stored row never reached the parser:\n{}",
+            (0..snapshot.lines)
+                .map(|r| row_text(&snapshot, r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let _ = std::fs::remove_file(&sink);
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_seeded_pane_is_an_ordinary_shell_with_its_history_above_the_prompt() {
+        // Both halves of the product decision at once: the restored text is
+        // in SCROLLBACK — off the visible screen, reachable by scrolling,
+        // exactly where a terminal puts what it printed earlier — and the
+        // shell underneath it is a shell, which the user finds out by
+        // typing into it.
+        let _serial = super::pty_test_guard();
+        let rows: Vec<Vec<SnapshotCell>> = (0..40)
+            .map(|i| {
+                format!("STORED{i}")
+                    .chars()
+                    .map(|ch| styled(ch, CellColor::Default, CellColor::Default, [false; 6]))
+                    .collect()
+            })
+            .collect();
+        let restored = crate::scrollback::RestoredScrollback { cols: 80, rows };
+        let seed = crate::scrollback::ansi_seed(&restored, 80);
+        // Ten rows, forty seeded: the oldest thirty have to be in history.
+        let mut session = seeded_session(80, 10, &seed);
+        session.write(b"printf 'TYPED_%s\n' OK\r".to_vec());
+        let snapshot = wait_for(&mut session, |s| grid_contains(s, "TYPED_OK"), 20);
+        assert!(
+            grid_contains(&snapshot, "TYPED_OK"),
+            "a command typed into a seeded pane ran:\n{}",
+            (0..snapshot.lines)
+                .map(|r| row_text(&snapshot, r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            !grid_contains(&snapshot, "STORED0 "),
+            "the oldest stored row has scrolled off the visible screen"
+        );
+        let (display, _) = session.sync_and_snapshot_with_live();
+        let history: String = display
+            .history_rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            history.contains("STORED0 "),
+            "the restored rows are in the terminal's scrollback:\n{history}"
+        );
+        let visible: String = (0..snapshot.lines)
+            .map(|r| row_text(&snapshot, r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            history.contains("restored from a previous session")
+                || visible.contains("restored from a previous session"),
+            "the boundary was drawn between the restored rows and the shell\
+             \nhistory:\n{history}\nvisible:\n{visible}"
+        );
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_pane_with_nothing_to_restore_spawns_the_terminal_it_always_did() {
+        // The corrupt, missing and empty file all arrive as an empty seed,
+        // and an empty seed must leave no trace at all — no rule, no blank
+        // line above the prompt, nothing for the user to wonder about.
+        let _serial = super::pty_test_guard();
+        // Through the real path: a file that decodes to no rows at all,
+        // which is also where a missing or corrupt one lands once `load`
+        // has answered `None`.
+        let nothing = crate::scrollback::RestoredScrollback {
+            cols: 80,
+            rows: Vec::new(),
+        };
+        let seed = crate::scrollback::ansi_seed(&nothing, 80);
+        assert!(seed.is_empty(), "nothing stored is nothing to print");
+        let mut session = seeded_session(80, 24, &seed);
+        session.write(b"printf 'CLEAN_%s\n' OK\r".to_vec());
+        let snapshot = wait_for(&mut session, |s| grid_contains(s, "CLEAN_OK"), 20);
+        assert!(grid_contains(&snapshot, "CLEAN_OK"), "the shell is alive");
+        assert!(
+            !grid_contains(&snapshot, "restored"),
+            "an unseeded terminal drew a boundary:\n{}",
+            (0..snapshot.lines)
+                .map(|r| row_text(&snapshot, r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let (display, _) = session.sync_and_snapshot_with_live();
+        assert!(
+            display.history_rows.is_empty(),
+            "an unseeded terminal put nothing in scrollback"
+        );
+        session
+            .shutdown()
+            .join_with_deadline(Duration::from_secs(3));
     }
 
     #[test]

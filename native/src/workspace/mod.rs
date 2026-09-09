@@ -1753,14 +1753,43 @@ impl Workspace {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Entity<TerminalPane> {
+        self.spawn_pane_restoring(id, cwd, None, cx)
+    }
+
+    /// `spawn_pane`, with the terminal's stored text already above its
+    /// first prompt.
+    ///
+    /// The shell is spawned exactly as it always was and is genuinely
+    /// live; the restored rows are printed into the terminal's own parser
+    /// before it says anything, so they land in scrollback rather than
+    /// over the top of it (see [`TerminalPane::new`]). A
+    /// `restore_key` of `None`, or one with no readable file behind it,
+    /// gives back precisely `spawn_pane`.
+    fn spawn_pane_restoring(
+        &mut self,
+        id: String,
+        cwd: Option<PathBuf>,
+        restore_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TerminalPane> {
         let theme = self.theme;
         let family = self.settings.font_family.clone();
         let size = self.settings.font_size;
         let translucent = self.settings.background_image.is_some();
         let pane_id = id.clone();
         let hub = Arc::clone(&self.broadcast);
-        let pane =
-            cx.new(|pane_cx| TerminalPane::new(pane_id, cwd, theme, family, size, hub, pane_cx));
+        let pane = cx.new(|pane_cx| {
+            TerminalPane::new(
+                pane_id,
+                cwd,
+                restore_key.as_deref(),
+                theme,
+                family,
+                size,
+                hub,
+                pane_cx,
+            )
+        });
         pane.update(cx, |pane, pane_cx| {
             pane.set_appearance(
                 theme,
@@ -2066,22 +2095,38 @@ impl Workspace {
     /// Takes INDICES rather than tabs because it also has to write back to
     /// `tab_opened_at`, and a borrowed slice of `self.tabs` would hold the
     /// workspace immutably for the whole call.
-    fn record_projects(&mut self, indices: &[usize], cx: &App) {
+    ///
+    /// Each captured tab's terminals write their SCROLLBACK here too, and
+    /// here only. The design's rule is that scrollback saves on exactly the
+    /// paths project capture already runs on and never on a new one — and
+    /// every one of those paths (closing the last terminal in a tab,
+    /// closing a tab, pinning a live tab, `shutdown_all`, the quit hook and
+    /// the load-session teardown) reaches this function and nothing else
+    /// does. Putting the save anywhere else would be the sixth path the
+    /// spec forbids.
+    fn record_projects(&mut self, indices: &[usize], cx: &mut App) {
         // Last chance to ask the shells where they are: below, and in
         // every caller, they are about to be torn down.
         self.remember_pane_dirs(cx);
         let now = crate::projects::now_secs();
         let mut captured: Vec<crate::projects::Project> = Vec::new();
         let mut marked: Vec<String> = Vec::new();
-        for tab in indices.iter().filter_map(|index| self.tabs.get(*index)) {
+        for index in indices {
+            let Some(tab) = self.tabs.get(*index) else {
+                continue;
+            };
             // The mark moves for every tab that was ASKED to be captured,
             // including one that turned out to have no directories at all
             // (an all-remote tab). Otherwise a tab that spends an hour on a
             // peer and then opens one local pane would hand that hour to
             // the first project it ever manages to record.
             marked.push(tab.id.clone());
-            let Some(mut project) = crate::projects::project_for_dirs(self.tab_dirs(tab), now)
-            else {
+            let dirs = self.tab_dirs(tab);
+            // Before the capture, while every shell is still alive to be
+            // asked what it said. `save_tab_scrollback` borrows `self`
+            // immutably, exactly as the lines around it do.
+            self.save_tab_scrollback(*index, &dirs, cx);
+            let Some(mut project) = crate::projects::project_for_dirs(dirs, now) else {
                 continue;
             };
             let (terminals, active_secs) = self.tab_stats(tab, now);
@@ -2117,16 +2162,77 @@ impl Workspace {
         // The sidebar reads this, never the file, so it has to learn about
         // a capture from the same call that made it.
         self.projects_cache = store;
+        // A project that loses a directory — or is evicted past the recent
+        // cap altogether — leaves a scrollback file nobody will ever read
+        // again, and nothing else in the app is ever going to notice. Reaped
+        // against the store as it now stands, straight after the write that
+        // made it so, so the directory can only ever hold text a project
+        // still claims.
+        let referenced: std::collections::HashSet<String> = self
+            .projects_cache
+            .all()
+            .iter()
+            .filter_map(|project| {
+                project
+                    .anchor
+                    .as_deref()
+                    .map(|anchor| crate::scrollback::project_keys(anchor, &project.dirs))
+            })
+            .flatten()
+            .collect();
+        crate::scrollback::reap(&referenced);
+    }
+
+    /// Store the scrollback of every live pane in the tab at `index` whose
+    /// folder is one of the project's.
+    ///
+    /// The anchor is the record's FROZEN one wherever there is a record.
+    /// The anchor a capture derives moves the moment the project gains a
+    /// folder that ranks ahead of the current one, and a moved anchor is a
+    /// different key — the text would be written where the next reopen does
+    /// not look. `or_else` only fires for a project being recorded for the
+    /// very first time, which by definition has nothing stored to miss.
+    ///
+    /// A pane whose folder is not in `dirs` — one sitting in `$HOME`, or
+    /// viewing another machine — stores nothing. There is no index to key
+    /// it by, and it is not part of the project's directory set.
+    fn save_tab_scrollback(&self, index: usize, dirs: &[PathBuf], cx: &mut App) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let anchor = self
+            .projects_cache
+            .matching(dirs)
+            .and_then(|record| record.anchor.clone())
+            .or_else(|| crate::projects::anchor_dir(dirs).cloned());
+        let Some(anchor) = anchor else {
+            return;
+        };
+        for terminal_id in tab.all_terminal_ids() {
+            let Some(pane) = self.panes.get(&terminal_id).cloned() else {
+                continue;
+            };
+            pane.update(cx, |pane, _| {
+                let Some(cwd) = pane.last_known_cwd() else {
+                    return;
+                };
+                let Some(i) = crate::scrollback::dir_index_of(dirs, std::path::Path::new(&cwd))
+                else {
+                    return;
+                };
+                pane.save_scrollback(&crate::scrollback::terminal_key(&anchor, i, &dirs[i]));
+            });
+        }
     }
 
     /// Remember the tab at `index`, if there is one.
-    fn record_project_at(&mut self, index: usize, cx: &App) {
+    fn record_project_at(&mut self, index: usize, cx: &mut App) {
         self.record_projects(&[index], cx);
     }
 
     /// Remember every open project: the quit and load-session paths, where
     /// the whole workspace goes at once.
-    fn record_open_projects(&mut self, cx: &App) {
+    fn record_open_projects(&mut self, cx: &mut App) {
         let all: Vec<usize> = (0..self.tabs.len()).collect();
         self.record_projects(&all, cx);
     }
@@ -2204,9 +2310,17 @@ impl Workspace {
         let mut terminal_ids: Vec<String> = Vec::with_capacity(plan.spawns.len());
         // The tab's memory of its own panes, seeded as they are spawned.
         let mut remembered = crate::projects::TabPaneDirs::default();
-        for (cwd, wanted) in plan.spawns.iter().zip(project.dirs.iter()) {
+        for (i, (cwd, wanted)) in plan.spawns.iter().zip(project.dirs.iter()).enumerate() {
             let terminal_id = self.fresh_id();
-            self.spawn_pane(terminal_id.clone(), cwd.clone(), cx);
+            // `i` IS the dir_index the key was written under: this loop
+            // walks `project.dirs` in order, and so did the capture that
+            // saved. The folder goes in beside it so a reordered `dirs`
+            // misses rather than restoring its neighbour's text.
+            let restore_key = project
+                .anchor
+                .as_deref()
+                .map(|anchor| crate::scrollback::terminal_key(anchor, i, wanted));
+            self.spawn_pane_restoring(terminal_id.clone(), cwd.clone(), restore_key, cx);
             // Seeded even for a folder that IS there, so the pane counts as
             // one of the project's terminals from the instant it opens
             // rather than from the first fold.

@@ -211,10 +211,50 @@ pub struct TerminalPane {
 
 const PADDING: f32 = 6.0;
 
+/// The grid a pane's shell is spawned on, before the first render measures
+/// the pane for real. Named because the scrollback seed is written to this
+/// width — the rule it ends with has to fit the terminal it is going into.
+const SPAWN_COLS: usize = 80;
+const SPAWN_LINES: usize = 24;
+
+/// How far the "[process exited]" scrim dims the grid behind it.
+///
+/// It was 0.85 — near-opaque — which cost nothing while a dead pane was an
+/// empty grid and a sentence. It costs the whole feature now: reopening a
+/// project exists to show what its terminals SAID, and the same scrim falls
+/// over that text the moment one of those shells exits. Low enough to read
+/// the terminal through, high enough that the pane still reads as dead
+/// rather than live, with the notice itself on an opaque chip so it stays
+/// legible either way.
+const EXIT_SCRIM_OPACITY: f32 = 0.35;
+
 impl TerminalPane {
+    /// A local pane on a live shell, optionally with the text stored under
+    /// `restore_key` already sitting above its first prompt.
+    ///
+    /// The restore is a decision the spec did not make. The spec's restore
+    /// is a DEAD pane, and a reopened project full of dead panes would make
+    /// the user revive every terminal before working. So the stored cells
+    /// are re-encoded as the ANSI that would have printed them
+    /// ([`crate::scrollback::ansi_seed`]) and handed to the terminal's own
+    /// parser before the shell starts talking — the scrollback lands above
+    /// the first prompt, the way it does in tmux, and the shell below it is
+    /// an ordinary shell.
+    ///
+    /// **Nothing seeded reaches the PTY.** The bytes go to the parser
+    /// inside [`TermSession::spawn_seeded`]; the child process is never
+    /// written to, so a user who types the instant the pane opens gets a
+    /// normal shell with an empty input line.
+    ///
+    /// `restore_key` of `None` — and a key with no file, a corrupt file or
+    /// an empty one — takes the SAME `TermSession::spawn` call this
+    /// function has always made, spelled out below rather than reasoned
+    /// about: a terminal opened normally is the terminal it was.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         working_directory: Option<std::path::PathBuf>,
+        restore_key: Option<&str>,
         theme: &'static Theme,
         font_family: String,
         font_size: f32,
@@ -225,16 +265,27 @@ impl TerminalPane {
         let cell_width = px(font_size * 0.6);
         let line_height = px((font_size * 1.4).round());
 
-        let session = TermSession::spawn(
-            80,
-            24,
-            f32::from(cell_width) as u16,
-            f32::from(line_height) as u16,
-            working_directory,
-        )
+        let seed = restore_key
+            .and_then(crate::scrollback::load)
+            .map(|restored| crate::scrollback::ansi_seed(&restored, SPAWN_COLS))
+            .unwrap_or_default();
+        let (cell_w, cell_h) = (f32::from(cell_width) as u16, f32::from(line_height) as u16);
+        let session = if seed.is_empty() {
+            TermSession::spawn(SPAWN_COLS, SPAWN_LINES, cell_w, cell_h, working_directory)
+        } else {
+            TermSession::spawn_seeded(
+                SPAWN_COLS,
+                SPAWN_LINES,
+                cell_w,
+                cell_h,
+                working_directory,
+                &seed,
+            )
+        }
         .ok();
 
-        Self::from_parts(
+        let spawned = session.is_some();
+        let mut pane = Self::from_parts(
             id,
             Target::Local,
             session,
@@ -245,7 +296,21 @@ impl TerminalPane {
             font_size,
             broadcast,
             cx,
-        )
+        );
+        // A shell that would not START is the one case where the spec's
+        // DEAD restore is the honest answer: there is no parser to seed
+        // because there is no terminal running, and the pane is already
+        // wearing the exited treatment. Showing what the terminal last said
+        // is better than showing an empty grid, and it cannot be mistaken
+        // for live — [`TerminalPane::restore_scrollback`] refuses any pane
+        // that has a session, which is every pane that reaches the seed
+        // above.
+        if !spawned {
+            if let Some(key) = restore_key {
+                pane.restore_scrollback(key, cx);
+            }
+        }
+        pane
     }
 
     /// A pane for a target that isn't (yet, or no longer) reachable: never
@@ -779,9 +844,8 @@ impl TerminalPane {
     /// top would delete it (`scrollback::save_in` clears the file of a
     /// terminal that said nothing) — so reopening a project and quitting
     /// without typing would erase the scrollback it just showed you.
-    // The tab-close and quit hooks that call this land with the workspace
-    // wiring; the decisions it is made of are tested in `restored_pane_tests`.
-    #[allow(dead_code)]
+    // Called from `Workspace::record_projects`, on every path that
+    // captures a project and no other.
     pub fn save_scrollback(&mut self, key: &str) -> bool {
         if !may_save_scrollback(self.views_remote(), self.session.is_some()) {
             return false;
@@ -812,8 +876,10 @@ impl TerminalPane {
     /// point rather than a guard against a caller mistake: painting stored
     /// text into a live terminal would put a picture where a shell is, and
     /// the user would type into it and believe what they saw.
-    // Called by the project reopen that lands with the workspace wiring.
-    #[allow(dead_code)]
+    // The reopen path does NOT come here: a reopened project spawns live
+    // shells and seeds their parsers instead (`TerminalPane::new`), so a
+    // dead grid of old text is not what the user is left holding. This is
+    // reached only by a pane whose shell would not start.
     pub fn restore_scrollback(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         if !may_restore_scrollback(self.views_remote(), self.session.is_some()) {
             return false;
@@ -3462,9 +3528,26 @@ impl Render for TerminalPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(rgb(theme.background))
-                    .opacity(0.85)
-                    .child(div().text_color(rgb(theme.ui_text_muted)).child(message))
+                    // The scrim is a CHILD, not this element's own
+                    // background: gpui's `opacity` applies to the whole
+                    // subtree, so dimming the parent would dim the notice
+                    // with it and the two cannot be tuned apart.
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .bg(rgb(theme.background))
+                            .opacity(EXIT_SCRIM_OPACITY),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(theme.background))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child(message),
+                    )
             }))
     }
 }
@@ -6432,6 +6515,7 @@ mod restored_pane_tests {
     use super::{
         exit_message, exit_notice, local_paint_frame, may_restore_scrollback, may_save_scrollback,
         restored_snapshot, restored_window_start, split_capture, CellLook, ExitNotice,
+        EXIT_SCRIM_OPACITY,
     };
     use crate::scrollback::RestoredScrollback;
     use crate::term_session::{
@@ -6568,6 +6652,28 @@ mod restored_pane_tests {
              file a restored pane is showing"
         );
         assert!(!may_save_scrollback(true, false));
+    }
+
+    #[test]
+    // The decision here IS a number, so the assertion is a constant one on
+    // purpose: it names the range the value has to stay inside, and fails
+    // the moment someone moves it back out.
+    #[allow(clippy::assertions_on_constants)]
+    fn restored_text_stays_readable_behind_the_dead_treatment() {
+        // 0.85 cost nothing while a dead pane was an empty grid and a
+        // sentence. It costs the whole feature now: a reopened project
+        // exists to show what its terminals SAID, and this scrim falls over
+        // that text the moment one of those shells exits. Both bounds are
+        // the requirement — readable through it, and still unmistakably a
+        // dead pane rather than a live one.
+        assert!(
+            EXIT_SCRIM_OPACITY < 0.5,
+            "the scrim hides the terminal it is drawn over: {EXIT_SCRIM_OPACITY}"
+        );
+        assert!(
+            EXIT_SCRIM_OPACITY > 0.15,
+            "a dead pane must still read as dead: {EXIT_SCRIM_OPACITY}"
+        );
     }
 
     // --- which rows a restored pane shows ----------------------------------
