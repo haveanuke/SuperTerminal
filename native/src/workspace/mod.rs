@@ -2220,7 +2220,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                pane.save_scrollback(&crate::scrollback::terminal_key(&anchor, i, &dirs[i]));
+                pane.save_scrollback(&crate::scrollback::terminal_key(&anchor, &dirs[i]));
             });
         }
     }
@@ -2319,7 +2319,7 @@ impl Workspace {
             let restore_key = project
                 .anchor
                 .as_deref()
-                .map(|anchor| crate::scrollback::terminal_key(anchor, i, wanted));
+                .map(|anchor| crate::scrollback::terminal_key(anchor, wanted));
             self.spawn_pane_restoring(terminal_id.clone(), cwd.clone(), restore_key, cx);
             // Seeded even for a folder that IS there, so the pane counts as
             // one of the project's terminals from the instant it opens

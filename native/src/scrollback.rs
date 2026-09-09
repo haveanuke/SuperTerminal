@@ -121,23 +121,27 @@ fn file_name(id: &str) -> Option<String> {
 /// promised to be stable across std releases and a persisted key must not
 /// change under the app.
 ///
-/// The FOLDER is in the key as well as its index, and that is not
-/// belt-and-braces. A project's `dirs` can be reordered between the save
-/// and the restore — a pane closed and reopened elsewhere drops a
-/// directory out of the middle, and a pinned record keeps its own folder
-/// list while the capture's moves on. Keyed on the index alone, position
-/// *i* would then name a DIFFERENT folder and that folder's terminal would
-/// be handed its sibling's output: the user shown text that was never in
-/// that directory, presented as if it were. With the folder folded in,
-/// the same drift produces a key nothing has ever written, so the restore
-/// misses and the pane opens on a plain prompt. A miss is recoverable;
-/// wrong text is not.
-pub fn terminal_key(anchor: &Path, dir_index: usize, dir: &Path) -> String {
-    format!(
-        "sb-{:016x}-{dir_index}-{:016x}",
-        path_hash(anchor),
-        path_hash(dir)
-    )
+/// Keyed on the ANCHOR and the FOLDER, and deliberately NOT on the folder's
+/// index within the project.
+///
+/// The index was in the key first, to stop a reordered `dirs` handing one
+/// terminal its sibling's output — the user shown text that was never in
+/// that directory, presented as if it were. Folding the folder in already
+/// prevents that: the pair is unique, because `ProjectStore::record`
+/// dedupes `dirs`, so one folder appears at most once per project and no
+/// two projects share an anchor.
+///
+/// With the folder in the key the index only ADDS failure. A pinned or
+/// renamed record keeps its own folder list while later captures move on,
+/// so its indices drift apart from the store's and every one of its
+/// terminals then misses — the pinned projects, the ones the user cared
+/// enough to keep, restoring nothing. Dropping the index turns those
+/// misses back into correct hits without ever risking a wrong one.
+///
+/// A miss is recoverable and wrong text is not; this change makes fewer of
+/// both.
+pub fn terminal_key(anchor: &Path, dir: &Path) -> String {
+    format!("sb-{:016x}-{:016x}", path_hash(anchor), path_hash(dir))
 }
 
 /// Every key a project holding `dirs` can hold, which is what [`reap`] has
@@ -145,10 +149,7 @@ pub fn terminal_key(anchor: &Path, dir_index: usize, dir: &Path) -> String {
 /// else in the store can mint them, because no other anchor hashes here
 /// (see the tests).
 pub fn project_keys(anchor: &Path, dirs: &[PathBuf]) -> Vec<String> {
-    dirs.iter()
-        .enumerate()
-        .map(|(i, dir)| terminal_key(anchor, i, dir))
-        .collect()
+    dirs.iter().map(|dir| terminal_key(anchor, dir)).collect()
 }
 
 /// Which of a project's `dirs` a pane sitting in `cwd` belongs to, or
@@ -1141,12 +1142,12 @@ mod tests {
         let anchor = Path::new("/Users/tomas/repo");
         let native = Path::new("/Users/tomas/repo/native");
         assert_eq!(
-            terminal_key(anchor, 0, anchor),
-            "sb-464d47d65b2a4d86-0-464d47d65b2a4d86"
+            terminal_key(anchor, anchor),
+            "sb-464d47d65b2a4d86-464d47d65b2a4d86"
         );
         assert_eq!(
-            terminal_key(anchor, 3, native),
-            "sb-464d47d65b2a4d86-3-6a0fa3acf4760d88"
+            terminal_key(anchor, native),
+            "sb-464d47d65b2a4d86-6a0fa3acf4760d88"
         );
         // The same directory in the case a shell's `cd` happened to leave
         // it in is the same directory — `projects::dir_key`'s rule, and it
@@ -1154,44 +1155,56 @@ mod tests {
         assert_eq!(
             terminal_key(
                 Path::new("/users/TOMAS/Repo"),
-                0,
                 Path::new("/USERS/tomas/repo")
             ),
-            terminal_key(anchor, 0, anchor)
+            terminal_key(anchor, anchor)
         );
     }
 
     #[test]
-    fn a_key_moves_when_the_folder_at_its_index_does() {
-        // The drift this exists to defeat: one project, one anchor, one
-        // index — and a `dirs` list that reordered between the save and the
-        // reopen. Keyed on the index alone, position 0 would find position
-        // 0's file and paint the OTHER folder's terminal output into this
-        // one. The folder in the key makes that a key nothing has written.
+    fn reordering_a_projects_folders_still_finds_each_folders_own_text() {
+        // The key was once anchor + INDEX + folder, to stop a reordered
+        // `dirs` handing one terminal its sibling's output. The folder
+        // alone already prevents that — `record` dedupes `dirs`, so a
+        // folder appears at most once per project — and the index only
+        // added failure: a pinned record keeps its own folder list while
+        // later captures move on, so its indices drift and every one of
+        // its terminals missed. The projects the user cared enough to pin
+        // were the ones restoring nothing.
         let anchor = Path::new("/Users/tomas/repo");
         let dirs = [
             PathBuf::from("/Users/tomas/repo"),
             PathBuf::from("/Users/tomas/repo/native"),
         ];
         let reordered = [dirs[1].clone(), dirs[0].clone()];
-        let saved = project_keys(anchor, &dirs);
-        let reopened = project_keys(anchor, &reordered);
-        for key in &reopened {
-            assert!(
-                !saved.contains(key),
-                "{key} would restore a sibling folder's text"
-            );
-        }
-        // And the same folder at the same index is still the same key, or
-        // nothing would ever restore at all.
-        assert_eq!(saved, project_keys(anchor, &dirs));
+        let mut saved = project_keys(anchor, &dirs);
+        let mut reopened = project_keys(anchor, &reordered);
+        saved.sort();
+        reopened.sort();
+        assert_eq!(
+            saved, reopened,
+            "a reorder must find the same text, not miss it"
+        );
+        // And the guarantee that made the index look necessary still
+        // holds: two folders never share a key, so no terminal can be
+        // handed another folder's output.
+        assert_ne!(
+            terminal_key(anchor, &dirs[0]),
+            terminal_key(anchor, &dirs[1])
+        );
     }
 
     #[test]
-    fn a_reordered_project_restores_nothing_rather_than_the_wrong_folder() {
-        // The same drift, all the way through the store: what a reopen
-        // actually gets back when the folder list moved under it. Nothing —
-        // not the neighbour's terminal output dressed as this folder's.
+    fn a_reordered_project_restores_each_folders_own_text() {
+        // The same drift, all the way through the store. When the key
+        // carried the folder's INDEX this was a miss — safe, but the wrong
+        // kind of safe: a pinned record keeps its own folder list while
+        // later captures move on, so its indices drift and it restored
+        // nothing at all. Keyed on the folder, a reorder is simply found.
+        //
+        // What must NEVER happen is a folder being handed its neighbour's
+        // output, so this asserts the text each key returns, not merely
+        // that something came back.
         let store = dir("reorder");
         let anchor = Path::new("/Users/tomas/repo");
         let dirs = [
@@ -1207,17 +1220,17 @@ mod tests {
             .unwrap();
         }
         let reordered = [dirs[1].clone(), dirs[0].clone()];
-        for key in project_keys(anchor, &reordered) {
+        let keys = project_keys(anchor, &reordered);
+        // `reordered` is [native, repo], so its keys come back in that
+        // order and must carry dir1's and dir0's text respectively.
+        for (key, expected) in keys.iter().zip(["dir1", "dir0"]) {
+            let back = load_in(&store, key).expect("a reorder is found, not missed");
+            let text: String = back.rows[0].iter().map(|c| c.ch).collect();
             assert!(
-                load_in(&store, &key).is_none(),
-                "{key} restored text from a folder that never had it"
+                text.starts_with(expected),
+                "{key} returned {text:?}, wanted {expected}"
             );
         }
-        // Unmoved, it still comes back — the miss above is drift, not the
-        // feature quietly never working.
-        let back = load_in(&store, &project_keys(anchor, &dirs)[1]).expect("unmoved restores");
-        let text: String = back.rows[0].iter().map(|c| c.ch).collect();
-        assert!(text.starts_with("dir1"), "{text:?}");
     }
 
     #[test]
@@ -1254,19 +1267,20 @@ mod tests {
             "/",
             "/Users/tomas/\u{4f60}\u{597d}",
         ];
+        // Every DISTINCT (anchor, folder) pair, including the shapes most
+        // likely to collide under a weak hash: a prefix of another path, a
+        // trailing space, the filesystem root, and non-ASCII.
         let mut seen: HashSet<String> = HashSet::new();
         for anchor in anchors {
-            for index in 0..4 {
-                for dir in anchors {
-                    let key = terminal_key(Path::new(anchor), index, Path::new(dir));
-                    assert!(
-                        seen.insert(key.clone()),
-                        "{anchor} #{index} in {dir} collided: {key}"
-                    );
-                }
+            for dir in anchors {
+                let key = terminal_key(Path::new(anchor), Path::new(dir));
+                assert!(
+                    seen.insert(key.clone()),
+                    "{anchor} in {dir} collided: {key}"
+                );
             }
         }
-        assert_eq!(seen.len(), anchors.len() * 4 * anchors.len());
+        assert_eq!(seen.len(), anchors.len() * anchors.len());
     }
 
     #[test]
@@ -1286,7 +1300,7 @@ mod tests {
             .copied()
             .chain(std::iter::once(long.as_str()))
         {
-            let key = terminal_key(Path::new(anchor), 7, Path::new(anchor));
+            let key = terminal_key(Path::new(anchor), Path::new(anchor));
             assert!(
                 key.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
