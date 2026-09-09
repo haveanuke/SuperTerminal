@@ -587,14 +587,18 @@ pub fn duration_label(secs: u64) -> String {
 
 /// What a project row says about itself beneath its name.
 ///
+/// The TERMINAL count is deliberately not here. It was, and it cost the
+/// thing the row exists for: the sidebar is narrow, so "SuperTerminal ·
+/// 1 terminal" truncated to "SuperTermin 1 terminal" — the count pushing
+/// out the name, which is the only part a user scans for. Folders is the
+/// number that says how big the project is; terminals is a detail worth
+/// less than the letters it eats.
+///
 /// Time is omitted entirely at zero. A record written before `active_secs`
 /// existed, or one whose only session never closed cleanly, has no
 /// measurement to report — and "under a minute" would invent one.
-pub fn project_summary(dirs: usize, terminals: usize, active_secs: u64) -> String {
-    let mut parts = vec![
-        count_label(dirs, "folder"),
-        count_label(terminals, "terminal"),
-    ];
+pub fn project_summary(dirs: usize, active_secs: u64) -> String {
+    let mut parts = vec![count_label(dirs, "folder")];
     if active_secs > 0 {
         parts.push(duration_label(active_secs));
     }
@@ -968,12 +972,29 @@ pub struct SidebarSections<'a> {
 /// a tab rooted somewhere else hides nothing, however many other folders
 /// the two happen to share.
 pub fn sidebar_sections<'a>(store: &'a ProjectStore, open: &[Vec<PathBuf>]) -> SidebarSections<'a> {
+    // A project that is OPEN is already on screen, as a live tab above
+    // these sections. Listing it again below is the same project twice,
+    // and an earlier version did exactly that for pinned ones on the
+    // reasoning that hiding a pinned project would make the pin look
+    // broken. It reads as a duplicate instead — the user sees their
+    // project in the active list AND under PINNED and cannot tell what
+    // the second one is for.
+    //
+    // Both sections filter now. A pinned project reappears the moment it
+    // is closed, which is the promise pinning actually makes: it will be
+    // there when you come back, not that it will be listed twice while
+    // you are already in it.
+    let is_open = |project: &Project| open.iter().any(|dirs| capture_has_anchor_of(dirs, project));
     SidebarSections {
-        pinned: store.pinned(),
+        pinned: store
+            .pinned()
+            .into_iter()
+            .filter(|project| !is_open(project))
+            .collect(),
         recent: store
             .recent()
             .into_iter()
-            .filter(|project| !open.iter().any(|dirs| capture_has_anchor_of(dirs, project)))
+            .filter(|project| !is_open(project))
             .collect(),
     }
 }
@@ -1741,16 +1762,22 @@ mod stats_tests {
         // A record written before `active_secs` existed, or one whose only
         // session never closed cleanly, has NO time to report. Saying
         // "under a minute" would invent a measurement that was never made.
-        let summary = project_summary(1, 1, 0);
-        assert_eq!(summary, "1 folder \u{b7} 1 terminal");
+        let summary = project_summary(1, 0);
+        assert_eq!(summary, "1 folder");
         assert!(!summary.contains("minute"));
     }
 
     #[test]
-    fn the_summary_states_folders_terminals_and_time_together() {
-        assert_eq!(
-            project_summary(4, 6, 11_520),
-            "4 folders \u{b7} 6 terminals \u{b7} 3h 12m"
+    fn the_summary_states_folders_and_time_but_not_terminals() {
+        // The terminal count used to be here and cost the row its name:
+        // the sidebar is narrow, so "SuperTerminal - 1 terminal" truncated
+        // to "SuperTermin 1 terminal", the count eating the only part a
+        // user scans for.
+        let summary = project_summary(4, 11_520);
+        assert_eq!(summary, "4 folders \u{b7} 3h 12m");
+        assert!(
+            !summary.contains("terminal"),
+            "the terminal count must not come back: {summary}"
         );
     }
 
@@ -2225,17 +2252,35 @@ mod tab_memory_tests {
     }
 
     #[test]
-    fn a_pinned_project_stays_in_pinned_while_it_is_open() {
-        // Pinning is a promise that it is always in that list. Hiding it
-        // the moment it is opened would make pinning look broken exactly
-        // when the user is using it.
+    fn an_open_project_is_listed_once_even_when_pinned() {
+        // An earlier version kept a pinned project in PINNED while it was
+        // open, arguing that hiding it would make pinning look broken.
+        // Using it proved otherwise: the project appears in the live tab
+        // list above AND under PINNED, and the second copy reads as a
+        // duplicate nobody can explain.
+        //
+        // Pinning promises the project is there when you come BACK, not
+        // that it is listed twice while you are already in it.
         let mut store = ProjectStore::default();
         store.record(project("fav", &["/chat"], 200, true));
         let open = vec![vec![PathBuf::from("/chat")]];
         let sections = sidebar_sections(&store, &open);
-        let ids: Vec<&str> = sections.pinned.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["fav"], "still pinned, still shown");
+        assert!(
+            sections.pinned.is_empty(),
+            "an open project is already on screen as a live tab"
+        );
         assert!(sections.recent.is_empty(), "and pinned is never in recents");
+    }
+
+    #[test]
+    fn a_pinned_project_comes_back_the_moment_it_is_closed() {
+        // The other half, and the one that makes hiding it safe: nothing
+        // was forgotten, it was only not shown twice.
+        let mut store = ProjectStore::default();
+        store.record(project("fav", &["/chat"], 200, true));
+        let sections = sidebar_sections(&store, &[]);
+        let ids: Vec<&str> = sections.pinned.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["fav"], "closed, so it is listed again");
     }
 
     #[test]

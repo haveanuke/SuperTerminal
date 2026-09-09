@@ -3611,11 +3611,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
-        let summary = crate::projects::project_summary(
-            project.dirs.len(),
-            project.terminals,
-            project.active_secs,
-        );
+        let summary = crate::projects::project_summary(project.dirs.len(), project.active_secs);
         let pinned = project.pinned;
         let pin_id = project.id.clone();
         let mark = crate::projects::project_mark(&project.label, project.icon);
