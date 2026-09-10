@@ -490,6 +490,114 @@ fn attached_tab_label(peer_label: &str, session_label: &str) -> String {
     }
 }
 
+/// Which tab is active once the tab at `removed` is taken out and
+/// `remaining` are left.
+///
+/// One function because there are two callers — `close_terminal` losing a
+/// tab's last terminal and `close_tab` taking the whole tab — and the two
+/// had the identical five lines written out twice. That duplication is
+/// this codebase's recurring defect: a decision made at one site and
+/// missed at its sibling.
+///
+/// `remaining == 0` is now a real answer rather than an impossible one.
+/// Closing the last terminal leaves the workspace empty instead of
+/// force-spawning a shell in `$HOME` that the user never asked for, so
+/// this used to be reached only after that respawn had already made it
+/// untrue. Zero is returned as a RESTING value, not a selection: with no
+/// tabs, every read of `active_tab` goes through `Vec::get` and answers
+/// `None` for it, and the next tab created overwrites it outright.
+///
+/// The old inline version's `self.tabs.len() - 1` on an empty `Vec` is a
+/// usize underflow — a panic, not a wrong index.
+fn active_tab_after_close(removed: usize, active: usize, remaining: usize) -> usize {
+    if remaining == 0 {
+        return 0;
+    }
+    // Removing a tab BEFORE the active one shifts every later index down;
+    // follow the shift so the same tab stays selected.
+    let shifted = active - usize::from(removed < active);
+    shifted.min(remaining - 1)
+}
+
+/// Where a new terminal goes when the user asks for a WINDOW (cmd-n, and
+/// the folder picker's fallback when the focused shell is busy).
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum NewWindowTarget {
+    /// Add a window to the project at this index.
+    InTab(usize),
+    /// There is no project to put a window in — open a tab instead.
+    AsNewTab,
+}
+
+/// A window belongs to a project, and with nothing open there is no
+/// project to put one in. cmd-n must still produce a terminal from the
+/// empty state — a shortcut that silently does nothing is how a user gets
+/// stuck in a workspace they cannot leave — so it opens a tab instead.
+///
+/// The folder picker already made this choice inline for its own fallback;
+/// both go through here now so the two cannot drift apart.
+fn new_window_target(active: usize, tabs: usize) -> NewWindowTarget {
+    if active < tabs {
+        NewWindowTarget::InTab(active)
+    } else {
+        NewWindowTarget::AsNewTab
+    }
+}
+
+/// What the empty main area says under its heading, and whether it offers
+/// to bring the projects list into view.
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct EmptyState {
+    /// The line beneath the heading. Never empty: this screen is the first
+    /// thing a brand-new user sees, so there is always something true and
+    /// useful to say.
+    hint: &'static str,
+    /// Whether to draw the button that opens the sidebar on projects.
+    show_projects_button: bool,
+}
+
+/// The empty main area deliberately does NOT list projects: the sidebar
+/// already lists them, with pins, reopen-on-click and the live tabs above
+/// them, and a second copy in the middle of the window would be the same
+/// rows twice with two sets of click behaviour to keep in step.
+///
+/// What the main area adds is the part the sidebar cannot say: that having
+/// no terminal open is a state and not a failure, and where to go from it.
+/// So it states the fact, offers the one action that always works (a new
+/// terminal, with the key that does it), and otherwise only POINTS at the
+/// sidebar.
+///
+/// This is also the launch screen — startup opens no terminal at all — so
+/// the no-projects case is the one written for first, not the leftover:
+///
+/// * Nothing remembered — a first-ever launch, with an empty sidebar
+///   beside it. The hint says what the empty sidebar is FOR, which is the
+///   only thing that screen can honestly offer; the button is not drawn,
+///   because opening an empty list is not a way forward.
+/// * Remembered, sidebar already on projects — say where they are and draw
+///   no button; the button would do nothing visible.
+/// * Remembered, sidebar closed or on another view — the list is not on
+///   screen, so offer to put it there.
+fn empty_state(remembered_projects: usize, showing_projects: bool) -> EmptyState {
+    if remembered_projects == 0 {
+        return EmptyState {
+            hint: "start one - the folders you work in are remembered here",
+            show_projects_button: false,
+        };
+    }
+    if showing_projects {
+        EmptyState {
+            hint: "pick up a project from the sidebar, or start fresh",
+            show_projects_button: false,
+        }
+    } else {
+        EmptyState {
+            hint: "your projects are still remembered",
+            show_projects_button: true,
+        }
+    }
+}
+
 struct DragState {
     tab_index: usize,
     /// The window this drag started in — resizes must never follow an
@@ -620,6 +728,16 @@ pub struct Workspace {
     /// on the tick (no Window), so render — which has one — completes the
     /// focus, keeping keyboard focus consistent with the visible tab.
     companion_pending_focus: Option<String>,
+    /// The workspace root awaiting the same window-aware handoff, set when
+    /// the last terminal goes.
+    ///
+    /// Not every close path has a `Window`: a shell that EXITS on its own
+    /// (typing `exit`, the commonest way to close a terminal) reaches
+    /// `close_terminal` through a pane event, which has none. Focus would
+    /// then be left on the pane that just died, and since gpui dispatches
+    /// actions along the focus path, cmd-t would stop working on exactly
+    /// the screen whose whole job is to offer a new terminal.
+    pending_root_focus: bool,
     /// Phone-link flyout anchored to the rail icon.
     companion_flyout: bool,
     /// Transient "copied" confirmation on the flyout's copy chip. The
@@ -789,6 +907,7 @@ impl Workspace {
             shareable_peers_cache,
             share_open: std::collections::HashSet::new(),
             companion_pending_focus: None,
+            pending_root_focus: false,
             companion_flyout: false,
             companion_copied: false,
             companion_copy_gen: 0,
@@ -832,7 +951,23 @@ impl Workspace {
         if this.settings.buddy_companion.as_ref() != Some(&this.companion.save) {
             this.save_companion();
         }
-        this.add_tab(None, cx);
+        // Launch lands on the empty state. No `add_tab` here, and no
+        // condition on one either.
+        //
+        // The obvious alternative — spawn a terminal only when the project
+        // store is empty, so a first-ever launch has something — was
+        // considered and rejected. It gives the app two startup paths, and
+        // the one a user meets ONCE is the one that would never be
+        // exercised again; the app would behave differently on day one
+        // from every day after. It also contradicts the direction: the
+        // home screen IS the product's front door, not a fallback for when
+        // there is nothing to put on it.
+        //
+        // That makes the empty state's own "new terminal" affordance
+        // load-bearing rather than a courtesy — it is the first thing a
+        // new user ever sees, on a workspace with no projects and no
+        // peers. `empty_state` is written for that case first.
+        //
         // cmd-q does not close the window: it reaches AppKit's `terminate:`,
         // which fires `applicationWillTerminate:` -> gpui's quit observers
         // and only then clears the windows. `shutdown_all` hangs off
@@ -1884,7 +2019,19 @@ impl Workspace {
         }
     }
 
-    /// Route keyboard focus to the currently-focused terminal's pane.
+    /// Route keyboard focus to the currently-focused terminal's pane, or
+    /// to the workspace itself when there is no terminal at all.
+    ///
+    /// The fallback is what keeps the empty state escapable. gpui
+    /// dispatches actions along the FOCUS path, and every binding —
+    /// cmd-t, cmd-n, cmd-o, the settings sheet — is registered on the
+    /// workspace root, which `track_focus` puts on that path only while it
+    /// holds focus. This used to do nothing without a pane, which was
+    /// invisible while a pane always existed: startup opened one and
+    /// closing the last respawned one. Now launch lands here, and so does
+    /// closing the last terminal — with focus otherwise left on a pane
+    /// that was just torn down, the shortcut that gets the user OUT would
+    /// be the one that stopped working.
     pub fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pane) = self
             .focused_terminal
@@ -1892,6 +2039,8 @@ impl Workspace {
             .and_then(|id| self.panes.get(id))
         {
             pane.read(cx).focus(window);
+        } else {
+            window.focus(&self.focus_handle);
         }
     }
 
@@ -1985,6 +2134,43 @@ impl Workspace {
                 let adjusted = rename_index - usize::from(rename_index > removed);
                 self.rename_field = Some((adjusted, field));
             }
+        }
+    }
+
+    /// Everything a tab removal leaves to fix up, in ONE place: the
+    /// in-progress rename's index, the per-tab state keyed by tab id, the
+    /// active index, and where focus lands.
+    ///
+    /// Call immediately after `self.tabs.remove(removed)`, with
+    /// `was_active` computed BEFORE it. Both close paths — the one that
+    /// loses a tab's last terminal and the one that takes the whole tab —
+    /// had these five steps written out separately, which is exactly the
+    /// shape of bug this repo keeps producing: the empty case was fixed in
+    /// one and would have been missed in the other.
+    ///
+    /// An empty workspace is a legal resting state now, so the branch that
+    /// used to respawn a shell in `$HOME` instead lets focus go. Nothing
+    /// is left pointing at a pane that no longer exists: with no tabs
+    /// there are no panes, so `None` is the only honest answer, and the
+    /// panels retarget to `Detached` through `set_focused_terminal`.
+    fn settle_after_tab_removal(
+        &mut self,
+        removed: usize,
+        was_active: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.fix_rename_after_removal(removed);
+        self.prune_closed_tab_state();
+        self.active_tab = active_tab_after_close(removed, self.active_tab, self.tabs.len());
+        if self.tabs.is_empty() {
+            self.set_focused_terminal(None, cx);
+            self.pending_root_focus = true;
+        } else if was_active {
+            // Only an active-tab close moves focus.
+            let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
+                .into_iter()
+                .next();
+            self.set_focused_terminal(next, cx);
         }
     }
 
@@ -2482,32 +2668,19 @@ impl Workspace {
                 let was_active = tab_index == self.active_tab
                     || self.focused_terminal.as_deref() == Some(terminal_id);
                 self.tabs.remove(tab_index);
-                self.fix_rename_after_removal(tab_index);
-                self.prune_closed_tab_state();
-                if self.tabs.is_empty() {
-                    self.add_tab(None, cx);
-                } else {
-                    // Removing a tab before the active one shifts every later
-                    // index down; follow the shift so the same tab stays
-                    // selected. Only an active-tab close moves focus.
-                    if tab_index < self.active_tab {
-                        self.active_tab -= 1;
-                    }
-                    self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-                    if was_active {
-                        let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
-                            .into_iter()
-                            .next();
-                        self.set_focused_terminal(next, cx);
-                    }
-                }
+                // Closing the LAST terminal leaves the workspace empty and
+                // stays there. It used to force a fresh shell in `$HOME`,
+                // which is the one thing a user who has just closed all of
+                // their work did not ask for.
+                self.settle_after_tab_removal(tab_index, was_active, cx);
             }
         }
         cx.notify();
     }
 
     /// Close a whole tab: every terminal in its tree shuts down (the old
-    /// app's removeTab). The last remaining tab is respawned fresh.
+    /// app's removeTab). Closing the last one leaves the workspace with no
+    /// tabs and no focused terminal — see `settle_after_tab_removal`.
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(ids) = self.tabs.get(index).map(|tab| tab.all_terminal_ids()) else {
             return;
@@ -2539,22 +2712,10 @@ impl Workspace {
         self.broadcasts.prune_to(&live);
         self.share_open.retain(|id| self.panes.contains_key(id));
         self.tabs.remove(index);
-        self.fix_rename_after_removal(index);
-        self.prune_closed_tab_state();
-        if self.tabs.is_empty() {
-            self.add_tab(None, cx);
-        } else {
-            if index < self.active_tab {
-                self.active_tab -= 1;
-            }
-            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-            if was_active {
-                let next = collect_terminal_ids(self.tabs[self.active_tab].active_pane())
-                    .into_iter()
-                    .next();
-                self.set_focused_terminal(next, cx);
-            }
-        }
+        // The sibling of the same decision in `close_terminal`, and made in
+        // the same call: closing the last project leaves the workspace
+        // empty rather than respawning a shell in `$HOME`.
+        self.settle_after_tab_removal(index, was_active, cx);
         cx.notify();
     }
 
@@ -3867,12 +4028,14 @@ impl Workspace {
                     }
                     _ => {
                         // Busy (or no) local terminal: open a new window in
-                        // the current project at that directory.
-                        let index = ws.active_tab;
-                        if index < ws.tabs.len() {
-                            ws.new_window(index, Some(PathBuf::from(path)), cx);
-                        } else {
-                            ws.add_tab(Some(PathBuf::from(path)), cx);
+                        // the current project at that directory — or, with
+                        // no project open at all, a tab there. Same rule as
+                        // cmd-n, made in the same function so the two
+                        // cannot drift.
+                        let cwd = Some(PathBuf::from(path));
+                        match new_window_target(ws.active_tab, ws.tabs.len()) {
+                            NewWindowTarget::InTab(index) => ws.new_window(index, cwd, cx),
+                            NewWindowTarget::AsNewTab => ws.add_tab(cwd, cx),
                         }
                         ws.focus_active_pane(window, cx);
                     }
@@ -4068,7 +4231,13 @@ impl Workspace {
         // collapsed set can both be holding ids no live tab answers to.
         self.prune_closed_tab_state();
         if self.tabs.is_empty() {
-            self.add_tab(None, cx);
+            // A session saved from an empty workspace restores as one.
+            // Every pane above was torn down and `self.panes` is empty, so
+            // the id `focused_terminal` still holds names nothing — it has
+            // to be dropped here rather than left pointing at a dead pane.
+            self.active_tab = 0;
+            self.set_focused_terminal(None, cx);
+            self.pending_root_focus = true;
         } else {
             let wanted = layout.active_tab_id;
             self.active_tab = self.tabs.iter().position(|t| t.id == wanted).unwrap_or(0);
@@ -4082,6 +4251,81 @@ impl Workspace {
     }
 
     // --- rendering ---
+
+    /// The main area with no terminal open — a state the user chose, so it
+    /// says so plainly rather than leaving a blank rectangle that reads as
+    /// a crash.
+    ///
+    /// It does NOT list projects. The sidebar beside it already does, with
+    /// pins, click-to-reopen and the live tabs above them; a second copy in
+    /// the middle of the window would be the same rows twice with two sets
+    /// of click behaviour to keep in step, which is precisely the kind of
+    /// duplication this file keeps getting wrong. What the main area adds
+    /// is the one action that always works — a new terminal, with the key
+    /// that does it — and, when the list is not on screen, a way to put it
+    /// there. `empty_state` decides which of those apply.
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let showing_projects = self.sidebar_open && self.sidebar_view == SidebarView::Projects;
+        let state = empty_state(self.projects_cache.all().len(), showing_projects);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.0))
+            .text_size(px(11.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(theme.ui_text))
+                    .child("no terminals open"),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(theme.ui_text_muted))
+                    .child(state.hint),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(self.chip_button(
+                        "new terminal",
+                        false,
+                        |ws, window, cx| {
+                            ws.add_tab(None, cx);
+                            ws.focus_active_pane(window, cx);
+                        },
+                        cx,
+                    ))
+                    .children(state.show_projects_button.then(|| {
+                        self.chip_button(
+                            "show projects",
+                            false,
+                            |ws, window, cx| {
+                                // Opens the sidebar AND switches it to
+                                // projects, so this is the right button
+                                // whether it was closed or on another view.
+                                ws.open_sidebar(SidebarView::Projects, cx);
+                                ws.focus_active_pane(window, cx);
+                            },
+                            cx,
+                        )
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(theme.ui_text_muted))
+                            .child("cmd-t"),
+                    ),
+            )
+            .into_any_element()
+    }
 
     fn render_tree(
         &self,
@@ -5839,6 +6083,17 @@ impl Render for Workspace {
         if let Some(id) = self.companion_pending_focus.take() {
             self.focus_terminal_by_id(&id, window, cx);
         }
+        if self.pending_root_focus {
+            self.pending_root_focus = false;
+            // A sheet owns the keyboard while it is up, and its own
+            // `close_overlay` calls `focus_active_pane` on the way out —
+            // which lands on the root for exactly this reason. So drop the
+            // request rather than yanking focus out of a field the user is
+            // typing in.
+            if self.overlay == Overlay::None {
+                window.focus(&self.focus_handle);
+            }
+        }
         let theme = self.theme;
         let active_tree = self
             .tabs
@@ -5847,7 +6102,10 @@ impl Render for Workspace {
 
         let content = match active_tree {
             Some(tree) => self.render_tree(&tree, self.active_tab, Vec::new(), cx),
-            None => div().size_full().into_any_element(),
+            // No tabs at all: the empty state. Also covers an `active_tab`
+            // that somehow outran the list, which `Vec::get` answers the
+            // same way rather than panicking.
+            None => self.render_empty_state(cx),
         };
 
         // Clicking away from a tab rename commits it (matching the old
@@ -5915,8 +6173,12 @@ impl Render for Workspace {
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &NewWindow, window, cx| {
-                let index = ws.active_tab;
-                ws.new_window(index, None, cx);
+                // From the empty state there is no project to put a window
+                // IN, so cmd-n opens a tab rather than doing nothing.
+                match new_window_target(ws.active_tab, ws.tabs.len()) {
+                    NewWindowTarget::InTab(index) => ws.new_window(index, None, cx),
+                    NewWindowTarget::AsNewTab => ws.add_tab(None, cx),
+                }
                 ws.focus_active_pane(window, cx);
             }))
             .on_action(cx.listener(|ws, _: &CloseTab, window, cx| {
@@ -6588,6 +6850,198 @@ mod tests {
             project_mark_color(&crate::themes::TOKYO_NIGHT, slot),
             project_mark_color(&crate::themes::DRACULA, slot),
             "two themes that share no palette must not paint one mark alike"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_leaves_no_tab_active_rather_than_underflowing() {
+        // The whole point of this change: zero tabs is a legal state. The
+        // code this replaced ended in `self.tabs.len() - 1`, which on an
+        // empty Vec is a usize UNDERFLOW — a panic in an app that runs all
+        // day, reachable the moment the last terminal closes.
+        assert_eq!(active_tab_after_close(0, 0, 0), 0);
+        // A stale active index cannot conjure a panic either.
+        assert_eq!(active_tab_after_close(3, 7, 0), 0);
+
+        // Removing a tab BEFORE the active one shifts it down, so the same
+        // tab stays selected.
+        assert_eq!(active_tab_after_close(0, 2, 3), 1);
+        assert_eq!(active_tab_after_close(1, 2, 3), 1);
+        // Removing one AFTER it leaves it where it is.
+        assert_eq!(active_tab_after_close(2, 1, 3), 1);
+        // Removing the active one keeps the index, which is now the tab
+        // that took its place...
+        assert_eq!(active_tab_after_close(1, 1, 3), 1);
+        // ...unless it was the last, in which case it clamps back.
+        assert_eq!(active_tab_after_close(2, 2, 2), 1);
+        // Down to one tab, everything lands on it.
+        assert_eq!(active_tab_after_close(0, 0, 1), 0);
+        assert_eq!(active_tab_after_close(1, 1, 1), 0);
+    }
+
+    #[test]
+    fn the_shortcut_for_a_new_window_still_produces_a_terminal_with_nothing_open() {
+        // A window belongs to a project. With none open there is no
+        // project to put one in, and `new_window` returns early on an
+        // out-of-range index — so without this, cmd-n from the empty state
+        // (which is now also the LAUNCH state) would silently do nothing
+        // and the shortcut would be a dead key on the first screen a new
+        // user ever sees.
+        assert_eq!(new_window_target(0, 0), NewWindowTarget::AsNewTab);
+        // A stale active index is the same case, never an index used raw.
+        assert_eq!(new_window_target(4, 2), NewWindowTarget::AsNewTab);
+        // With projects open it is still a window in the active one.
+        assert_eq!(new_window_target(0, 1), NewWindowTarget::InTab(0));
+        assert_eq!(new_window_target(2, 5), NewWindowTarget::InTab(2));
+    }
+
+    #[test]
+    fn the_launch_screen_says_something_useful_before_any_project_exists() {
+        // Startup opens no terminal, so this screen is the first thing a
+        // brand-new user sees: no projects, no peers, an empty sidebar
+        // beside it. It must not degrade to a bare heading — and it must
+        // not offer to "show projects" when there are none, which would
+        // open an empty list and read as a broken button.
+        let first_launch = empty_state(0, true);
+        assert!(!first_launch.hint.is_empty());
+        assert!(!first_launch.show_projects_button);
+        // The sidebar being shut changes nothing while there is nothing to
+        // show in it.
+        assert_eq!(empty_state(0, false), first_launch);
+
+        // With projects remembered and the list already on screen, the
+        // button would do nothing visible — so it is not drawn, and the
+        // line points at the list instead.
+        let listed = empty_state(3, true);
+        assert!(!listed.show_projects_button);
+        assert!(!listed.hint.is_empty());
+
+        // With projects remembered and the list NOT on screen (sidebar
+        // closed, or open on git/files/peers), offer to put it there.
+        let hidden = empty_state(3, false);
+        assert!(hidden.show_projects_button);
+        assert!(!hidden.hint.is_empty());
+        assert_ne!(hidden.hint, listed.hint);
+    }
+
+    #[test]
+    fn nothing_respawns_a_shell_the_user_did_not_ask_for() {
+        // The user's complaint, in one assertion: "when I close out of all
+        // my work it opens up another terminal in ~ dir". Two close paths
+        // did it and startup did it, and the recurring failure in this
+        // repo is fixing one site and missing its sibling — so all of them
+        // are scanned, together, in one test.
+        //
+        // `load_session` is here too: restoring a session saved from an
+        // empty workspace must restore AN EMPTY WORKSPACE.
+        let production = include_str!("mod.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("the test module anchor `only_the_helper_assigns_focus` also depends on");
+
+        for name in [
+            "pub fn new(cx: &mut Context<Self>) -> Self {",
+            "fn settle_after_tab_removal(",
+            "fn close_terminal(",
+            "fn close_tab(",
+            "fn load_session(",
+        ] {
+            let after = production
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist in mod.rs"));
+            let body = &after[..after.find("\n    fn ").unwrap_or(after.len())];
+            assert!(
+                !body.contains("add_tab("),
+                "{name} spawns a terminal nobody asked for"
+            );
+        }
+    }
+
+    #[test]
+    fn the_empty_state_can_always_be_escaped_from_the_keyboard() {
+        // gpui dispatches actions along the FOCUS path, and every binding
+        // (cmd-t included) is registered on the workspace root, which is on
+        // that path only while it holds focus. With no terminal there is no
+        // pane to focus, so if nothing claims it the one screen whose whole
+        // job is to offer a new terminal is the one where the shortcut for
+        // a new terminal is dead. Both halves of the fix are asserted here
+        // because they cover different paths and either alone leaves a hole.
+        let production = include_str!("mod.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("test module anchor");
+        let body_of = |name: &str| {
+            let after = production
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist in mod.rs"));
+            after[..after.find("\n    fn ").unwrap_or(after.len())].to_string()
+        };
+
+        // Paths that HAVE a Window (every key binding and click handler
+        // calls this after acting).
+        assert!(
+            body_of("pub fn focus_active_pane(").contains("window.focus(&self.focus_handle)"),
+            "with no pane to focus this must claim focus for the workspace \
+             root, not quietly do nothing"
+        );
+        // Paths that do NOT: a shell that exits on its own arrives through
+        // a pane event, which carries no Window. Render has one and
+        // consumes this flag (verified by reading `impl Render`).
+        assert!(
+            body_of("fn settle_after_tab_removal(").contains("self.pending_root_focus = true"),
+            "emptying the workspace from a Window-less path must still hand \
+             focus back to the root on the next frame"
+        );
+    }
+
+    #[test]
+    fn the_two_ways_to_ask_for_a_window_make_the_same_choice() {
+        // cmd-n and the folder picker's busy-terminal fallback both have to
+        // decide "a window in the active project, or a whole new tab?", and
+        // both are now reachable with no project open. They had the answer
+        // written out separately, which is exactly how this codebase has
+        // produced ten near-identical bugs: one site updated, its twin
+        // left behind. One function, two call sites, asserted here.
+        let production = include_str!("mod.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("test module anchor");
+        assert_eq!(
+            production
+                .matches("new_window_target(ws.active_tab, ws.tabs.len())")
+                .count(),
+            2,
+            "cmd-n and the folder picker must both route through new_window_target"
+        );
+    }
+
+    #[test]
+    fn the_post_close_active_index_is_decided_in_exactly_one_place() {
+        // The underflow lived in five lines that were duplicated verbatim
+        // across `close_terminal` and `close_tab`. Making them a function
+        // is only worth something while nothing computes the answer
+        // inline again — the second copy is where the bug always comes
+        // back.
+        let production = include_str!("mod.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("test module anchor");
+        assert!(
+            !production.contains("self.active_tab -= 1"),
+            "the index shift belongs to active_tab_after_close"
+        );
+        assert!(
+            !production.contains("self.active_tab.min("),
+            "the clamp belongs to active_tab_after_close - on an empty Vec \
+             its `len() - 1` argument is a usize underflow"
+        );
+        assert_eq!(
+            production.matches("active_tab_after_close(").count(),
+            2,
+            "one definition, one call site: both close paths go through \
+             settle_after_tab_removal"
         );
     }
 }
