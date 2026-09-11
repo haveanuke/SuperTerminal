@@ -5491,9 +5491,6 @@ impl Workspace {
         match self.overlay {
             Overlay::None => None,
             Overlay::SettingsSheet => {
-                // The sheet sizes itself against the window rather than a
-                // fixed pixel budget; see `settings-content`'s `max_h`.
-                let vh = f32::from(window.viewport_size().height);
                 let current = self.settings.theme.clone();
                 // Built only while the themes section is active — hidden
                 // sections must not pay for the whole chip grid per render.
@@ -5636,6 +5633,8 @@ impl Workspace {
 
                 Some(
                     self.sheet("settings", "esc closes", sheet_max, cx)
+                        // Fixed, not capped: see `settings_sheet_height`.
+                        .h(Self::settings_sheet_height(window))
                         .child(
                             div()
                                 .flex()
@@ -5683,25 +5682,14 @@ impl Workspace {
                                     div()
                                         .id("settings-content")
                                         .flex_grow()
-                                        // Sized against the ACTUAL window rather than
-                                        // a fixed guess. It was 280px, which is a
-                                        // different fraction of every window, and
-                                        // then briefly a THIRD of the height — which
-                                        // was reading the request backwards. The
-                                        // sheet is allowed to be big: it is a
-                                        // settings panel the user opened on purpose,
-                                        // not something covering work they were
-                                        // doing.
-                                        //
-                                        // 60% of the viewport for the CONTENT, so
-                                        // the sheet with its chrome sits a little
-                                        // above two thirds and still reads as a
-                                        // panel over the terminal rather than a
-                                        // screen of its own.
-                                        //
-                                        // Floored so a very short window still shows
-                                        // something scrollable rather than a sliver.
-                                        .max_h(px((vh * 0.6).max(220.0)))
+                                        // No max of its own: the sheet has a
+                                        // FIXED height now, so the content
+                                        // fills what is left of it and
+                                        // scrolls. A second cap here would
+                                        // either fight the frame or leave a
+                                        // gap under short sections — the
+                                        // thing a fixed frame exists to
+                                        // stop.
                                         .overflow_y_scroll()
                                         .flex()
                                         .flex_col()
@@ -6213,6 +6201,21 @@ impl Workspace {
     /// panel OVER the terminal rather than a screen of its own.
     fn sheet_max_height(window: &Window) -> gpui::Pixels {
         px((f32::from(window.viewport_size().height) * 0.72).max(260.0))
+    }
+
+    /// The settings sheet's FIXED height — always this, never sized to its
+    /// content.
+    ///
+    /// A max-height sheet grows to fit what is in it, and the settings
+    /// sections hold very different amounts, so every section switch
+    /// resized the panel under the pointer. Somewhere over half the window
+    /// and CONSTANT is what a settings panel should be: the content scrolls
+    /// inside it, the frame does not move.
+    ///
+    /// The other sheets keep the max-height behaviour deliberately — a
+    /// one-line search box has no business occupying half the screen.
+    fn settings_sheet_height(window: &Window) -> gpui::Pixels {
+        px((f32::from(window.viewport_size().height) * 0.58).max(320.0))
     }
 
     /// A bottom sheet. `max_height` is the WINDOW-relative cap the caller
