@@ -7593,6 +7593,10 @@ mod tests {
 
         for (source, name) in [
             (mod_rs, "fn render_projects_view"),
+            // The PINNED/RECENT builder. On the ladder already, but the
+            // scan is the thing that keeps it there, and a builder this
+            // test does not read is exactly how the share row drifted off.
+            (mod_rs, "fn render_project_row"),
             (companion, "fn render_share_row"),
         ] {
             let body = body_of(source, name);
