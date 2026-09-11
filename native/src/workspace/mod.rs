@@ -7437,7 +7437,9 @@ mod tests {
         // A sheet taller than its own window has no scroll path out: the
         // rows past the bottom edge are simply unreachable. Both floors
         // (320 asked for, 260 capped) are absolute, so this holds only
-        // while the window is at least as tall as the CAP's floor.
+        // while the window is at least as tall as the CAP's floor -- and
+        // it is: `main.rs` sets `window_min_size` to 400x300, so 300 is
+        // the shortest window that exists and the first case below.
         for viewport in [260.0, 300.0, 361.0, 400.0, 768.0, 1440.0] {
             let height = settings_sheet_effective_px(viewport);
             assert!(
@@ -7445,10 +7447,12 @@ mod tests {
                 "settings sheet is {height} in a {viewport} window — taller than the window"
             );
         }
-        // Below that floor the shared cap stops tracking the window, and
-        // the sheet does overhang. Stated rather than asserted away: the
-        // fix belongs in `sheet_max_px`, which every sheet shares, not in
-        // the settings-only height.
+        // Below 260 the shared cap stops tracking the window and the sheet
+        // would overhang -- pinned here as a landmine, not a live bug:
+        // `window_min_size` puts that size out of reach today, and the day
+        // someone lowers that minimum this is what fails. The fix would
+        // belong in `sheet_max_px`, which every sheet shares, not in the
+        // settings-only height.
         assert!(settings_sheet_effective_px(200.0) > 200.0);
     }
 }
