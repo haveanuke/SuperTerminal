@@ -177,8 +177,20 @@ pub fn prune(cache: &mut GitCache, live: &HashSet<PathBuf>) {
     cache.retain(|anchor, _| live.contains(anchor));
 }
 
+/// The only non-ASCII characters `git_line` may ever emit: the separator,
+/// and the two tracking arrows.
+///
+/// This UI takes SVG icons, never emoji — and a branch NAME is attacker-ish
+/// input in the sense that matters here: it is whatever someone called a
+/// branch, including emoji, and it is rendered verbatim. That is fine (a
+/// branch called 🚀 should display as its name), so this guards the parts
+/// this module AUTHORS, not the parts it quotes.
+#[cfg(test)]
+pub const LINE_GLYPHS: [char; 3] = ['\u{b7}', '\u{2191}', '\u{2193}'];
+
 #[cfg(test)]
 mod tests {
+    use super::LINE_GLYPHS;
     use super::*;
     use superterminal_core::git::status::parse_status;
 
@@ -405,5 +417,41 @@ mod tests {
         cache.insert(dir.clone(), None);
         prune(&mut cache, &HashSet::from([dir.clone()]));
         assert_eq!(cache.get(&dir), Some(&None));
+    }
+
+    #[test]
+    fn the_line_authors_no_emoji_of_its_own() {
+        // The hints module has a guard like this; the git line did not, so
+        // nothing stopped a later edit reaching for an emoji here. Driven
+        // over every shape the line can take rather than a sample.
+        let shapes = [
+            summary("main", 0, 0, 0),
+            summary("main", 0, 0, 3),
+            summary("main", 2, 0, 0),
+            summary("main", 0, 5, 0),
+            summary("main", 2, 1, 4),
+        ];
+        for summary in shapes {
+            let line = git_line(Some(&summary)).expect("a summary yields a line");
+            for ch in line.chars() {
+                assert!(
+                    ch.is_ascii() || LINE_GLYPHS.contains(&ch),
+                    "git_line emitted {ch:?}, which is neither ASCII nor one of \
+                     its three allowed glyphs: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_named_with_an_emoji_is_still_shown_verbatim() {
+        // The guard above is about what this module AUTHORS. A branch name
+        // is quoted, not authored: someone called it that, and silently
+        // mangling it would be worse than rendering it.
+        let summary = summary("feature/\u{1f680}-launch", 0, 0, 0);
+        assert_eq!(
+            git_line(Some(&summary)).as_deref(),
+            Some("feature/\u{1f680}-launch")
+        );
     }
 }
