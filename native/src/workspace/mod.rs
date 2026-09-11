@@ -495,6 +495,44 @@ const PROJECT_GIT_TICKS: u32 = 15;
 /// in one list and something else in the other would be unreadable, and
 /// two copies of these six lines is exactly how this codebase has drifted
 /// siblings apart before.
+/// Inset on BOTH sides of every sidebar row, project and nested alike.
+///
+/// Shared so a row nested under a project can never be wider than the card
+/// it hangs under. Terminal rows used to carry no inset at all while the
+/// project card had 4, which drew the child 8px WIDER than its parent.
+const SIDEBAR_ROW_INSET: f32 = 4.0;
+/// Padding between a row's own edge and its first mark.
+const SIDEBAR_ROW_PAD: f32 = 6.0;
+/// The fold triangle's column on a project row. A project with nothing to
+/// fold still spends it, so every project's dot lands in one column.
+const SIDEBAR_FOLD_W: f32 = 12.0;
+/// Gap between the marks on a row.
+const SIDEBAR_GAP: f32 = 6.0;
+/// One step of nesting.
+const SIDEBAR_INDENT: f32 = 14.0;
+
+/// Distance from the sidebar's left edge to a row's leading dot, by
+/// nesting depth: 0 is a project, 1 a window or a terminal hanging
+/// straight off the project, 2 a terminal under a window row.
+///
+/// Depth 0 is not a free number -- it is where the project card's own box
+/// lands its dot, walking its inset, padding, fold column and gap. Every
+/// deeper row is measured from it, which is the property that keeps the
+/// tree the right way up.
+fn sidebar_bullet_x(depth: u8) -> f32 {
+    SIDEBAR_ROW_INSET
+        + SIDEBAR_ROW_PAD
+        + SIDEBAR_FOLD_W
+        + SIDEBAR_GAP
+        + f32::from(depth) * SIDEBAR_INDENT
+}
+
+/// The left padding a nested row needs to land its dot at `depth`, given
+/// the row itself already starts at the shared inset.
+fn sidebar_child_pad_left(depth: u8) -> f32 {
+    sidebar_bullet_x(depth) - SIDEBAR_ROW_INSET
+}
+
 fn activity_dot(activity: Activity, theme: &'static Theme) -> impl IntoElement {
     let color = match activity {
         Activity::Idle => theme.green,
@@ -3570,8 +3608,8 @@ impl Workspace {
                     // is a shape with edges, which is what lets the two
                     // lines inside it read as one thing. Inset so the
                     // rounding is visible against the sidebar edge.
-                    .mx(px(4.0))
-                    .px(px(6.0))
+                    .mx(px(SIDEBAR_ROW_INSET))
+                    .px(px(SIDEBAR_ROW_PAD))
                     .py(px(3.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
@@ -3581,7 +3619,7 @@ impl Workspace {
                         div()
                             .id(SharedString::from(format!("project-fold-{}", tab.id)))
                             .cursor_pointer()
-                            .w(px(12.0))
+                            .w(px(SIDEBAR_FOLD_W))
                             .flex_none()
                             .text_size(px(8.0))
                             .text_color(rgb(theme.ui_text_muted))
@@ -3760,7 +3798,12 @@ impl Workspace {
                             .flex_row()
                             .items_center()
                             .h(px(16.0))
-                            .pl(px(16.0))
+                            // One step under the project, sharing its
+                            // inset. See `sidebar_bullet_x`.
+                            .mx(px(SIDEBAR_ROW_INSET))
+                            .pl(px(sidebar_child_pad_left(1)))
+                            .pr(px(8.0))
+                            .rounded(px(4.0))
                             .cursor_pointer()
                             .text_size(px(8.0))
                             .text_color(rgb(if window_active {
@@ -3827,8 +3870,15 @@ impl Workspace {
                             .items_center()
                             .gap(px(6.0))
                             .h(px(20.0))
-                            .pl(px(20.0))
+                            // One step under the project, or two when a
+                            // window row stands between them. Sharing the
+                            // project's inset is what stops a terminal
+                            // being drawn WIDER than the project it
+                            // belongs to. See `sidebar_bullet_x`.
+                            .mx(px(SIDEBAR_ROW_INSET))
+                            .pl(px(sidebar_child_pad_left(if multi_window { 2 } else { 1 })))
                             .pr(px(8.0))
+                            .rounded(px(4.0))
                             .cursor_pointer()
                             .when(focused, |d| d.bg(rgb(theme.ui_surface)))
                             .hover(|style| style.bg(rgb(theme.ui_surface)))
@@ -4077,8 +4127,13 @@ impl Workspace {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .mx(px(4.0))
-            .px(px(6.0))
+            .mx(px(SIDEBAR_ROW_INSET))
+            // No fold triangle -- a project that is not open has no
+            // children to fold -- but the triangle's column is spent
+            // anyway, so a PINNED dot lands in the same column as an open
+            // project's rather than 18px to its left.
+            .pl(px(SIDEBAR_ROW_PAD + SIDEBAR_FOLD_W + SIDEBAR_GAP))
+            .pr(px(SIDEBAR_ROW_PAD))
             .py(px(3.0))
             .rounded(px(6.0))
             .cursor_pointer()
@@ -7454,5 +7509,69 @@ mod tests {
         // belong in `sheet_max_px`, which every sheet shares, not in the
         // settings-only height.
         assert!(settings_sheet_effective_px(200.0) > 200.0);
+    }
+
+    #[test]
+    fn a_nested_sidebar_row_sits_right_of_the_row_it_hangs_under() {
+        // The reported bug, in one assertion: "the project title is
+        // positioned like a sub-bullet of the terminal rather than the
+        // other way around". Terminal rows used a bare `pl(20)` while the
+        // project card above them was inset 4, padded 6, and spent 12 on a
+        // fold triangle -- so the PROJECT's dot sat at 28 and its own
+        // TERMINAL's at 20. The child bullet was left of the parent's and
+        // the tree read upside down.
+        let project = sidebar_bullet_x(0);
+        for depth in 1..=2u8 {
+            assert!(
+                sidebar_bullet_x(depth) > project,
+                "depth {depth} bullet at {} is not right of the project's {project}",
+                sidebar_bullet_x(depth)
+            );
+        }
+        // Strictly deeper each step, not merely different.
+        assert!(sidebar_bullet_x(2) > sidebar_bullet_x(1));
+    }
+
+    #[test]
+    fn a_nested_sidebar_row_is_never_wider_than_its_parent() {
+        // The other half of what was reported: "the Project is skinnier
+        // than the terminals under it". The project card carried
+        // `mx(4)` and the rows under it carried none, so each child was
+        // 8px wider than the card it belonged to. Every row now starts at
+        // the same inset, and `sidebar_child_pad_left` subtracts exactly
+        // that inset -- which is the whole reason it is not just
+        // `sidebar_bullet_x`.
+        for depth in 0..=2u8 {
+            assert_eq!(
+                SIDEBAR_ROW_INSET + sidebar_child_pad_left(depth),
+                sidebar_bullet_x(depth),
+                "a depth {depth} row does not start from the shared inset"
+            );
+        }
+    }
+
+    #[test]
+    fn no_sidebar_row_hard_codes_its_own_indent() {
+        // Arithmetic tests cannot see a row that never consults the
+        // ladder, and a bare `pl` is exactly how this broke: both child
+        // rows had one, each plausible on its own, neither agreeing with
+        // the project card. Source-text, because gpui layout is not
+        // testable here.
+        let production = include_str!("mod.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("the test module anchor");
+        let after = production
+            .split("fn render_projects_view")
+            .nth(1)
+            .expect("render_projects_view must exist");
+        let body = &after[..after.find("\n    fn ").unwrap_or(after.len())];
+        for literal in [".pl(px(16.0))", ".pl(px(20.0))", ".mx(px(4.0))"] {
+            assert!(
+                !body.contains(literal),
+                "a sidebar row hard-codes {literal} instead of going \
+                 through the SIDEBAR_* ladder"
+            );
+        }
     }
 }
