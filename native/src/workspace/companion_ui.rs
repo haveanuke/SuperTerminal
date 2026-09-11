@@ -580,6 +580,7 @@ impl Workspace {
         &self,
         terminal_id: &str,
         shareable: &[crate::peers::PeerRecord],
+        depth: u8,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
@@ -595,7 +596,14 @@ impl Workspace {
                 .flex_row()
                 .items_center()
                 .py(px(3.0))
-                .pl(px(30.0))
+                // This panel hangs under a terminal row, so it takes the
+                // same shared inset and one step further in. A bare `pl`
+                // here is what put it 12px LEFT of the terminal it belongs
+                // to and 8px wider than the project card above it -- the
+                // reported bug, in the one row builder that lives outside
+                // `render_projects_view`.
+                .mx(px(SIDEBAR_ROW_INSET))
+                .pl(px(sidebar_child_pad_left(depth)))
                 .pr(px(8.0))
                 .text_size(px(9.0))
                 .text_color(rgb(theme.ui_text_muted))
@@ -648,7 +656,9 @@ impl Workspace {
             .items_center()
             .gap(px(4.0))
             .py(px(3.0))
-            .pl(px(30.0))
+            // Same ladder as the message above; see `sidebar_bullet_x`.
+            .mx(px(SIDEBAR_ROW_INSET))
+            .pl(px(sidebar_child_pad_left(depth)))
             .pr(px(8.0))
             .children(chips)
             .into_any_element()

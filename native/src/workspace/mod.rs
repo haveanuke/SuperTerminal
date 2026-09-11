@@ -3778,6 +3778,10 @@ impl Workspace {
                 continue;
             }
             let multi_window = tab.windows.len() > 1;
+            // A terminal hangs one step under its project, or two when a
+            // window row stands between them. The share panel hangs one
+            // step under the terminal. See `sidebar_bullet_x`.
+            let terminal_depth: u8 = if multi_window { 2 } else { 1 };
             let window_groups: Vec<(usize, Vec<String>)> = tab
                 .windows
                 .iter()
@@ -3876,7 +3880,7 @@ impl Workspace {
                             // being drawn WIDER than the project it
                             // belongs to. See `sidebar_bullet_x`.
                             .mx(px(SIDEBAR_ROW_INSET))
-                            .pl(px(sidebar_child_pad_left(if multi_window { 2 } else { 1 })))
+                            .pl(px(sidebar_child_pad_left(terminal_depth)))
                             .pr(px(8.0))
                             .rounded(px(4.0))
                             .cursor_pointer()
@@ -3960,6 +3964,7 @@ impl Workspace {
                         rows.push(self.render_share_row(
                             &terminal_id,
                             &self.shareable_peers_cache,
+                            terminal_depth + 1,
                             cx,
                         ));
                     }
@@ -7557,21 +7562,65 @@ mod tests {
         // rows had one, each plausible on its own, neither agreeing with
         // the project card. Source-text, because gpui layout is not
         // testable here.
-        let production = include_str!("mod.rs")
+        // EVERY row builder in the sidebar, not just the ones in this
+        // file. `render_share_row` lives in companion_ui.rs, which is
+        // exactly why the first pass missed it: it kept a bare `pl(30)`
+        // and drew the share panel left of, and wider than, the terminal
+        // it hangs under -- the reported bug surviving its own fix, one
+        // module over.
+        let mod_rs = include_str!("mod.rs")
             .split("\nmod tests {")
             .next()
             .expect("the test module anchor");
-        let after = production
-            .split("fn render_projects_view")
-            .nth(1)
-            .expect("render_projects_view must exist");
-        let body = &after[..after.find("\n    fn ").unwrap_or(after.len())];
-        for literal in [".pl(px(16.0))", ".pl(px(20.0))", ".mx(px(4.0))"] {
+        let companion = include_str!("companion_ui.rs");
+        // Bound at the next item at the SAME indentation, whatever its
+        // visibility. `render_share_row` is `pub(super) fn`, so a lone
+        // "\n    fn " needle never finds its end and the scan runs
+        // silently to the end of the file -- passing for the wrong
+        // reason, over a region it does not mean.
+        fn body_of<'a>(source: &'a str, name: &str) -> &'a str {
+            let after = source
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let end = ["\n    fn ", "\n    pub(super) fn ", "\n    pub fn "]
+                .iter()
+                .filter_map(|needle| after.find(needle))
+                .min()
+                .unwrap_or(after.len());
+            &after[..end]
+        }
+
+        for (source, name) in [
+            (mod_rs, "fn render_projects_view"),
+            (companion, "fn render_share_row"),
+        ] {
+            let body = body_of(source, name);
             assert!(
-                !body.contains(literal),
-                "a sidebar row hard-codes {literal} instead of going \
-                 through the SIDEBAR_* ladder"
+                body.len() > 400,
+                "{name} body came out at {} chars — the scan is not \
+                 bounding what it thinks it is",
+                body.len()
             );
+            // The bound actually held: no second item at this indent.
+            for needle in ["\n    fn ", "\n    pub(super) fn ", "\n    pub fn "] {
+                assert!(
+                    !body.contains(needle),
+                    "{name} body ran past its own end into the next item"
+                );
+            }
+            for literal in [
+                ".pl(px(16.0))",
+                ".pl(px(20.0))",
+                ".pl(px(30.0))",
+                ".mx(px(4.0))",
+            ] {
+                assert!(
+                    !body.contains(literal),
+                    "{name} hard-codes {literal} instead of going through \
+                     the SIDEBAR_* ladder"
+                );
+            }
         }
     }
 }
