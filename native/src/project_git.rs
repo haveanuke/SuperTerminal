@@ -188,6 +188,21 @@ pub fn prune(cache: &mut GitCache, live: &HashSet<PathBuf>) {
 #[cfg(test)]
 pub const LINE_GLYPHS: [char; 3] = ['\u{b7}', '\u{2191}', '\u{2193}'];
 
+/// Whether a landing probe still owns the slot it was issued.
+///
+/// Presence alone is not ownership. A project that leaves the sidebar and
+/// comes straight back has its slot pruned and REISSUED while the first
+/// probe is still running — so that probe lands, finds a marker, and
+/// writes a stale answer into the second probe's slot; the second then
+/// lands, finds nothing, and drops. The row ends up showing the older
+/// answer, which is exactly what pruning was supposed to prevent.
+///
+/// Same rule as `hosts::accepts_completion`, which exists for this on the
+/// git panel.
+pub fn probe_owns_slot(slot: Option<u64>, token: u64) -> bool {
+    slot == Some(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::LINE_GLYPHS;
@@ -452,6 +467,24 @@ mod tests {
         assert_eq!(
             git_line(Some(&summary)).as_deref(),
             Some("feature/\u{1f680}-launch")
+        );
+    }
+
+    #[test]
+    fn a_probe_owns_its_slot_only_while_the_token_matches() {
+        assert!(probe_owns_slot(Some(7), 7), "its own slot");
+        assert!(
+            !probe_owns_slot(None, 7),
+            "a pruned slot is not ownership - the project left the sidebar"
+        );
+        assert!(
+            !probe_owns_slot(Some(8), 7),
+            "a REISSUED slot belongs to the newer probe; the older one must \
+             not steal it and write a stale answer"
+        );
+        assert!(
+            !probe_owns_slot(Some(6), 7),
+            "and a slot from an older generation is not this probe's either"
         );
     }
 }

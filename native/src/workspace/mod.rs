@@ -752,7 +752,11 @@ pub struct Workspace {
     /// anchor is removed from here by the probe that owns it; a probe that
     /// finds its slot already gone was pruned mid-flight and drops its
     /// answer rather than resurrecting an entry.
-    project_git_inflight: std::collections::HashSet<PathBuf>,
+    /// Anchor -> the token of the probe that owns its slot. See the
+    /// insertion site for why this is a token and not a presence flag.
+    project_git_inflight: std::collections::HashMap<PathBuf, u64>,
+    /// Monotonic source for those tokens.
+    project_git_token: u64,
     /// The repo registry the project probes go through — interning, the
     /// per-repo action lock and the in-flight guard, exactly as the git
     /// panel uses for its own refresh.
@@ -965,7 +969,8 @@ impl Workspace {
             projects_cache: crate::projects::ProjectStore::load(),
             projects_note: None,
             project_git: HashMap::new(),
-            project_git_inflight: std::collections::HashSet::new(),
+            project_git_inflight: std::collections::HashMap::new(),
+            project_git_token: 0,
             project_git_state: Arc::new(superterminal_core::git::GitState::default()),
             cue_gates: HashMap::new(),
             tts_child: None,
@@ -2360,14 +2365,29 @@ impl Workspace {
         // An entry is dropped the moment its project leaves the list, so a
         // stale branch can never be drawn for a folder that has gone.
         crate::project_git::prune(&mut self.project_git, &anchors);
-        // A probe whose slot is pruned here lands to find it gone and
-        // drops its answer rather than resurrecting the entry.
+        // A probe whose slot is pruned here lands to find it gone — or
+        // reissued — and drops its answer rather than resurrecting the
+        // entry.
         self.project_git_inflight
-            .retain(|anchor| anchors.contains(anchor));
+            .retain(|anchor, _| anchors.contains(anchor));
         for anchor in anchors {
-            if !self.project_git_inflight.insert(anchor.clone()) {
+            if self.project_git_inflight.contains_key(&anchor) {
                 continue; // already asked; not asked twice
             }
+            // A TOKEN, not a bare presence flag. Presence alone let a
+            // stale probe claim a newer one's slot: a project that leaves
+            // the sidebar and comes straight back is pruned and reinserted
+            // while the first probe is still running, so that probe lands,
+            // finds a marker, and writes its now-stale answer into the
+            // slot belonging to the second — which then lands, finds
+            // nothing, and drops. The row shows the older answer.
+            //
+            // Same shape as `hosts::accepts_completion`, which exists for
+            // exactly this on the git panel: a completion may only write
+            // if the token it carries is still the current one.
+            self.project_git_token = self.project_git_token.wrapping_add(1);
+            let token = self.project_git_token;
+            self.project_git_inflight.insert(anchor.clone(), token);
             let state = Arc::clone(&self.project_git_state);
             cx.spawn(async move |ws, cx| {
                 let probe = {
@@ -2378,12 +2398,19 @@ impl Workspace {
                         .await
                 };
                 let _ = ws.update(cx, |ws: &mut Workspace, cx| {
-                    // Owning the slot is what makes the write safe: if the
-                    // prune above took it while this ran, the project has
-                    // left the sidebar and its answer is discarded.
-                    if !ws.project_git_inflight.remove(&anchor) {
+                    // Owning the slot is what makes the write safe, and
+                    // ownership is the TOKEN matching — not merely a slot
+                    // existing. A slot reissued to a newer probe while this
+                    // one ran carries that probe's token, so this lands,
+                    // does not match, and discards its stale answer without
+                    // stealing the newer one's slot.
+                    if !crate::project_git::probe_owns_slot(
+                        ws.project_git_inflight.get(&anchor).copied(),
+                        token,
+                    ) {
                         return;
                     }
+                    ws.project_git_inflight.remove(&anchor);
                     match probe {
                         // Busy is not an answer about the repo — someone is
                         // committing. Keep whatever the row already had.
