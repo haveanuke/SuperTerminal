@@ -379,6 +379,36 @@ enum PeerListing {
 /// Fold the endpoint probe and the last `/sessions` poll into one thing to
 /// draw. Every failure mode gets its own answer, because the alternative —
 /// an empty list — is what "pick a peer and see nothing happen" looks like.
+/// How tall a bottom sheet may get in a window this tall, in pixels.
+///
+/// Split out from [`Workspace::sheet_max_height`] so the rule is testable:
+/// a `Window` cannot be built outside a running app, and there is no gpui
+/// test harness here.
+fn sheet_max_px(viewport_height: f32) -> f32 {
+    (viewport_height * 0.72).max(260.0)
+}
+
+/// How tall the settings sheet asks to be in a window this tall, in pixels.
+///
+/// `0.58` is the share of the window it wants -- over half, deliberately.
+/// `320.0` is the floor that keeps the panel usable in a short window; it
+/// can exceed the window, which is why this is only what the sheet ASKS
+/// for. See [`settings_sheet_effective_px`] for what it measures.
+fn settings_sheet_px(viewport_height: f32) -> f32 {
+    (viewport_height * 0.58).max(320.0)
+}
+
+/// What the settings sheet actually measures: what it asks for, clamped by
+/// the `max_h` every sheet carries.
+///
+/// Two numbers are in play and neither alone answers "how tall is it" --
+/// below roughly a 444px window the shared cap is the smaller of the two
+/// and wins, above it the fixed height does. Both are here so the answer
+/// can be asserted rather than reasoned about at each call site.
+fn settings_sheet_effective_px(viewport_height: f32) -> f32 {
+    settings_sheet_px(viewport_height).min(sheet_max_px(viewport_height))
+}
+
 fn peer_listing(
     reach: Option<&crate::peer_client::discover::Reach>,
     poll: Option<crate::peer_client::sessions::LastPoll>,
@@ -5667,7 +5697,22 @@ impl Workspace {
                                 .flex()
                                 .flex_row()
                                 .gap(px(14.0))
-                                .items_start()
+                                // The body takes what the fixed frame has
+                                // left and NOT a pixel more. `flex_grow`
+                                // claims the leftover; `min_h(0)` is what
+                                // lets it shrink below its own content --
+                                // without it flexbox's automatic minimum
+                                // size pins the row to its tallest child,
+                                // so a long section lays out taller than
+                                // the sheet and spills past the frame with
+                                // no scroll path. Children stretch to this
+                                // height (hence no `items_start`), which is
+                                // what gives the scrolling column below a
+                                // BOUNDED viewport to scroll inside; a
+                                // scroll container sized to its own content
+                                // never scrolls.
+                                .flex_grow()
+                                .min_h(px(0.0))
                                 .child(
                                     div()
                                         .flex_none()
@@ -5709,14 +5754,19 @@ impl Workspace {
                                     div()
                                         .id("settings-content")
                                         .flex_grow()
-                                        // No max of its own: the sheet has a
-                                        // FIXED height now, so the content
-                                        // fills what is left of it and
-                                        // scrolls. A second cap here would
+                                        // No max of its own: the row above is
+                                        // bounded to the fixed frame and this
+                                        // stretches to it, so the viewport
+                                        // this scrolls inside is already the
+                                        // right size. A second cap here would
                                         // either fight the frame or leave a
                                         // gap under short sections — the
                                         // thing a fixed frame exists to
-                                        // stop.
+                                        // stop. `min_h(0)` for the same
+                                        // reason as the row: a tall section
+                                        // must not push its own scroll
+                                        // container open.
+                                        .min_h(px(0.0))
                                         .overflow_y_scroll()
                                         .flex()
                                         .flex_col()
@@ -6227,7 +6277,7 @@ impl Workspace {
     /// a sliver, and capped below the full height so it always reads as a
     /// panel OVER the terminal rather than a screen of its own.
     fn sheet_max_height(window: &Window) -> gpui::Pixels {
-        px((f32::from(window.viewport_size().height) * 0.72).max(260.0))
+        px(sheet_max_px(f32::from(window.viewport_size().height)))
     }
 
     /// The settings sheet's FIXED height — always this, never sized to its
@@ -6242,7 +6292,7 @@ impl Workspace {
     /// The other sheets keep the max-height behaviour deliberately — a
     /// one-line search box has no business occupying half the screen.
     fn settings_sheet_height(window: &Window) -> gpui::Pixels {
-        px((f32::from(window.viewport_size().height) * 0.58).max(320.0))
+        px(settings_sheet_px(f32::from(window.viewport_size().height)))
     }
 
     /// A bottom sheet. `max_height` is the WINDOW-relative cap the caller
@@ -7343,5 +7393,62 @@ mod tests {
             "one definition, one call site: both close paths go through \
              settle_after_tab_removal"
         );
+    }
+
+    #[test]
+    fn the_settings_sheet_takes_over_half_the_window() {
+        // The requirement in the user's own words: settings should "always
+        // take up over 50% of the screen, not adjust over and over". The
+        // second half (not adjusting) is the fixed `.h()`; THIS is the
+        // first half, and it is the part a later tweak to the ratio could
+        // silently undo.
+        for viewport in [600.0, 900.0, 1200.0, 1600.0, 2400.0] {
+            let height = settings_sheet_effective_px(viewport);
+            assert!(
+                height > viewport * 0.5,
+                "settings sheet is {height} in a {viewport} window, not over half"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settings_sheet_never_out_grows_the_sheet_cap() {
+        // Two independent numbers decide this height and they cross over,
+        // so "which one wins" is not the same answer at every size: below
+        // roughly 444px the shared cap is smaller and governs, above it the
+        // fixed height does. Either way the sheet may never exceed the cap
+        // every other sheet obeys.
+        for viewport in [300.0, 400.0, 444.0, 500.0, 800.0, 1600.0] {
+            assert!(
+                settings_sheet_effective_px(viewport) <= sheet_max_px(viewport),
+                "settings sheet escapes the sheet cap at {viewport}"
+            );
+        }
+        // The crossover is real, not theoretical — both branches are live.
+        assert_eq!(settings_sheet_effective_px(400.0), sheet_max_px(400.0));
+        assert_eq!(
+            settings_sheet_effective_px(1600.0),
+            settings_sheet_px(1600.0)
+        );
+    }
+
+    #[test]
+    fn the_settings_sheet_fits_inside_the_window_it_floats_over() {
+        // A sheet taller than its own window has no scroll path out: the
+        // rows past the bottom edge are simply unreachable. Both floors
+        // (320 asked for, 260 capped) are absolute, so this holds only
+        // while the window is at least as tall as the CAP's floor.
+        for viewport in [260.0, 300.0, 361.0, 400.0, 768.0, 1440.0] {
+            let height = settings_sheet_effective_px(viewport);
+            assert!(
+                height <= viewport,
+                "settings sheet is {height} in a {viewport} window — taller than the window"
+            );
+        }
+        // Below that floor the shared cap stops tracking the window, and
+        // the sheet does overhang. Stated rather than asserted away: the
+        // fix belongs in `sheet_max_px`, which every sheet shares, not in
+        // the settings-only height.
+        assert!(settings_sheet_effective_px(200.0) > 200.0);
     }
 }
