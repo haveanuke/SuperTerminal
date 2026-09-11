@@ -13,6 +13,7 @@ mod layout;
 mod pane;
 mod peer_client;
 mod peers;
+mod project_git;
 mod projects;
 mod scrollback;
 mod settings;

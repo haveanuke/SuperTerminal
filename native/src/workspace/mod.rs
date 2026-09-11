@@ -407,15 +407,65 @@ fn peer_listing(
     }
 }
 
-/// The status dot beside one of a peer's sessions.
+/// A project row's SECOND line: what the project is, muted and smaller
+/// than the name above it.
 ///
-/// Same vocabulary as the projects view's — green idle, yellow busy, hollow
-/// when there is no trustworthy signal — minus its "quiet" cyan state. That
-/// one is derived from LOCAL output timing, which nothing here observes;
-/// inventing it from a poll would be a colour claiming evidence it does not
-/// have. Hollow for `Unknown` for the same reason: a filled dot asserts a
-/// state, and `Unknown` is the absence of one.
-fn peer_activity_dot(activity: Activity, theme: &'static Theme) -> impl IntoElement {
+/// One helper for both row kinds. The live tabs and the remembered
+/// projects are separate renderers, and a detail line that was 9px muted
+/// in one and something else in the other is exactly the sibling drift
+/// this file has produced repeatedly.
+fn project_detail_line(text: String, theme: &'static Theme) -> impl IntoElement {
+    div()
+        .overflow_hidden()
+        .text_ellipsis()
+        .whitespace_nowrap()
+        .text_size(px(9.0))
+        .text_color(rgb(theme.ui_text_muted))
+        .child(SharedString::from(text))
+}
+
+/// The activity a PROJECT row's dot reports: its terminals', reduced.
+///
+/// An empty set is `Unknown`, NOT `Activity::aggregate`'s `Idle`. That
+/// difference is the whole function: a remembered project has no terminals
+/// to observe, and `Idle` on its row would draw a green dot claiming a
+/// shell is sitting at a prompt in a project that is not even open. Both
+/// row kinds go through this, so the one closed-project rule cannot be
+/// applied to one of them and missed on the other.
+fn project_activity(terminals: &[Activity]) -> Activity {
+    if terminals.is_empty() {
+        return Activity::Unknown;
+    }
+    Activity::aggregate(terminals.iter().copied())
+}
+
+/// Heartbeats between per-project git refreshes. The heartbeat is 300ms,
+/// so this is every 4.5 seconds — deliberately slower than the sidebar
+/// poll it hangs off, because each refresh spawns two git processes PER
+/// PROJECT and the branch a project sits on does not move on a sub-second
+/// scale.
+///
+/// A MULTIPLE of that poll's own 3, and it has to be: the two gates are
+/// nested, so `tick % 3 == 0 && tick % N == 0` fires at their lowest
+/// common multiple. A co-prime N like 20 would have made this 18 seconds
+/// rather than the 6 it read as.
+const PROJECT_GIT_TICKS: u32 = 15;
+
+/// The status dot a row leads with: one beside a peer's session, one
+/// beside a project.
+///
+/// Green idle, yellow busy, hollow when there is no trustworthy signal.
+/// The terminal rows' extra "quiet" cyan state is deliberately NOT here:
+/// that one is derived from a single pane's LOCAL output timing, and
+/// neither a peer's poll nor a project's aggregate observes it. Hollow for
+/// `Unknown` for the same reason a colour is never invented — a filled dot
+/// asserts a state, and `Unknown` is the absence of one.
+///
+/// One function for both callers on purpose: a dot that meant green-is-idle
+/// in one list and something else in the other would be unreadable, and
+/// two copies of these six lines is exactly how this codebase has drifted
+/// siblings apart before.
+fn activity_dot(activity: Activity, theme: &'static Theme) -> impl IntoElement {
     let color = match activity {
         Activity::Idle => theme.green,
         Activity::Busy => theme.yellow,
@@ -688,6 +738,25 @@ pub struct Workspace {
     /// folders were gone, and that their shells opened in `~` instead.
     /// `None` once a reopen finds every folder where it left it.
     projects_note: Option<String>,
+    /// What each project row's SECOND line says about its repo, keyed by
+    /// the project's anchor directory. Filled by `refresh_project_git` on
+    /// a slow poll from the background executor and read synchronously by
+    /// render — every git call shells out and can block, and a row redraws
+    /// every frame (see `project_git`).
+    ///
+    /// Pruned against the projects the sidebar actually lists, so a branch
+    /// can never be drawn for a folder that has left it.
+    project_git: crate::project_git::GitCache,
+    /// Anchors with a probe running, so a poll cannot stack a second git
+    /// process on a project the previous one has not answered for yet. An
+    /// anchor is removed from here by the probe that owns it; a probe that
+    /// finds its slot already gone was pruned mid-flight and drops its
+    /// answer rather than resurrecting an entry.
+    project_git_inflight: std::collections::HashSet<PathBuf>,
+    /// The repo registry the project probes go through — interning, the
+    /// per-repo action lock and the in-flight guard, exactly as the git
+    /// panel uses for its own refresh.
+    project_git_state: Arc<superterminal_core::git::GitState>,
     /// Per-terminal cue gates (bell → Ping, long-job finish → Glass).
     cue_gates: HashMap<String, superterminal_core::cue::CueGate>,
     /// The currently speaking `say` process (killed before a new note).
@@ -895,6 +964,9 @@ impl Workspace {
             // rather than after the first poll.
             projects_cache: crate::projects::ProjectStore::load(),
             projects_note: None,
+            project_git: HashMap::new(),
+            project_git_inflight: std::collections::HashSet::new(),
+            project_git_state: Arc::new(superterminal_core::git::GitState::default()),
             cue_gates: HashMap::new(),
             tts_child: None,
             caffeinate_child: None,
@@ -1589,6 +1661,12 @@ impl Workspace {
                         (id.clone(), (cwd, activity))
                     })
                     .collect();
+                // The rows' git lines, on their own slower gate: this one
+                // spawns git PROCESSES, and a branch does not move on the
+                // same scale a cwd does.
+                if self.pet_tick_count.is_multiple_of(PROJECT_GIT_TICKS) {
+                    self.refresh_project_git(cx);
+                }
                 cx.notify();
             }
         }
@@ -2238,6 +2316,100 @@ impl Workspace {
             .get(&tab.id)
             .map(|remembered| remembered.dirs())
             .unwrap_or_default()
+    }
+
+    /// Refresh the per-project git cache: one probe per project the
+    /// sidebar can draw, on the background executor.
+    ///
+    /// Never per render and never on the UI thread — every git call shells
+    /// out and can block (see `project_git`). Run from the sidebar poll
+    /// only while the projects view is actually open, on a slower gate
+    /// than the rest of that poll: this is two `git` processes per project
+    /// (`rev-parse`, then `status`), and the branch a project is on does
+    /// not change on a 900ms scale.
+    ///
+    /// Single-flight per anchor: a project whose previous probe has not
+    /// answered is skipped rather than given a second git process, so a
+    /// slow repo cannot stack them up poll after poll.
+    fn refresh_project_git(&mut self, cx: &mut Context<Self>) {
+        let mut anchors: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for tab in &self.tabs {
+            let dirs = self.tab_dirs(tab);
+            // The SAME key its row draws with — the tab's matched record
+            // first, its folders' derivation only as a fallback. See
+            // `project_git::row_anchor` for why deriving here would probe
+            // a different folder from the remembered row's.
+            let record = self.projects_cache.matching(&dirs);
+            if let Some(anchor) = crate::project_git::row_anchor(&dirs, record) {
+                anchors.insert(anchor.clone());
+            }
+        }
+        // The remembered projects the sidebar can LIST, not every record
+        // the store holds: `recent()` is capped, and probing records past
+        // the cap would spend git processes on rows nothing draws.
+        for project in self
+            .projects_cache
+            .pinned()
+            .into_iter()
+            .chain(self.projects_cache.recent())
+        {
+            if let Some(anchor) = crate::project_git::row_anchor(&project.dirs, Some(project)) {
+                anchors.insert(anchor.clone());
+            }
+        }
+        // An entry is dropped the moment its project leaves the list, so a
+        // stale branch can never be drawn for a folder that has gone.
+        crate::project_git::prune(&mut self.project_git, &anchors);
+        // A probe whose slot is pruned here lands to find it gone and
+        // drops its answer rather than resurrecting the entry.
+        self.project_git_inflight
+            .retain(|anchor| anchors.contains(anchor));
+        for anchor in anchors {
+            if !self.project_git_inflight.insert(anchor.clone()) {
+                continue; // already asked; not asked twice
+            }
+            let state = Arc::clone(&self.project_git_state);
+            cx.spawn(async move |ws, cx| {
+                let probe = {
+                    let state = Arc::clone(&state);
+                    let anchor = anchor.clone();
+                    cx.background_executor()
+                        .spawn(async move { crate::project_git::probe(&state, &anchor) })
+                        .await
+                };
+                let _ = ws.update(cx, |ws: &mut Workspace, cx| {
+                    // Owning the slot is what makes the write safe: if the
+                    // prune above took it while this ran, the project has
+                    // left the sidebar and its answer is discarded.
+                    if !ws.project_git_inflight.remove(&anchor) {
+                        return;
+                    }
+                    match probe {
+                        // Busy is not an answer about the repo — someone is
+                        // committing. Keep whatever the row already had.
+                        crate::project_git::Probe::Busy => {}
+                        crate::project_git::Probe::Blank => {
+                            ws.project_git.insert(anchor, None);
+                            cx.notify();
+                        }
+                        crate::project_git::Probe::Summary(summary) => {
+                            ws.project_git.insert(anchor, Some(summary));
+                            cx.notify();
+                        }
+                    }
+                });
+                Ok::<(), ()>(())
+            })
+            .detach();
+        }
+    }
+
+    /// What one project row's git line says, or `None` when it draws none.
+    /// A pure cache read — `refresh_project_git` is the only thing that
+    /// talks to git.
+    fn project_git_line(&self, anchor: Option<&PathBuf>) -> Option<String> {
+        let entry = self.project_git.get(anchor?)?;
+        crate::project_git::git_line(entry.as_ref())
     }
 
     /// The stats a capture carries beyond its directories: how many
@@ -3129,7 +3301,7 @@ impl Workspace {
                                 .py(px(2.0))
                                 .rounded(px(3.0))
                                 .hover(|style| style.bg(rgb(theme.ui_border)))
-                                .child(peer_activity_dot(session.activity, theme))
+                                .child(activity_dot(session.activity, theme))
                                 .child(
                                     div()
                                         .flex_grow()
@@ -3308,6 +3480,28 @@ impl Workspace {
             };
             let collapsed = self.collapsed_projects.contains(&tab.id);
             let collapse_tab_id = tab.id.clone();
+            // The dot leads the row: what this project IS, scannable
+            // without reading it. Its terminals' activity, reduced —
+            // read from the sidebar cache, so no pane is queried and no
+            // process is probed to draw a frame. A terminal the poll has
+            // not reached yet reports `Unknown` rather than being dropped:
+            // absence of an observation is not evidence of an idle shell.
+            let tab_activity = project_activity(
+                &tab.windows
+                    .iter()
+                    .flat_map(collect_terminal_ids)
+                    .map(|id| {
+                        self.sidebar_status_cache
+                            .get(&id)
+                            .map(|(_, activity)| *activity)
+                            .unwrap_or(Activity::Unknown)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            // The second line. `None` until the poll has probed this
+            // project, and `None` forever for a folder that is not a repo
+            // — in both cases the row simply has no git line.
+            let tab_git = self.project_git_line(crate::project_git::row_anchor(&tab_dirs, record));
             rows.push(
                 div()
                     .id(SharedString::from(format!("project-{}", tab.id)))
@@ -3315,8 +3509,14 @@ impl Workspace {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .h(px(24.0))
-                    .px(px(8.0))
+                    // A CARD, not a highlighted line: the selected project
+                    // is a shape with edges, which is what lets the two
+                    // lines inside it read as one thing. Inset so the
+                    // rounding is visible against the sidebar edge.
+                    .mx(px(4.0))
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
                     .when(active_tab, |d| d.bg(rgb(theme.ui_surface)))
                     .hover(|style| style.bg(rgb(theme.ui_surface)))
@@ -3344,21 +3544,36 @@ impl Workspace {
                                 }),
                             ),
                     )
+                    .child(activity_dot(tab_activity, theme))
                     .child(project_mark_badge(tab_mark, theme))
-                    .child(label_element)
-                    // No terminal count. It sat between the project's name
-                    // and its controls in a narrow sidebar, so the name
-                    // truncated to make room for it — "SuperTermin 1
-                    // terminal" — and the name is the only part anyone
-                    // scans for. The row already expands to list the
-                    // terminals themselves, which says the same thing
-                    // without spending the width.
+                    // Identity on top, context beneath. The column takes
+                    // the row's slack so the name gives way to the
+                    // controls rather than pushing them off the sidebar,
+                    // and so the git line indents under the name by
+                    // itself. Room for the nested children and the buddy
+                    // line the next slice adds is here, beneath.
+                    //
+                    // No terminal count on either line. It sat between the
+                    // project's name and its controls in a narrow sidebar,
+                    // so the name truncated to make room for it —
+                    // "SuperTermin 1 terminal" — and the name is the only
+                    // part anyone scans for. The row already expands to
+                    // list the terminals themselves, which says the same
+                    // thing without spending the width.
                     //
                     // Its sibling in `project_summary` (the REMEMBERED
                     // project rows) was removed first and this one was
                     // missed, which is why the count appeared to survive
                     // its own deletion.
-                    .child(div().flex_grow())
+                    .child(
+                        div()
+                            .flex_grow()
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(label_element)
+                            .children(tab_git.map(|line| project_detail_line(line, theme))),
+                    )
                     .children(can_pin.then(|| {
                         div()
                             .id(SharedString::from(format!("project-pin-{}", tab.id)))
@@ -3765,10 +3980,19 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// One remembered project: its name, and what it IS — folder count and
-    /// time worked, from `projects::project_summary`. The terminal count
-    /// was there and was dropped: in a narrow sidebar it truncated the
-    /// name, which is the only part anyone scans for.
+    /// One remembered project: its name, and what it IS — its branch and
+    /// working state when the cache has probed it, and the folder count
+    /// and time worked when it has not. The terminal count was there and
+    /// was dropped: in a narrow sidebar it truncated the name, which is
+    /// the only part anyone scans for.
+    ///
+    /// Same anatomy as the LIVE tab rows above — dot, mark, name, then one
+    /// muted line beneath — because a project must not change its face the
+    /// moment it is opened. The two are separate renderers and this file's
+    /// recurring defect is a decision made in one of them and missed in
+    /// the other, so everything they share is a named helper rather than
+    /// two copies: `activity_dot`, `project_mark_badge`,
+    /// `project_detail_line`, `project_git_line`.
     ///
     /// Clicking reopens it; clicking its pin keeps it (or lets it go).
     fn render_project_row(
@@ -3777,7 +4001,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
-        let summary = crate::projects::project_summary(project.dirs.len(), project.active_secs);
+        // The git line when this project's repo has been probed; the
+        // folder/time summary when it has not, or when the folder is not a
+        // repo at all. Never both: one muted line under the name is the
+        // anatomy, and the branch is the more current of the two facts.
+        let detail = self
+            .project_git_line(crate::project_git::row_anchor(&project.dirs, Some(project)))
+            .unwrap_or_else(|| {
+                crate::projects::project_summary(project.dirs.len(), project.active_secs)
+            });
         let pinned = project.pinned;
         let pin_id = project.id.clone();
         let mark = crate::projects::project_mark(&project.label, project.icon);
@@ -3788,10 +4020,16 @@ impl Workspace {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(8.0))
+            .mx(px(4.0))
+            .px(px(6.0))
             .py(px(3.0))
+            .rounded(px(6.0))
             .cursor_pointer()
             .hover(|style| style.bg(rgb(theme.ui_surface)))
+            // A project that is not open has no terminals to observe, so
+            // its dot is hollow. `project_activity` is what makes that the
+            // same rule the live rows use rather than a second one.
+            .child(activity_dot(project_activity(&[]), theme))
             .child(project_mark_badge(mark, theme))
             .child(
                 div()
@@ -3807,12 +4045,7 @@ impl Workspace {
                             .text_color(rgb(theme.ui_text))
                             .child(SharedString::from(project.label.clone())),
                     )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(rgb(theme.ui_text_muted))
-                            .child(SharedString::from(summary)),
-                    ),
+                    .child(project_detail_line(detail, theme)),
             )
             .child(
                 div()
@@ -3887,6 +4120,10 @@ impl Workspace {
             SidebarView::Projects => {
                 self.projects_cache = crate::projects::ProjectStore::load();
                 self.remember_pane_dirs(cx);
+                // And their git lines, off-thread, rather than up to one
+                // slow tick after the view appears. Single-flight, so an
+                // impatient reopen cannot stack a second probe per project.
+                self.refresh_project_git(cx);
             }
             SidebarView::Peers => {}
             SidebarView::Git => {
@@ -6599,6 +6836,31 @@ mod peer_attach_tests {
 mod tests {
     use super::*;
     use crate::hosts::{ProfileId, Target};
+
+    #[test]
+    fn a_closed_project_reports_unknown_not_idle() {
+        // The one rule `project_activity` exists for. `Activity::aggregate`
+        // answers `Idle` for an empty set ("nothing is running"), which on
+        // a project row would draw a GREEN dot — a shell sitting at a
+        // prompt — for a project that is not even open.
+        assert_eq!(project_activity(&[]), Activity::Unknown);
+        assert_ne!(project_activity(&[]), Activity::Idle);
+    }
+
+    #[test]
+    fn a_live_project_reports_its_terminals_aggregate() {
+        assert_eq!(project_activity(&[Activity::Idle]), Activity::Idle);
+        assert_eq!(
+            project_activity(&[Activity::Idle, Activity::Busy]),
+            Activity::Busy,
+            "one working terminal makes the project working"
+        );
+        assert_eq!(
+            project_activity(&[Activity::Idle, Activity::Unknown]),
+            Activity::Unknown,
+            "an unobserved terminal is not evidence of an idle one"
+        );
+    }
 
     #[test]
     fn a_peers_poller_survives_until_its_last_pane_closes() {

@@ -162,7 +162,12 @@ fn anchor_rank(dir: &Path) -> (usize, String) {
 /// field existed and not yet through [`ProjectStore::load_from`] — the one
 /// its directories derive. Never `None` for a record the store has loaded
 /// or recorded, except the hand-edited all-`$HOME` case.
-fn project_anchor(project: &Project) -> Option<&PathBuf> {
+///
+/// Public because the sidebar's git cache is keyed by it (see
+/// `project_git`): a remembered row and the tab that reopens it must key
+/// the same entry, and the stored anchor is the one thing about a project
+/// that does not move when its folders do.
+pub fn project_anchor(project: &Project) -> Option<&PathBuf> {
     project
         .anchor
         .as_ref()
