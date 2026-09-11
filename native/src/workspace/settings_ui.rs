@@ -24,13 +24,15 @@ pub(super) mod hints {
     pub const AWAKE: &str = "Holds the Mac awake while a terminal is still working.";
     pub const PEER_CANDIDATES: &str =
         "Macs online on your tailnet right now. Pair one to share terminals with it.";
+    pub const PEER_PAIRING: &str =
+        "One Mac pairs and shows a code; the other accepts it from the clipboard.";
     pub const PAIRED_PEERS: &str =
         "Pairing turns on view and type. Delete revokes instantly, even mid-session.";
     pub const PEER_TERMINALS: &str =
         "Terminals a paired Mac is sharing. Opening one gives a view, not a shell.";
 
     #[cfg(test)]
-    pub const ALL: [&str; 10] = [
+    pub const ALL: [&str; 11] = [
         TOOL_ADAPTERS,
         GALLERY,
         LIVE_VIEWPORT,
@@ -39,6 +41,7 @@ pub(super) mod hints {
         CUES,
         AWAKE,
         PEER_CANDIDATES,
+        PEER_PAIRING,
         PAIRED_PEERS,
         PEER_TERMINALS,
     ];
@@ -998,6 +1001,85 @@ impl Workspace {
         self.apply_peer_mutation(current, cx);
     }
 
+    /// Accept a pairing minted on the OTHER Mac: store a record for the
+    /// discovered candidate `host` carrying the secret the user copied
+    /// there, instead of minting one only this machine has ever seen.
+    ///
+    /// The missing half of `pair_peer`. `companion::auth::principal_for`
+    /// matches on the SECRET alone, so one shared secret authenticates
+    /// BOTH directions and this single paste completes the pair — whereas
+    /// pairing on both Macs, which is all this UI could do before, leaves
+    /// each holding a credential the other has never seen. See
+    /// `docs/superpowers/specs/2026-09-11-accept-pairing-design.md`, which
+    /// records that failing against two real Macs: a healthy tailnet path
+    /// and a peer that still answered 404.
+    ///
+    /// The host comes from the row that was clicked, never from a pasted
+    /// link: `Workspace::probe_peer` resolves a peer's address by matching
+    /// `PeerRecord::host` against a scanned `Candidate::host`, so a record
+    /// holding the link's `100.x.x.x` would be permanently unreachable. A
+    /// link's address is still cross-checked against the scan, which is
+    /// how accepting the right link on the wrong row is caught.
+    ///
+    /// The clipboard is read ONLY here, on the click — never during a
+    /// render. A pasteboard read is a user-intent action on macOS, and one
+    /// per frame would be both a privacy smell and a system paste prompt.
+    /// Everything after the read is `peers::accept_pasted_pairing`, a pure
+    /// function tested in `peers.rs`; this only carries out its verdict.
+    pub(super) fn accept_peer_paste(
+        &mut self,
+        host: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pasted = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        let (mut current, _problems) = self.settings.peers();
+        match peers::accept_pasted_pairing(&pasted, host, &self.peer_candidates, &current) {
+            Ok(record) => {
+                // Same mutation path as minting, so a live companion
+                // restarts and honours the new peer immediately rather
+                // than at the next manual toggle. No pairing panel is
+                // shown: this secret came from the other Mac, which
+                // already has it, and the candidate moving into the
+                // paired list below is the confirmation.
+                current.push(record);
+                self.apply_peer_mutation(current, cx);
+            }
+            Err(reason) => {
+                // A refusal must not be silent — a paste that quietly did
+                // nothing is exactly the failure mode this whole feature
+                // exists to end. The peers section has no inline place to
+                // put one, so it goes to the window. `reason` is built by
+                // `accept_pasted_pairing` from fixed strings, peer labels
+                // and scanned hostnames, and never from the paste itself,
+                // so the secret cannot reach this dialog.
+                let _ = window.prompt(
+                    gpui::PromptLevel::Warning,
+                    "That pairing was not accepted",
+                    Some(&reason),
+                    &["OK"],
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Put the just-minted pairing where the other Mac can take it: the
+    /// full pairing URL while the companion is running, else the bare
+    /// code, which is exactly the pair of forms `accept_peer_paste`
+    /// understands. Without this the only way to move a 32-hex secret
+    /// between two Macs would be to retype it.
+    pub(super) fn copy_peer_pairing(&mut self, cx: &mut Context<Self>) {
+        let Some((_id, _label, secret)) = self.peer_pairing_secret.clone() else {
+            return;
+        };
+        let text = self.peer_pairing_url(&secret).unwrap_or(secret);
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
     /// Delete a peer — the revocation. Forced live immediately, never left
     /// to the next manual companion toggle: see `apply_peer_mutation`.
     pub(super) fn delete_peer(&mut self, id: &PeerId, cx: &mut Context<Self>) {
@@ -1110,12 +1192,37 @@ impl Workspace {
             .map(|candidate| {
                 let host = candidate.host.clone();
                 let pair_host = host.clone();
+                let accept_host = host.clone();
+                // Two ways to become a pair, and exactly one of the two
+                // Macs takes each: `pair` mints a secret and shows it,
+                // `accept` takes the one copied on the other machine. Both
+                // live on the candidate row because a peer record's host
+                // must be a SCANNED hostname to be reachable at all — see
+                // `Workspace::accept_peer_paste`.
+                let row_action = |tag: &'static str, id: String| {
+                    div()
+                        .id(SharedString::from(id))
+                        .cursor_pointer()
+                        .px(px(7.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(rgb(theme.ui_border))
+                        .bg(rgb(theme.ui_surface))
+                        .text_color(rgb(theme.ui_text))
+                        .hover(|style| {
+                            style
+                                .border_color(rgb(theme.ui_accent))
+                                .bg(rgb(theme.ui_border))
+                        })
+                        .child(tag)
+                };
                 div()
                     .id(SharedString::from(format!("peer-candidate-{host}")))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(px(6.0))
                     .py(px(2.0))
                     .child(
                         div()
@@ -1128,26 +1235,18 @@ impl Workspace {
                             ))),
                     )
                     .child(
-                        div()
-                            .id(SharedString::from(format!("peer-pair-{host}")))
-                            .cursor_pointer()
-                            .px(px(7.0))
-                            .py(px(1.0))
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(rgb(theme.ui_border))
-                            .bg(rgb(theme.ui_surface))
-                            .text_color(rgb(theme.ui_text))
-                            .hover(|style| {
-                                style
-                                    .border_color(rgb(theme.ui_accent))
-                                    .bg(rgb(theme.ui_border))
-                            })
-                            .child("pair")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |ws, _, _, cx| ws.pair_peer(&pair_host, cx)),
-                            ),
+                        row_action("pair", format!("peer-pair-{host}")).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _, _, cx| ws.pair_peer(&pair_host, cx)),
+                        ),
+                    )
+                    .child(
+                        row_action("accept", format!("peer-accept-{host}")).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |ws, _, window, cx| {
+                                ws.accept_peer_paste(&accept_host, window, cx)
+                            }),
+                        ),
                     )
             })
             .collect();
@@ -1289,7 +1388,7 @@ impl Workspace {
                             .text_size(px(11.0))
                             .text_color(rgb(theme.ui_text))
                             .child(SharedString::from(format!(
-                                "Paired {label} \u{2014} scan on that Mac to finish:"
+                                "Paired {label} \u{2014} copy this, then hit accept on that Mac:"
                             ))),
                     )
                     .children(url.as_deref().and_then(|url| self.render_peer_qr(url)))
@@ -1305,12 +1404,28 @@ impl Workspace {
                             .text_color(rgb(theme.ui_text_muted))
                             .child(SharedString::from(format!("secret: {secret}"))),
                     )
-                    .child(self.chip_button(
-                        "done",
-                        false,
-                        |ws, _window, cx| ws.dismiss_peer_pairing_secret(cx),
-                        cx,
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(6.0))
+                            // Copy first, dismiss second: the panel exists
+                            // to move this secret to the other Mac, and
+                            // the only alternative to copying it is
+                            // retyping 32 hex characters by hand.
+                            .child(self.chip_button(
+                                "copy",
+                                false,
+                                |ws, _window, cx| ws.copy_peer_pairing(cx),
+                                cx,
+                            ))
+                            .child(self.chip_button(
+                                "done",
+                                false,
+                                |ws, _window, cx| ws.dismiss_peer_pairing_secret(cx),
+                                cx,
+                            )),
+                    )
             });
 
         div()
@@ -1333,6 +1448,7 @@ impl Workspace {
                     )),
             )
             .child(self.hint(hints::PEER_CANDIDATES))
+            .child(self.hint(hints::PEER_PAIRING))
             .children(candidates_empty.then(|| {
                 self.hint("Nothing yet. Both Macs need Tailscale running and SuperTerminal open.")
             }))

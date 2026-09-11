@@ -391,14 +391,192 @@ impl Grants {
     }
 }
 
-pub fn pair(host: &str) -> PeerRecord {
+/// The one shape a peer record is ever built in, whether its secret was
+/// minted here ([`pair`]) or pasted from the other Mac
+/// ([`accept_pasted_pairing`]). Written once so the two can never drift:
+/// an accepted pairing is deliberately no more and no less trusted than a
+/// minted one, and a second constructor is how that stops being true.
+fn record_for(host: &str, secret: String) -> PeerRecord {
     PeerRecord {
         id: PeerId(new_peer_id()),
         host: host.to_string(),
         label: host.to_string(),
-        secret: new_peer_secret(),
+        secret,
         grants: Grants::on_pair(),
     }
+}
+
+pub fn pair(host: &str) -> PeerRecord {
+    record_for(host, new_peer_secret())
+}
+
+// ---------------------------------------------------------------------
+// Accepting a pairing minted on ANOTHER machine.
+//
+// `pair` mints a fresh secret, which is the right thing for exactly one of
+// the two Macs. If BOTH mint, each holds a secret the other has never
+// seen and neither recognises the other at all: `companion::auth::
+// principal_for` matches on the SECRET alone, so there is nothing else for
+// it to fall back on. The counterpart of that same fact is what makes the
+// fix a single paste -- one shared secret authenticates BOTH directions,
+// because ids, labels and grants are local and never have to agree between
+// the two machines.
+// ---------------------------------------------------------------------
+
+/// Why a pasted pairing string could not be used.
+///
+/// Fixed strings, never built from what was pasted: a reason that echoed
+/// the paste would put a secret into a dialog, a log line, or a failing
+/// test's output -- the same hazard `PeerRecord`'s hand-written `Debug`
+/// exists to close.
+pub const PASTE_EMPTY: &str = "nothing was copied - copy the pairing link on the other Mac first";
+pub const PASTE_URL_WITHOUT_CODE: &str = "that link carries no pairing code after its #";
+pub const PASTE_NOT_A_CODE: &str = "a pairing code is 32 lowercase hex characters";
+
+/// What a pasted pairing string carried.
+///
+/// `Debug` is hand-written for the same reason `PeerRecord`'s is: this
+/// type holds a secret for the moment between a clipboard read and a
+/// settings write, which is exactly the window in which a `{:?}` would
+/// leak it.
+#[derive(Clone, PartialEq)]
+pub struct PastedPairing {
+    /// The address a pairing URL pointed at (`100.x.x.x`), when the paste
+    /// was a URL rather than a bare code.
+    ///
+    /// Deliberately NOT what gets stored as `PeerRecord::host`: a record's
+    /// host must be a tailnet HOSTNAME, because `Workspace::probe_peer`
+    /// finds a peer's address by matching that field against a scanned
+    /// `Candidate::host`. A record holding `100.64.0.2` there would match
+    /// no candidate and be permanently unreachable. The address is used
+    /// only to cross-check the machine the user picked -- see
+    /// [`accept_pasted_pairing`].
+    pub addr: Option<String>,
+    /// Already validated by `secret_ok`: no path constructs this struct
+    /// without passing that check first.
+    pub secret: String,
+}
+
+impl std::fmt::Debug for PastedPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PastedPairing")
+            .field("addr", &self.addr)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Split a pasted URL into `(host, fragment)`. `None` when the text is not
+/// a URL at all, which is how a bare code is told apart from a link.
+///
+/// Hand-rolled rather than pulling in a URL crate: the only shape that has
+/// to be understood is the one `settings_ui::peer_pairing_url` produces --
+/// `http://<addr>:<port>/#<secret>` -- and anything this cannot make sense
+/// of falls through to being refused, never guessed at.
+fn split_pairing_url(text: &str) -> Option<(&str, Option<&str>)> {
+    let after_scheme = text.split_once("://")?.1;
+    let (before_fragment, fragment) = match after_scheme.split_once('#') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (after_scheme, None),
+    };
+    let authority = before_fragment
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(before_fragment);
+    // Userinfo first, then the port -- and a bracketed IPv6 literal keeps
+    // its own colons, which is why the port is only stripped when there
+    // are no brackets to be inside of.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host.rfind(']') {
+        Some(end) => host[..=end].trim_start_matches('[').trim_end_matches(']'),
+        None => host.rsplit_once(':').map_or(host, |(host, _)| host),
+    };
+    (!host.is_empty()).then_some((host, fragment))
+}
+
+/// Parse what the user pasted into "an address, maybe, and a secret".
+///
+/// Both forms the design calls for are accepted because both occur: a full
+/// pairing URL, which carries the address as well, and a bare 32-hex code
+/// that arrived over a message rather than a scan.
+///
+/// The secret is validated with the SAME `secret_ok` the settings loader
+/// uses, so a paste that `load_peers` would quarantine on the next launch
+/// is refused now, with a reason, rather than stored to fail mysteriously
+/// later.
+pub fn parse_pairing_paste(pasted: &str) -> Result<PastedPairing, &'static str> {
+    let trimmed = pasted.trim();
+    if trimmed.is_empty() {
+        return Err(PASTE_EMPTY);
+    }
+    if let Some((host, fragment)) = split_pairing_url(trimmed) {
+        let Some(fragment) = fragment.filter(|f| !f.is_empty()) else {
+            return Err(PASTE_URL_WITHOUT_CODE);
+        };
+        if !secret_ok(fragment) {
+            return Err(PASTE_NOT_A_CODE);
+        }
+        return Ok(PastedPairing {
+            addr: Some(host.to_string()),
+            secret: fragment.to_string(),
+        });
+    }
+    if !secret_ok(trimmed) {
+        return Err(PASTE_NOT_A_CODE);
+    }
+    Ok(PastedPairing {
+        addr: None,
+        secret: trimmed.to_string(),
+    })
+}
+
+/// A peer record carrying a secret that came from the OTHER Mac, for the
+/// discovered candidate `host` the user pointed at. The missing half of
+/// pairing: without it, both machines mint and neither can authenticate.
+///
+/// `host` comes from a `Candidate`, never from the paste, for the reason
+/// spelled out on [`PastedPairing::addr`]. A URL's address is used only to
+/// catch the user accepting the right link on the wrong row.
+///
+/// Refusals, in the order they are checked:
+///
+/// - a malformed code, so nothing unusable is ever written;
+/// - a secret some other record already holds, because two peers sharing
+///   one are indistinguishable at auth time and `load_peers` would
+///   quarantine BOTH on the next launch;
+/// - a link whose address belongs to a DIFFERENT discovered Mac;
+/// - a host already paired, which would mean a second, redundant
+///   credential for one machine.
+pub fn accept_pasted_pairing(
+    pasted: &str,
+    host: &str,
+    candidates: &[Candidate],
+    paired: &[PeerRecord],
+) -> Result<PeerRecord, String> {
+    let parsed = parse_pairing_paste(pasted).map_err(str::to_string)?;
+    // Plain `==`, not `token_matches`: a local uniqueness check against
+    // records this machine already holds, not an authentication boundary,
+    // and there is no remote party whose timing it could leak to.
+    if let Some(existing) = paired.iter().find(|p| p.secret == parsed.secret) {
+        return Err(format!("{} already holds that code", existing.label));
+    }
+    if let Some(addr) = parsed.addr.as_deref() {
+        // Only when the address is one the scan actually reported: a link
+        // built from a LAN address, or from a scan since gone stale, is
+        // not evidence that the user picked the wrong machine, and the row
+        // they clicked is an explicit choice either way.
+        if let Some(named) = candidates.iter().find(|c| c.addr == addr) {
+            if named.host != host {
+                return Err(format!("that link is for {}, not {host}", named.host));
+            }
+        }
+    }
+    if paired.iter().any(|p| p.host == host) {
+        return Err(format!("{host} is already paired"));
+    }
+    Ok(record_for(host, parsed.secret))
 }
 
 /// Which grant a peer row's toggle acted on.
@@ -915,6 +1093,13 @@ mod tests {
         }
     }
 
+    fn other_candidate(host: &str, addr: &str) -> Candidate {
+        Candidate {
+            addr: addr.to_string(),
+            ..candidate(host)
+        }
+    }
+
     #[test]
     fn pairing_mints_a_labelled_record_with_a_valid_secret() {
         // Grants are asserted separately in
@@ -1021,6 +1206,293 @@ mod tests {
         assert!(toggled.spawn);
         assert!(toggled.view);
         assert!(toggled.type_);
+    }
+
+    // -------------------------------------------------------------
+    // Accepting a pairing minted on the OTHER Mac. `pair` above covers
+    // the machine that mints; these cover the one that pastes, which is
+    // the half that did not exist and without which two Macs could not
+    // authenticate at all.
+    // -------------------------------------------------------------
+
+    /// Stands in for the secret the other Mac minted and showed. Fixed,
+    /// so a test failure cannot be mistaken for a real credential.
+    const PASTED: &str = "0123456789abcdef0123456789abcdef";
+
+    fn link_to(addr: &str, secret: &str) -> String {
+        format!("http://{addr}:43110/#{secret}")
+    }
+
+    #[test]
+    fn a_pairing_url_carries_both_its_address_and_its_code() {
+        let parsed = parse_pairing_paste(&link_to("100.64.0.2", PASTED)).unwrap();
+        assert_eq!(parsed.addr.as_deref(), Some("100.64.0.2"));
+        assert_eq!(parsed.secret, PASTED);
+    }
+
+    #[test]
+    fn a_bare_code_carries_no_address_to_cross_check_against() {
+        let parsed = parse_pairing_paste(PASTED).unwrap();
+        assert_eq!(parsed.addr, None);
+        assert_eq!(parsed.secret, PASTED);
+    }
+
+    #[test]
+    fn a_code_survives_the_whitespace_a_copy_brings_with_it() {
+        assert_eq!(
+            parse_pairing_paste(&format!("  {PASTED}\n"))
+                .unwrap()
+                .secret,
+            PASTED
+        );
+        assert_eq!(
+            parse_pairing_paste(&format!("\t{}  \n", link_to("100.64.0.2", PASTED)))
+                .unwrap()
+                .secret,
+            PASTED
+        );
+    }
+
+    #[test]
+    fn an_uppercase_code_is_refused_exactly_as_the_loader_refuses_one() {
+        // Same `secret_ok` on both sides. Hex case does not change the
+        // value, but `token_matches` compares STRINGS -- an uppercase copy
+        // would never match at auth, and would be a second storable form
+        // of one credential that a revocation could miss.
+        assert_eq!(
+            parse_pairing_paste(&PASTED.to_uppercase()),
+            Err(PASTE_NOT_A_CODE)
+        );
+    }
+
+    #[test]
+    fn a_link_with_no_code_in_it_says_so_rather_than_blaming_the_code() {
+        for bare in [
+            "http://100.64.0.2:43110/",
+            "http://100.64.0.2:43110/#",
+            "https://example.com",
+        ] {
+            assert_eq!(
+                parse_pairing_paste(bare),
+                Err(PASTE_URL_WITHOUT_CODE),
+                "wrong reason for {bare:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_whose_fragment_is_not_a_secret_is_refused() {
+        for bad in [
+            "http://100.64.0.2:43110/#nope",
+            "http://100.64.0.2:43110/#zzzzccddeeff00112233445566778899",
+        ] {
+            assert_eq!(
+                parse_pairing_paste(bad),
+                Err(PASTE_NOT_A_CODE),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_paste_is_refused_with_its_own_reason() {
+        for empty in ["", "   ", "\n\t"] {
+            assert_eq!(parse_pairing_paste(empty), Err(PASTE_EMPTY));
+        }
+    }
+
+    #[test]
+    fn something_that_is_neither_a_link_nor_a_code_is_refused() {
+        for junk in [
+            "hello world",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcdefff",
+        ] {
+            assert_eq!(
+                parse_pairing_paste(junk),
+                Err(PASTE_NOT_A_CODE),
+                "accepted {junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepting_stores_the_pasted_secret_instead_of_minting_one() {
+        // THE gap this closes: two Macs that each minted hold secrets
+        // neither has ever seen, so neither recognises the other.
+        let record = accept_pasted_pairing(
+            &link_to("100.64.0.2", PASTED),
+            "mac-a",
+            &[candidate("mac-a")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(record.secret, PASTED, "a fresh secret was minted instead");
+        assert_eq!(record.host, "mac-a");
+        assert_eq!(record.label, "mac-a");
+        assert!(!record.id.0.is_empty());
+    }
+
+    #[test]
+    fn an_accepted_pairing_is_trusted_exactly_as_much_as_a_minted_one() {
+        let accepted = accept_pasted_pairing(PASTED, "mac-a", &[], &[]).unwrap();
+        assert_eq!(accepted.grants, Grants::on_pair());
+        assert!(
+            !accepted.grants.spawn,
+            "spawn must stay opt-in whichever way a pairing was made"
+        );
+        let minted = pair("mac-a");
+        assert_eq!(
+            PeerRecord {
+                id: minted.id.clone(),
+                secret: minted.secret.clone(),
+                ..accepted
+            },
+            minted,
+            "an accepted record must differ from a minted one only in where its secret came from"
+        );
+    }
+
+    #[test]
+    fn a_secret_another_record_already_holds_is_refused() {
+        // `load_peers` quarantines EVERY member of a duplicate secret, so
+        // creating one by hand would revoke both peers at the next launch
+        // -- and until then the two would be indistinguishable at auth.
+        let mut held = pair("mac-b");
+        held.secret = PASTED.to_string();
+        assert!(accept_pasted_pairing(PASTED, "mac-a", &[], &[held]).is_err());
+    }
+
+    #[test]
+    fn a_link_for_a_different_discovered_mac_is_refused() {
+        let candidates = vec![candidate("mac-a"), other_candidate("mac-b", "100.64.0.3")];
+        let err = accept_pasted_pairing(&link_to("100.64.0.3", PASTED), "mac-a", &candidates, &[])
+            .unwrap_err();
+        assert!(
+            err.contains("mac-b"),
+            "the reason must name the machine the link is really for: {err}"
+        );
+    }
+
+    #[test]
+    fn a_link_from_an_address_no_scan_reported_still_pairs_the_chosen_row() {
+        // A link built from a LAN address, or a scan since gone stale, is
+        // not evidence that the user picked the wrong machine -- and the
+        // row's host is the only one `probe_peer` could ever resolve.
+        let record = accept_pasted_pairing(
+            &link_to("192.168.1.5", PASTED),
+            "mac-a",
+            &[candidate("mac-a")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(record.host, "mac-a");
+    }
+
+    #[test]
+    fn a_host_already_paired_is_not_paired_a_second_time() {
+        let err = accept_pasted_pairing(PASTED, "mac-a", &[], &[pair("mac-a")]).unwrap_err();
+        assert!(err.contains("mac-a"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_paste_never_becomes_a_record() {
+        let upper = PASTED.to_uppercase();
+        for bad in [
+            "",
+            "hello",
+            upper.as_str(),
+            "http://100.64.0.2:43110/",
+            "http://100.64.0.2:43110/#nope",
+        ] {
+            assert!(
+                accept_pasted_pairing(bad, "mac-a", &[], &[]).is_err(),
+                "stored {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_refusal_ever_echoes_the_pasted_secret() {
+        // A reason is shown to the user and can reach a log line or a
+        // failing test's output; it must never carry the credential.
+        let mut held = pair("mac-b");
+        held.secret = PASTED.to_string();
+        let candidates = vec![candidate("mac-a"), other_candidate("mac-b", "100.64.0.3")];
+        let wrong_row = link_to("100.64.0.3", PASTED);
+        let cases: Vec<(&str, Vec<PeerRecord>)> = vec![
+            (wrong_row.as_str(), Vec::new()),
+            (PASTED, vec![held]),
+            (PASTED, vec![pair("mac-a")]),
+        ];
+        for (pasted, paired) in cases {
+            let err = accept_pasted_pairing(pasted, "mac-a", &candidates, &paired).unwrap_err();
+            assert!(
+                !err.contains(PASTED),
+                "a refusal leaked the pasted secret: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pasted_pairing_never_shows_its_secret_in_debug_output() {
+        let parsed = parse_pairing_paste(&link_to("100.64.0.2", PASTED)).unwrap();
+        let rendered = format!("{parsed:?}");
+        assert!(
+            !rendered.contains(PASTED),
+            "the pasted secret leaked into Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>"),
+            "the field must stay visible as redacted, not silently dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("100.64.0.2"),
+            "the rest must stay debuggable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn one_accepted_secret_authenticates_both_directions() {
+        // The claim the whole feature rests on: `principal_for` matches on
+        // the SECRET alone, so ids, labels and grants stay local and one
+        // paste on the second machine completes the pair.
+        use crate::companion::auth::{principal_for, Principal};
+        // Mac A mints for Mac B and shows the link.
+        let minted = pair("mac-b");
+        // Mac B accepts it, for Mac A.
+        let accepted = accept_pasted_pairing(
+            &link_to("100.64.0.2", &minted.secret),
+            "mac-a",
+            &[candidate("mac-a")],
+            &[],
+        )
+        .unwrap();
+        assert_ne!(accepted.id, minted.id, "ids are local and need not agree");
+        assert_eq!(
+            principal_for("phone-token", &accepted.secret, &[minted.clone()]),
+            Some(Principal::Peer(minted.id.clone())),
+            "B presenting the shared secret must be recognised by A"
+        );
+        assert_eq!(
+            principal_for("phone-token", &minted.secret, &[accepted.clone()]),
+            Some(Principal::Peer(accepted.id.clone())),
+            "A presenting the same secret must be recognised by B"
+        );
+    }
+
+    #[test]
+    fn an_accepted_record_survives_the_loader_that_reads_it_back() {
+        // Accepting writes through the same settings file the loader
+        // reads; a record `load_peers` would quarantine is a pairing that
+        // silently stops working at the next launch.
+        let record = accept_pasted_pairing(PASTED, "mac-a", &[], &[]).unwrap();
+        let raw = serde_json::to_value(vec![record]).unwrap();
+        let (kept, problems) = load_peers(&raw);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].secret, PASTED);
+        assert_eq!(kept[0].grants, Grants::on_pair());
     }
 
     // -------------------------------------------------------------
