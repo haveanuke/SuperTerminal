@@ -6994,6 +6994,14 @@ mod tests {
             "emptying the workspace from a Window-less path must still hand \
              focus back to the root on the next frame"
         );
+        // Setting the flag is only half of it. Nothing consumes it except
+        // render, and a flag nobody reads leaves the same dead screen as
+        // never setting one — so the consumption is asserted too.
+        assert!(
+            production.contains("if self.pending_root_focus {"),
+            "render must CONSUME pending_root_focus; setting it alone \
+             changes nothing"
+        );
     }
 
     #[test]
